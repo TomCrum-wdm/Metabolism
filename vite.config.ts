@@ -5,7 +5,10 @@ import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
+  const base = process.env.VITE_BASE_PATH || '/';
+
   return {
+    base,
     plugins: [
       react(),
       tailwindcss(),
@@ -13,7 +16,7 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['apple-touch-icon.png', 'icon.svg'],
         manifest: {
-          id: '/',
+          id: base,
           name: 'TerraSphere 星球造物沙盒',
           short_name: 'TerraSphere',
           description:
@@ -21,23 +24,23 @@ export default defineConfig(() => {
           theme_color: '#050810',
           background_color: '#050810',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: base,
+          scope: base,
           icons: [
             {
-              src: '/pwa-192x192.png',
+              src: `${base}pwa-192x192.png`,
               sizes: '192x192',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-512x512.png',
+              src: `${base}pwa-512x512.png`,
               sizes: '512x512',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-maskable-512x512.png',
+              src: `${base}pwa-maskable-512x512.png`,
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable',

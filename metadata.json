@@ -1,0 +1,6 @@
+{
+  "name": "TerraSphere 星球造物沙盒",
+  "description": "WebGPU planetary voxel sandbox with Marching Cubes terrain sculpting, Newtonian radial gravity, physics-based SPH fluid simulation, and real-time shadows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -171,9 +171,11 @@ export const GameHud: React.FC<GameHudProps> = ({
           <div className="hidden lg:flex items-center gap-1">
             <span className="text-slate-500">RES</span>
             <span className="text-emerald-300 font-medium" data-testid="hud-res-readout">
-              {telemetry.voxelRadius >= 1000
-                ? `${telemetry.voxelRadius.toLocaleString()}块`
-                : `${Math.round(telemetry.voxelRadius)}块`}
+              {telemetry.voxelRadius >= 1e8
+                ? `${Number((telemetry.voxelRadius / 1e8).toFixed(2))}亿块`
+                : telemetry.voxelRadius >= 1000
+                  ? `${telemetry.voxelRadius.toLocaleString()}块`
+                  : `${Math.round(telemetry.voxelRadius)}块`}
             </span>
           </div>
 
@@ -600,13 +602,13 @@ export const GameHud: React.FC<GameHudProps> = ({
                   <span className="text-slate-400">笔刷半径</span>
                   <NumericCadInput
                     value={config.brushRadius}
-                    minValid={0.001}
+                    minValid={1e-9}
                     unit="m"
                     ariaLabel="笔刷半径"
                     testId="hud-brush-radius-input"
                     sliderScale="log"
                     sliderMin={Math.max(
-                      0.002,
+                      1e-8,
                       Number((telemetry.nativeVoxelSize * 1.5).toPrecision(2)),
                     )}
                     sliderMax={Math.max(10, Number((telemetry.planetRadius * 0.6).toFixed(1)))}

@@ -584,7 +584,7 @@ export class FluidSim {
         }
 
         // Exact voxel SDF terrain collision
-        const d = planet.sampleDensityAndNormal(npx, npy, npz, this.tempNormal);
+        const d = planet.sampleDensityAndNormal(npx, npy, npz, this.tempNormal, true);
         if (d > -particleMargin) {
           const penetration = d + particleMargin;
           const nx = this.tempNormal[0];
@@ -762,7 +762,7 @@ export class FluidSim {
           const idx = ix + iy * sY + iz * sZ;
           if (this.waterField[idx] > -0.22) {
             const wx = -waterHalf + ix * waterVoxel;
-            const td = planet.sampleDensity(wx, wy, wz);
+            const td = planet.sampleDensity(wx, wy, wz, true);
             if (td > clipThresh) {
               this.waterField[idx] -= (td - clipThresh) * invScale * 1.65;
             }

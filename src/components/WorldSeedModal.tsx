@@ -219,11 +219,11 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
               <div className="col-span-2 flex flex-col gap-1 rounded-xs border border-sky-500/30 bg-[#070b15] px-2.5 py-1.5">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-[11px] text-sky-300 font-medium">
-                    体素分辨率 (方块半径 · 支持几万方块)
+                    体素分辨率 (全量 360° · 支持 &gt;10亿³ 网格)
                   </span>
                   <span className="text-[10px] font-mono-tabular text-slate-400">
                     单块 {(draft.radius / Math.max(4, draft.voxelRadius)).toPrecision(3)}m ·{' '}
-                    {Math.round(Math.max(4, draft.voxelRadius) * 2 * 1.54).toLocaleString()}³
+                    {(Math.ceil((Math.max(4, draft.voxelRadius) * 2 * 1.54) / 8) * 8).toLocaleString()}³
                   </span>
                 </div>
                 <NumericCadInput
@@ -235,12 +235,12 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   testId="seed-voxel-res-input"
                   sliderScale="log"
                   sliderMin={6}
-                  sliderMax={50000}
+                  sliderMax={500000000}
                   className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, voxelRadius: v }))}
                 />
                 <div className="flex flex-wrap items-center gap-1 pt-0.5">
-                  {[18, 64, 512, 5000, 20000, 50000].map((res) => (
+                  {[18, 64, 512, 20000, 5000000, 500000000].map((res) => (
                     <button
                       key={res}
                       type="button"
@@ -253,7 +253,13 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                           : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
                       }`}
                     >
-                      {res >= 1000 ? `${res / 1000}k` : res}
+                      {res >= 1e8
+                        ? `${Number((res / 1e8).toFixed(1))}亿`
+                        : res >= 1e6
+                          ? `${res / 1e6}M`
+                          : res >= 1000
+                            ? `${res / 1000}k`
+                            : res}
                     </button>
                   ))}
                 </div>

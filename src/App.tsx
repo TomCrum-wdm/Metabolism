@@ -151,6 +151,7 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   playerLonDeg: 0,
   sunDir: [0.7, 0.5, 0.5],
   simTimeSec: 0,
+  voxelRevision: 0,
 };
 
 export default function App() {
@@ -624,8 +625,8 @@ export default function App() {
 
   const voxelStats = useMemo(() => {
     void seedVersion;
-    void telemetry.terrainVertices;
-    return engineRef.current
+    void telemetry.voxelRevision;
+    return engineRef.current && debugOpen
       ? engineRef.current.getVoxelStats()
       : {
           gridN: 57,
@@ -653,10 +654,15 @@ export default function App() {
           voxelRadius: DEFAULT_SEED_CONFIG.voxelRadius,
           nativeVoxelSize: DEFAULT_SEED_CONFIG.radius / DEFAULT_SEED_CONFIG.voxelRadius,
           virtualCellsPerAxis: 56,
+          fullCellsPerAxis: 56,
+          fullChunksPerAxis: 7,
+          fullGridN: 57,
+          octreeDepth: 3,
+          fullTotalVoxelsLabel: (56 * 56 * 56).toLocaleString(),
           sparseActiveChunks: 0,
           isSparseStreaming: false,
         };
-  }, [seedVersion, telemetry.terrainVertices, debugOpen]);
+  }, [debugOpen, seedVersion, telemetry.voxelRevision]);
 
   const currentSeedConfig =
     engineRef.current?.planet.seedConfig ??

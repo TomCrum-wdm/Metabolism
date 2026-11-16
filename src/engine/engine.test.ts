@@ -94,6 +94,9 @@ test('VoxelPlanet extracts closed outward-normal Marching Cubes terrain and supp
   }
   assert.ok(totalVerts > 15000, `Expected rich planet mesh, got ${totalVerts} verts`);
 
+  const revBefore = planet.voxelRevision;
+  const statsBefore = planet.getVoxelStats();
+
   const carveRes = planet.applyBrush(
     hit.x,
     hit.y,
@@ -106,6 +109,7 @@ test('VoxelPlanet extracts closed outward-normal Marching Cubes terrain and supp
   assert.ok(carveRes.deltaVolume < 0);
   assert.ok(carveRes.modifiedChunks.length > 0);
   assert.ok(planet.sampleDensity(hit.x, hit.y, hit.z) < 0);
+  assert.equal(planet.voxelRevision, revBefore + 1);
 
   const buildPos = [
     hit.x + hit.nx * 1.5,
@@ -123,6 +127,12 @@ test('VoxelPlanet extracts closed outward-normal Marching Cubes terrain and supp
   );
   assert.ok(buildRes.deltaVolume > 0);
   assert.ok(planet.sampleDensity(buildPos[0], buildPos[1], buildPos[2]) > 0);
+  assert.equal(planet.voxelRevision, revBefore + 2);
+  const statsAfter = planet.getVoxelStats();
+  assert.ok(
+    statsAfter.materialCounts[MaterialId.Crystal] > statsBefore.materialCounts[MaterialId.Crystal],
+    'Material counts must immediately reflect newly sculpted Crystal voxels',
+  );
 });
 
 test('Multi-resolution Chunk LOD reduces triangle counts monotonically across LOD 0, 1, and 2', () => {
@@ -565,6 +575,208 @@ test('Deferred VoxelPlanet skipGenerate + generatePlanetAsync + FluidSim.seedIni
   assert.ok(fluid.activeCount > 300);
   assert.ok(fluidSteps.length >= 1 && fluidSteps[fluidSteps.length - 1] === 1);
 });
+
+test('Dynamic macro grid scales full-planet resolution (voxelRadius=32) and snapshot resizes cleanly', () => {
+  const base18 = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 314159, voxelRadius: 18 });
+  const med32 = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 314159, voxelRadius: 32 });
+
+  assert.equal(base18.chunksPerAxis, 7);
+  assert.equal(base18.cellsPerAxis, 56);
+  assert.ok(med32.chunksPerAxis >= 12, `Expected >= 12 chunks/axis at res=32, got ${med32.chunksPerAxis}`);
+  assert.ok(med32.cellsPerAxis >= 96, `Expected >= 96 cells/axis at res=32, got ${med32.cellsPerAxis}`);
+  assert.equal(med32.isHighResStreaming, false);
+
+  let verts18 = 0;
+  for (let cz = 0; cz < base18.chunksPerAxis; cz++) {
+    for (let cy = 0; cy < base18.chunksPerAxis; cy++) {
+      for (let cx = 0; cx < base18.chunksPerAxis; cx++) {
+        verts18 += base18.extractBlockyChunkMesh(cx, cy, cz, 0).vertexCount;
+      }
+    }
+  }
+  let verts32 = 0;
+  for (let cz = 0; cz < med32.chunksPerAxis; cz++) {
+    for (let cy = 0; cy < med32.chunksPerAxis; cy++) {
+      for (let cx = 0; cx < med32.chunksPerAxis; cx++) {
+        verts32 += med32.extractBlockyChunkMesh(cx, cy, cz, 0).vertexCount;
+      }
+    }
+  }
+  assert.ok(verts32 > verts18 * 2.2, `Expected full-globe blocky vertex count at res=32 (${verts32}) >> res=18 (${verts18})`);
+
+  // Snapshot created at 105^3 must restore cleanly into a default 57^3 instance
+  const snap = med32.exportSnapshot();
+  const target = new VoxelPlanet(1);
+  target.importSnapshot(snap);
+  assert.equal(target.cellsPerAxis, med32.cellsPerAxis);
+  assert.equal(target.chunksPerAxis, med32.chunksPerAxis);
+  assert.equal(target.density.length, med32.density.length);
+});
+
+test('High-res planets exceed 160³ limit natively (voxelRadius=64->200³, 96->296³) and stream full visible cap at 512', () => {
+  const hi64 = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 808123, voxelRadius: 64 });
+  assert.equal(hi64.chunksPerAxis, 25);
+  assert.equal(hi64.cellsPerAxis, 200);
+  assert.equal(hi64.isHighResStreaming, false);
+
+  const hi96 = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 808123, voxelRadius: 96 });
+  assert.equal(hi96.chunksPerAxis, 37);
+  assert.equal(hi96.cellsPerAxis, 296);
+  assert.equal(hi96.isHighResStreaming, false);
+
+  let verts64 = 0;
+  for (let cz = 0; cz < hi64.chunksPerAxis; cz++) {
+    for (let cy = 0; cy < hi64.chunksPerAxis; cy++) {
+      for (let cx = 0; cx < hi64.chunksPerAxis; cx++) {
+        if (hi64.nonUniformChunks[hi64.chunkIndex(cx, cy, cz)] === 0) continue;
+        verts64 += hi64.extractBlockyChunkMesh(cx, cy, cz, 0).vertexCount;
+      }
+    }
+  }
+  assert.ok(verts64 > 180000, `Expected dense native 200³ blocky surface verts (>180k), got ${verts64}`);
+
+  const hi512 = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 808123, voxelRadius: 512 });
+  assert.equal(hi512.chunksPerAxis, 24);
+  assert.equal(hi512.cellsPerAxis, 192);
+  assert.equal(hi512.isHighResStreaming, true);
+  const surfR512 = hi512.findSurfaceRadiusAlongRay(0, 1, 0);
+  const tiersBuilt = new Set<string>();
+  let nonEmptyHemi = 0;
+  let lastDiscard = 0;
+  for (let pass = 0; pass < 50; pass++) {
+    const batch = hi512.streamHighResAround(0, surfR512, 0, 'blocky', 48, 22);
+    assert.equal(batch.active, true);
+    for (const m of batch.rebuiltMeshes) {
+      if (m.mesh.vertexCount > 0) {
+        tiersBuilt.add(m.tier);
+        if (m.tier === 'hemi') nonEmptyHemi++;
+      }
+    }
+    lastDiscard = batch.hemiDiscardRadius;
+    if (batch.pendingTotal === 0) break;
+  }
+  assert.ok(nonEmptyHemi > 200, `Expected high-density visible cap chunks (>200), got ${nonEmptyHemi}`);
+  assert.ok(lastDiscard > hi512.baseRadius * 0.8, `Expected hemisphere discard radius > 0.8*R, got ${lastDiscard}`);
+  assert.ok(
+    tiersBuilt.has('hemi') && tiersBuilt.has('mid') && tiersBuilt.has('native'),
+    `Expected hemi/mid/native tiers, got ${Array.from(tiersBuilt).join(',')}`,
+  );
+});
+
+test('Full 360° SVO scales past 1,000,000,000³ (voxelRadius=500M -> 1.54B³), covers all 6 directions, and streams 1:1 native blocks', () => {
+  const ultraCfg = {
+    ...DEFAULT_SEED_CONFIG,
+    seed: 998877,
+    radius: 13.0,
+    voxelRadius: 500_000_000,
+  };
+  const code = encodeSeedCode(ultraCfg);
+  assert.ok(code.startsWith('TS3|'));
+  const decoded = decodeSeedCode(code);
+  assert.ok(decoded !== null && decoded.voxelRadius === 500_000_000);
+
+  const planet = new VoxelPlanet(ultraCfg);
+  assert.equal(planet.isHighResStreaming, true);
+  assert.ok(
+    planet.fullCellsPerAxis > 1_000_000_000,
+    `Expected fullCellsPerAxis > 1,000,000,000, got ${planet.fullCellsPerAxis}`,
+  );
+  assert.ok(planet.octreeDepth >= 28, `Expected octreeDepth >= 28, got ${planet.octreeDepth}`);
+  assert.equal(planet.chunksPerAxis, 24);
+
+  const stats = planet.getVoxelStats();
+  assert.equal(stats.fullCellsPerAxis, planet.fullCellsPerAxis);
+  assert.equal(stats.virtualCellsPerAxis, planet.fullCellsPerAxis);
+  assert.ok(stats.fullTotalVoxelsLabel.includes('10^27'));
+
+  // 1. Verify full 360° coverage around the sphere (globe + hemi tiers close all 6 cardinal hemispheres)
+  const surfY = planet.findSurfaceRadiusAlongRay(0, 1, 0);
+  let dirFlags = { posX: 0, negX: 0, posY: 0, negY: 0, posZ: 0, negZ: 0 };
+  let lastBatch = planet.streamHighResAround(0, surfY, 0, 'blocky', 48, 28);
+  const allRebuilt = [...lastBatch.rebuiltMeshes];
+  for (let pass = 0; pass < 60 && lastBatch.pendingTotal > 0; pass++) {
+    lastBatch = planet.streamHighResAround(0, surfY, 0, 'blocky', 48, 28);
+    allRebuilt.push(...lastBatch.rebuiltMeshes);
+  }
+  assert.equal(lastBatch.globeBuiltComplete, true, 'Full 360° globe+hemi shell should complete');
+  assert.equal(lastBatch.hideMacro, true, 'Macro fallback must hide once full 360° sparse octree is built');
+
+  for (const item of allRebuilt) {
+    if (item.mesh.vertexCount === 0 || !item.mesh.origin) continue;
+    const ox = item.mesh.origin[0] + item.mesh.positions[0];
+    const oy = item.mesh.origin[1] + item.mesh.positions[1];
+    const oz = item.mesh.origin[2] + item.mesh.positions[2];
+    if (ox > 1) dirFlags.posX++;
+    if (ox < -1) dirFlags.negX++;
+    if (oy > 1) dirFlags.posY++;
+    if (oy < -1) dirFlags.negY++;
+    if (oz > 1) dirFlags.posZ++;
+    if (oz < -1) dirFlags.negZ++;
+  }
+  assert.ok(
+    dirFlags.posX > 0 &&
+      dirFlags.negX > 0 &&
+      dirFlags.posY > 0 &&
+      dirFlags.negY > 0 &&
+      dirFlags.posZ > 0 &&
+      dirFlags.negZ > 0,
+    `Expected full 360° surface coverage across ±X/±Y/±Z, got ${JSON.stringify(dirFlags)}`,
+  );
+
+  // 2. Verify zoomed-in cascade streams midOuter, mid, and 1:1 native blocks with chunk-local coords
+  const [sx, sy, sz] = planet.spawnPosition;
+  const sLen = Math.hypot(sx, sy, sz);
+  const hit = planet.raycastTerrain(sx, sy, sz, -sx / sLen, -sy / sLen, -sz / sLen, 10);
+  assert.equal(hit.hit, true, 'Adaptive sphere-assisted raycast must hit 1.54B³ surface cleanly');
+
+  const zoomTiers = new Set<string>();
+  let nativeMeshOriginOk = false;
+  for (let pass = 0; pass < 30; pass++) {
+    const zb = planet.streamHighResAround(hit.x, hit.y, hit.z, 'blocky', 48, 0.0001);
+    for (const item of zb.rebuiltMeshes) {
+      if (item.mesh.vertexCount > 0) {
+        zoomTiers.add(item.tier);
+        if (item.tier === 'native' && item.mesh.origin) {
+          const span = 8 * planet.nativeVoxelSize;
+          const lx = item.mesh.positions[0];
+          const ly = item.mesh.positions[1];
+          const lz = item.mesh.positions[2];
+          if (
+            lx >= -1e-9 &&
+            lx <= span + 1e-9 &&
+            ly >= -1e-9 &&
+            ly <= span + 1e-9 &&
+            lz >= -1e-9 &&
+            lz <= span + 1e-9
+          ) {
+            nativeMeshOriginOk = true;
+          }
+        }
+      }
+    }
+    if (zb.pendingTotal === 0) break;
+  }
+  assert.ok(
+    zoomTiers.has('midOuter') && zoomTiers.has('mid') && zoomTiers.has('native'),
+    `Expected midOuter/mid/native zoom cascade at 1.54B³, got ${Array.from(zoomTiers).join(',')}`,
+  );
+  assert.equal(nativeMeshOriginOk, true, '1:1 native sparse chunk must emit chunk-local coordinates + origin');
+
+  // 3. Sculpt 1:1 sub-micron crystal block & verify snapshot persistence
+  const bx = hit.x + hit.nx * planet.nativeVoxelSize * 2.5;
+  const by = hit.y + hit.ny * planet.nativeVoxelSize * 2.5;
+  const bz = hit.z + hit.nz * planet.nativeVoxelSize * 2.5;
+  planet.applyBrush(bx, by, bz, 'build', planet.nativeVoxelSize * 5, 3.0, MaterialId.Crystal);
+  assert.equal(planet.sampleNearestMaterial(bx, by, bz), MaterialId.Crystal);
+
+  const snap = planet.exportSnapshot();
+  const restored = new VoxelPlanet(1);
+  restored.importSnapshot(snap);
+  assert.equal(restored.voxelRadius, 500_000_000);
+  assert.ok(restored.fullCellsPerAxis > 1_000_000_000);
+  assert.equal(restored.sampleNearestMaterial(bx, by, bz), MaterialId.Crystal);
+});
+
 
 
 

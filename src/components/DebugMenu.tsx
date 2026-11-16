@@ -1,15 +1,12 @@
 import React, { useMemo, useState } from 'react';
-import {
-  MATERIAL_NAMES,
-  MaterialId,
-  VoxelFormatStats,
-} from '../engine/voxelPlanet';
+import { VoxelFormatStats } from '../engine/voxelPlanet';
 import {
   LodMode,
   SandboxConfig,
   SandboxTelemetry,
 } from '../engine/webgpuScene';
 import { NumericCadInput } from './NumericCadInput';
+import { MaterialDonutChart } from './MaterialDonutChart';
 
 interface DebugMenuProps {
   telemetry: SandboxTelemetry;
@@ -18,16 +15,6 @@ interface DebugMenuProps {
   onUpdateConfig: (partial: Partial<SandboxConfig>) => void;
   onClose: () => void;
 }
-
-const MAT_ORDER: MaterialId[] = [
-  MaterialId.Soil,
-  MaterialId.Stone,
-  MaterialId.Basalt,
-  MaterialId.Sandstone,
-  MaterialId.Crystal,
-  MaterialId.Ice,
-  MaterialId.Air,
-];
 
 function formatKb(bytes: number): string {
   return `${(bytes / 1024).toFixed(1)} KB`;
@@ -293,18 +280,18 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                 数据结构与二进制内存布局
               </div>
               <div className="grid grid-cols-2 gap-x-2.5 gap-y-1 font-mono-tabular text-[11px] text-slate-300">
-                <div>采样点网格: {voxelStats.gridN}³ ({voxelStats.totalVoxels.toLocaleString()})</div>
-                <div>体素单元: {voxelStats.cellsPerAxis}³ ({voxelStats.totalCells.toLocaleString()})</div>
-                <div>分块结构: {voxelStats.chunksPerAxis}³ × {voxelStats.chunkCells}³</div>
-                <div>宏步长: {formatMetric(voxelStats.voxelSize, 4)} m</div>
+                <div>全量 360° 网格: {voxelStats.fullCellsPerAxis.toLocaleString()}³</div>
+                <div>总虚拟体素: {voxelStats.fullTotalVoxelsLabel}</div>
+                <div>八叉树深度: L{voxelStats.octreeDepth} ({voxelStats.fullChunksPerAxis.toLocaleString()}³块)</div>
+                <div>驻留宏观缓存: {voxelStats.cellsPerAxis}³ ({voxelStats.chunksPerAxis}³×{voxelStats.chunkCells}³)</div>
                 <div>方块半径: {voxelStats.voxelRadius.toLocaleString()} 块</div>
-                <div>原生块尺寸: {formatMetric(voxelStats.nativeVoxelSize, 5)} m</div>
-                <div>虚拟全局维: {voxelStats.virtualCellsPerAxis.toLocaleString()}³</div>
+                <div>原生块尺寸: {formatMetric(voxelStats.nativeVoxelSize, 4)} m</div>
+                <div>宏步长: {formatMetric(voxelStats.voxelSize, 4)} m</div>
                 <div>
                   稀疏流式块:{' '}
                   {voxelStats.isSparseStreaming
                     ? `${voxelStats.sparseActiveChunks} 活跃`
-                    : '标准 56³'}
+                    : `全量 ${voxelStats.cellsPerAxis}³`}
                 </div>
                 <div>空间范围: ±{formatMetric(voxelStats.worldHalf, 2)} m</div>
                 <div>实心占空比: {solidPct}%</div>
@@ -323,33 +310,6 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                   <span>{formatKb(voxelStats.totalBytes)}</span>
                 </div>
               </div>
-            </div>
-
-            {/* Material Byte Histogram */}
-            <div className="rounded-xs border border-slate-800 bg-[#0d1322] p-2.5 space-y-1">
-              <div className="font-semibold text-[11px] text-slate-200 mb-1">
-                体素材质枚举分布 (Uint8 ID)
-              </div>
-              {MAT_ORDER.map((mId) => {
-                const count = voxelStats.materialCounts[mId] ?? 0;
-                const pct = ((count / voxelStats.totalVoxels) * 100).toFixed(1);
-                return (
-                  <div key={mId} className="flex items-center gap-2 font-mono-tabular text-[11px]">
-                    <span className="w-24 truncate text-slate-300">
-                      {mId}: {MATERIAL_NAMES[mId].split(' ')[0]}
-                    </span>
-                    <div className="flex-1 h-1.5 rounded-xs bg-slate-800 overflow-hidden">
-                      <div
-                        className="h-full bg-sky-400/80"
-                        style={{ width: `${Math.min(100, Number(pct) * 2.2)}%` }}
-                      />
-                    </div>
-                    <span className="w-12 text-right text-slate-400">
-                      {pct}%
-                    </span>
-                  </div>
-                );
-              })}
             </div>
 
             {/* Live Marching Cubes Cell Probe */}
@@ -429,6 +389,9 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
             </div>
           </>
         )}
+
+        {/* D3 Donut Chart: Real-time active voxel grid material composition */}
+        <MaterialDonutChart voxelStats={voxelStats} />
       </div>
     </aside>
   );

@@ -568,9 +568,13 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
 
                         <div className="font-mono-tabular text-[11px] text-sky-300/90 mt-0.5 truncate">
                           #{tile.config.seed} · R={tile.config.radius}m ·{' '}
-                          {tile.config.voxelRadius >= 1000
-                            ? `${(tile.config.voxelRadius / 1000).toFixed(tile.config.voxelRadius % 1000 === 0 ? 0 : 1)}k`
-                            : tile.config.voxelRadius}
+                          {tile.config.voxelRadius >= 1e8
+                            ? `${Number((tile.config.voxelRadius / 1e8).toFixed(2))}亿`
+                            : tile.config.voxelRadius >= 1e6
+                              ? `${Number((tile.config.voxelRadius / 1e6).toFixed(1))}M`
+                              : tile.config.voxelRadius >= 1000
+                                ? `${(tile.config.voxelRadius / 1000).toFixed(tile.config.voxelRadius % 1000 === 0 ? 0 : 1)}k`
+                                : tile.config.voxelRadius}
                           块
                         </div>
 
@@ -790,7 +794,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                   <div className="pt-2 border-t border-slate-800/80 space-y-1">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[11px] text-sky-300 font-medium">
-                        体素分辨率 (方块半径)
+                        体素分辨率 (全量 360° · 支持 &gt;10亿³)
                       </span>
                       <span className="text-[10px] font-mono-tabular text-slate-400">
                         单块{' '}
@@ -799,8 +803,10 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                           Math.max(4, selectedTile.config.voxelRadius)
                         ).toPrecision(3)}
                         m ·{' '}
-                        {Math.round(
-                          Math.max(4, selectedTile.config.voxelRadius) * 2 * 1.54,
+                        {(
+                          Math.ceil(
+                            (Math.max(4, selectedTile.config.voxelRadius) * 2 * 1.54) / 8,
+                          ) * 8
                         ).toLocaleString()}
                         ³
                       </span>
@@ -815,12 +821,12 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                       testId="title-voxel-res-input"
                       sliderScale="log"
                       sliderMin={6}
-                      sliderMax={50000}
+                      sliderMax={500000000}
                       onChangeValue={(v) => updateSelectedConfig({ voxelRadius: v })}
                     />
 
                     <div className="flex flex-wrap items-center gap-1 pt-0.5">
-                      {[18, 64, 512, 5000, 20000, 50000].map((res) => (
+                      {[18, 64, 512, 20000, 5000000, 500000000].map((res) => (
                         <button
                           key={res}
                           type="button"
@@ -831,7 +837,13 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                               : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
                           }`}
                         >
-                          {res >= 1000 ? `${res / 1000}k` : res}
+                          {res >= 1e8
+                            ? `${Number((res / 1e8).toFixed(1))}亿`
+                            : res >= 1e6
+                              ? `${res / 1e6}M`
+                              : res >= 1000
+                                ? `${res / 1000}k`
+                                : res}
                         </button>
                       ))}
                     </div>

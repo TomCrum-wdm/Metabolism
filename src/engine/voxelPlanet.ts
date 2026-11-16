@@ -159,7 +159,11 @@ function sanitizeSeedConfig(raw: Partial<PlanetSeedConfig>): PlanetSeedConfig {
 }
 
 export function encodeSeedCode(cfg: PlanetSeedConfig): string {
-  const fmt = (n: number) => (Number.isFinite(n) ? Number(n.toPrecision(6)).toString() : '0');
+  const fmt = (n: number) => {
+    if (!Number.isFinite(n)) return '0';
+    if (Number.isInteger(n) && Math.abs(n) <= 1e15) return String(n);
+    return Number(n.toPrecision(6)).toString();
+  };
   return [
     'TS3',
     Math.max(1, Math.floor(Math.abs(cfg.seed))) >>> 0,
@@ -211,6 +215,7 @@ export interface ChunkMeshData {
   cy: number;
   cz: number;
   lod: ChunkLodLevel;
+  origin?: [number, number, number];
   positions: Float32Array;
   normals: Float32Array;
   colors: Float32Array;
@@ -254,6 +259,11 @@ export interface VoxelFormatStats {
   voxelRadius: number;
   nativeVoxelSize: number;
   virtualCellsPerAxis: number;
+  fullCellsPerAxis: number;
+  fullChunksPerAxis: number;
+  fullGridN: number;
+  octreeDepth: number;
+  fullTotalVoxelsLabel: string;
   sparseActiveChunks: number;
   isSparseStreaming: boolean;
 }
@@ -381,13 +391,20 @@ interface AnalyticalContext {
 export interface HighResStreamBatch {
   active: boolean;
   hideMacro: boolean;
+  globeBuiltComplete: boolean;
+  hemiCenter: [number, number, number];
+  hemiDiscardRadius: number;
+  midOuterCenter: [number, number, number];
+  midOuterDiscardRadius: number;
+  midCenter: [number, number, number];
+  midDiscardRadius: number;
   nativeCenter: [number, number, number];
   nativeDiscardRadius: number;
-  midDiscardRadius: number;
+  pendingTotal: number;
   desiredKeys: Set<string>;
   rebuiltMeshes: Array<{
     key: string;
-    tier: 'native' | 'mid';
+    tier: 'globe' | 'hemi' | 'midOuter' | 'mid' | 'native';
     mesh: ChunkMeshData;
   }>;
 }
@@ -396,14 +413,33 @@ const SPARSE_PAD = 1;
 const SPARSE_N = CHUNK_CELLS + 1 + SPARSE_PAD * 2; // 11
 const SPARSE_NY = SPARSE_N;
 const SPARSE_NZ = SPARSE_N * SPARSE_N;
+const MAX_DENSE_CHUNKS_PER_AXIS = 40; // Up to 320³ flat dense RAM cache
+const STREAMING_FALLBACK_CHUNKS_PER_AXIS = 24; // 192³ resident fallback cache for 360° sparse octree (>1,000,000,000³+)
+
+function formatVoxelCountLabel(cellsPerAxis: number): string {
+  if (cellsPerAxis <= 2000) {
+    return (cellsPerAxis * cellsPerAxis * cellsPerAxis).toLocaleString();
+  }
+  const log10 = 3 * Math.log10(cellsPerAxis);
+  const exp = Math.floor(log10);
+  const mant = Math.pow(10, log10 - exp);
+  return `${mant.toFixed(2)}×10^${exp}`;
+}
 
 export class VoxelPlanet {
-  public readonly gridN = GRID_N;
-  public readonly cellsPerAxis = CELLS_PER_AXIS;
+  public gridN = GRID_N;
+  public cellsPerAxis = CELLS_PER_AXIS;
   public readonly chunkCells = CHUNK_CELLS;
-  public readonly chunksPerAxis = CHUNKS_PER_AXIS;
+  public chunksPerAxis = CHUNKS_PER_AXIS;
+  public totalChunks = CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS;
   public worldHalf = WORLD_HALF;
   public voxelSize = VOXEL_SIZE;
+
+  // Full 360° sparse hierarchical octree domain (scales unrestrictedly past 1,000,000,000³)
+  public fullCellsPerAxis = CELLS_PER_AXIS;
+  public fullChunksPerAxis = CHUNKS_PER_AXIS;
+  public fullGridN = GRID_N;
+  public octreeDepth = 3;
 
   public baseRadius = DEFAULT_PLANET_RADIUS;
   public voxelRadius = DEFAULT_SEED_CONFIG.voxelRadius;
@@ -411,9 +447,10 @@ export class VoxelPlanet {
   public isHighResStreaming = false;
   public seedConfig: PlanetSeedConfig = { ...DEFAULT_SEED_CONFIG };
 
-  public readonly density: Float32Array;
-  public readonly material: Uint8Array;
-  public readonly dirtyChunks: Uint8Array;
+  public density: Float32Array;
+  public material: Uint8Array;
+  public dirtyChunks: Uint8Array;
+  public nonUniformChunks: Uint8Array;
 
   public readonly sparseChunks = new Map<string, SparseVoxelChunk>();
   private streamFrame = 0;
@@ -437,6 +474,7 @@ export class VoxelPlanet {
   public spawnPosition: [number, number, number] = [0, DEFAULT_PLANET_RADIUS + 2.2, 0];
   public lakeBasinCenters: Array<[number, number, number]> = [];
   public hasGenerated = false;
+  public voxelRevision = 0;
 
   constructor(
     seedOrConfig: number | Partial<PlanetSeedConfig> = 202611,
@@ -445,9 +483,8 @@ export class VoxelPlanet {
     const total = GRID_N * GRID_N * GRID_N;
     this.density = new Float32Array(total);
     this.material = new Uint8Array(total);
-    this.dirtyChunks = new Uint8Array(
-      CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS,
-    );
+    this.dirtyChunks = new Uint8Array(this.totalChunks);
+    this.nonUniformChunks = new Uint8Array(this.totalChunks).fill(1);
 
     // Up to 24 verts per cell (supports worst-case blocky 6-face meshing & Marching Cubes)
     const maxVerts = CHUNK_CELLS * CHUNK_CELLS * CHUNK_CELLS * 24;
@@ -473,11 +510,11 @@ export class VoxelPlanet {
   }
 
   public gridIndex(ix: number, iy: number, iz: number): number {
-    return ix + iy * GRID_N + iz * GRID_N * GRID_N;
+    return ix + iy * this.gridN + iz * this.gridN * this.gridN;
   }
 
   public chunkIndex(cx: number, cy: number, cz: number): number {
-    return cx + cy * CHUNKS_PER_AXIS + cz * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS;
+    return cx + cy * this.chunksPerAxis + cz * this.chunksPerAxis * this.chunksPerAxis;
   }
 
   public chunkCenterWorld(cx: number, cy: number, cz: number): [number, number, number] {
@@ -497,13 +534,61 @@ export class VoxelPlanet {
     return (w + this.worldHalf) / this.voxelSize;
   }
 
+  private computeTargetChunksPerAxis(voxelRadius: number): number {
+    if (voxelRadius <= 18.45) return CHUNKS_PER_AXIS;
+    const desiredCells = Math.round(voxelRadius * 2 * 1.54);
+    const neededChunks = Math.ceil(desiredCells / CHUNK_CELLS);
+    if (neededChunks <= MAX_DENSE_CHUNKS_PER_AXIS) {
+      return Math.max(CHUNKS_PER_AXIS, neededChunks);
+    }
+    return STREAMING_FALLBACK_CHUNKS_PER_AXIS;
+  }
+
+  private resizeGridForChunks(chunksPerAxis: number): void {
+    const clamped = clamp(Math.round(chunksPerAxis), CHUNKS_PER_AXIS, MAX_DENSE_CHUNKS_PER_AXIS);
+    if (clamped === this.chunksPerAxis && this.density.length === (clamped * CHUNK_CELLS + 1) ** 3) {
+      return;
+    }
+    this.chunksPerAxis = clamped;
+    this.cellsPerAxis = clamped * CHUNK_CELLS;
+    this.gridN = this.cellsPerAxis + 1;
+    this.totalChunks = clamped * clamped * clamped;
+    const total = this.gridN * this.gridN * this.gridN;
+    this.density = new Float32Array(total);
+    this.material = new Uint8Array(total);
+    this.dirtyChunks = new Uint8Array(this.totalChunks);
+    this.nonUniformChunks = new Uint8Array(this.totalChunks).fill(1);
+  }
+
   private updateBoundsForRadius(radius: number, voxelRadius: number): void {
-    this.baseRadius = radius;
     this.voxelRadius = Math.max(4, voxelRadius);
+    const targetMacroChunks = this.computeTargetChunksPerAxis(this.voxelRadius);
+    this.resizeGridForChunks(targetMacroChunks);
+    this.baseRadius = radius;
     this.worldHalf = Math.max(0.25, radius * 1.54);
-    this.voxelSize = (this.worldHalf * 2) / CELLS_PER_AXIS;
+    this.voxelSize = (this.worldHalf * 2) / this.cellsPerAxis;
     this.nativeVoxelSize = this.baseRadius / this.voxelRadius;
-    this.isHighResStreaming = Math.abs(this.voxelRadius - 18) > 0.45;
+
+    const maxMacroVoxelRadius = Math.floor(this.cellsPerAxis / (2 * 1.54)) + 2;
+    this.isHighResStreaming =
+      this.voxelRadius < 17.55 || this.voxelRadius > maxMacroVoxelRadius;
+
+    if (this.isHighResStreaming) {
+      const desiredFullChunks = Math.max(
+        1,
+        Math.ceil((this.voxelRadius * 2 * 1.54) / CHUNK_CELLS),
+      );
+      this.fullChunksPerAxis = desiredFullChunks;
+      this.fullCellsPerAxis = desiredFullChunks * CHUNK_CELLS;
+    } else {
+      this.fullChunksPerAxis = this.chunksPerAxis;
+      this.fullCellsPerAxis = this.cellsPerAxis;
+    }
+    this.fullGridN = this.fullCellsPerAxis + 1;
+    this.octreeDepth = Math.max(
+      1,
+      Math.ceil(Math.log2(Math.max(2, this.fullChunksPerAxis))),
+    );
   }
 
   private buildAnalyticalContext(cfg: PlanetSeedConfig): AnalyticalContext {
@@ -770,9 +855,12 @@ export class VoxelPlanet {
       const fineWave = fbm3D(wxN * 1.85 + seedOffX, wyN * 1.85 + seedOffY, wzN * 1.85 + seedOffZ, 2) * fineAmp;
       targetRadius += fineWave;
       if (detailLogScale > 2.2) {
-        const blockWaveFreq = 1 / Math.max(this.nativeVoxelSize * 14, 1e-5);
+        const blockWaveFreq = 1 / Math.max(this.nativeVoxelSize * 14, 1e-12);
+        const bx = (((wx * blockWaveFreq) % 256) + 256) % 256;
+        const by = (((wy * blockWaveFreq) % 256) + 256) % 256;
+        const bz = (((wz * blockWaveFreq) % 256) + 256) % 256;
         const blockRelief =
-          fbm3D(wx * blockWaveFreq + seedOffX, wy * blockWaveFreq + seedOffY, wz * blockWaveFreq + seedOffZ, 2) *
+          fbm3D(bx + seedOffX, by + seedOffY, bz + seedOffZ, 2, 2.0, 0.5) *
           this.nativeVoxelSize *
           2.6;
         targetRadius += blockRelief;
@@ -872,6 +960,117 @@ export class VoxelPlanet {
     return { density: d, material: mat };
   }
 
+  private getRadialEvalBounds(): { minEvalR: number; maxSurfR: number; rScale: number } {
+    const { cfg, rScale } = this.genCtx;
+    const terrainSpread =
+      Math.abs(cfg.continentAmp) +
+      Math.abs(cfg.ridgeAmp) +
+      Math.abs(cfg.craterDepth);
+    const minSurfR = Math.max(0, Math.min(cfg.radius * 0.88, cfg.radius - (terrainSpread * 1.35 + 2.2) * rScale));
+    const minEvalR =
+      cfg.caveDensity > 0.01 ? Math.min(minSurfR, cfg.radius * 0.24) : minSurfR;
+    const maxSurfR =
+      cfg.radius +
+      (Math.abs(cfg.continentAmp) * 1.25 +
+        Math.abs(cfg.ridgeAmp) * 1.1 +
+        (cfg.hasArch ? 3.8 : 1.8)) *
+        rScale;
+    return { minEvalR, maxSurfR, rScale };
+  }
+
+  private computeChunkEvalMask(): Uint8Array {
+    const cpa = this.chunksPerAxis;
+    const total = this.totalChunks;
+    const needEval = new Uint8Array(total);
+    const evalWithHalo = new Uint8Array(total);
+
+    if (cpa <= 8) {
+      evalWithHalo.fill(1);
+      return evalWithHalo;
+    }
+
+    const { cfg, rScale, seedOffX, seedOffY, seedOffZ, archCenter } = this.genCtx;
+    const { minEvalR, maxSurfR } = this.getRadialEvalBounds();
+    const chunkSpan = CHUNK_CELLS * this.voxelSize;
+    const halfDiag = chunkSpan * 0.8660254;
+    const surfMargin =
+      halfDiag * (1.85 + Math.min(1.5, Math.abs(cfg.ridgeAmp) * 0.1 + Math.abs(cfg.craterDepth) * 0.06));
+    const caveMinR = cfg.radius * 0.28;
+    const caveMaxR = cfg.radius * 0.72;
+    const hasCaves = cfg.caveDensity > 0.01;
+    const archRadSq = (4.4 * rScale + halfDiag) * (4.4 * rScale + halfDiag);
+
+    for (let cz = 0; cz < cpa; cz++) {
+      const cwz = this.gridToWorld(cz * CHUNK_CELLS) + chunkSpan * 0.5;
+      for (let cy = 0; cy < cpa; cy++) {
+        const cwy = this.gridToWorld(cy * CHUNK_CELLS) + chunkSpan * 0.5;
+        for (let cx = 0; cx < cpa; cx++) {
+          const cwx = this.gridToWorld(cx * CHUNK_CELLS) + chunkSpan * 0.5;
+          const cr = Math.hypot(cwx, cwy, cwz);
+          if (cr > maxSurfR + halfDiag * 1.2 || cr < minEvalR - halfDiag * 1.2) {
+            continue;
+          }
+
+          const centerRes = this.evalAnalyticalAt(cwx, cwy, cwz, true);
+          let active = Math.abs(centerRes.density) <= surfMargin;
+
+          if (!active && cfg.hasArch) {
+            const adx = cwx - archCenter[0];
+            const ady = cwy - archCenter[1];
+            const adz = cwz - archCenter[2];
+            if (adx * adx + ady * ady + adz * adz <= archRadSq) {
+              active = true;
+            }
+          }
+
+          if (!active && hasCaves && cr >= caveMinR - halfDiag && cr <= caveMaxR + halfDiag) {
+            if (centerRes.density <= halfDiag * 3.8) {
+              active = true;
+            } else {
+              const caveNoise = fbm3D(
+                (cwx / rScale) * 0.19 + 11.3 + seedOffX * 0.07,
+                (cwy / rScale) * 0.19 + seedOffY * 0.07,
+                (cwz / rScale) * 0.19 + seedOffZ * 0.07,
+                3,
+              );
+              if (caveNoise > 0.14 - 0.35 * (halfDiag / Math.max(rScale, 1e-4))) {
+                active = true;
+              }
+            }
+          }
+
+          if (active) {
+            needEval[this.chunkIndex(cx, cy, cz)] = 1;
+          }
+        }
+      }
+    }
+
+    // Dilate active surface chunks by 1-chunk halo so shared boundary vertices match seamlessly
+    for (let cz = 0; cz < cpa; cz++) {
+      for (let cy = 0; cy < cpa; cy++) {
+        for (let cx = 0; cx < cpa; cx++) {
+          if (needEval[this.chunkIndex(cx, cy, cz)] === 0) continue;
+          const z0 = Math.max(0, cz - 1);
+          const z1 = Math.min(cpa - 1, cz + 1);
+          const y0 = Math.max(0, cy - 1);
+          const y1 = Math.min(cpa - 1, cy + 1);
+          const x0 = Math.max(0, cx - 1);
+          const x1 = Math.min(cpa - 1, cx + 1);
+          for (let nz = z0; nz <= z1; nz++) {
+            for (let ny = y0; ny <= y1; ny++) {
+              for (let nx = x0; nx <= x1; nx++) {
+                evalWithHalo[this.chunkIndex(nx, ny, nz)] = 1;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return evalWithHalo;
+  }
+
   public generatePlanet(seedOrConfig: number | Partial<PlanetSeedConfig> = 202611): void {
     const raw: Partial<PlanetSeedConfig> =
       typeof seedOrConfig === 'number'
@@ -887,20 +1086,50 @@ export class VoxelPlanet {
       .slice(0, 3)
       .map((c) => [c.x, c.y, c.z]);
 
-    const rScale = this.genCtx.rScale;
-    for (let iz = 0; iz < GRID_N; iz++) {
+    const gridN = this.gridN;
+    const cpa = this.chunksPerAxis;
+    const { minEvalR, maxSurfR, rScale } = this.getRadialEvalBounds();
+    const edgeClip = this.worldHalf * 0.94;
+    const includeMicro = !this.isHighResStreaming || this.gridN <= 64;
+    const evalMask = this.computeChunkEvalMask();
+
+    for (let iz = 0; iz < gridN; iz++) {
       const wz = this.gridToWorld(iz);
-      for (let iy = 0; iy < GRID_N; iy++) {
+      const az = Math.abs(wz);
+      const wz2 = wz * wz;
+      const czBase = Math.min(cpa - 1, iz >> 3) * cpa * cpa;
+      for (let iy = 0; iy < gridN; iy++) {
         const wy = this.gridToWorld(iy);
-        for (let ix = 0; ix < GRID_N; ix++) {
+        const ayz = Math.max(az, Math.abs(wy));
+        const wyz2 = wz2 + wy * wy;
+        const cyzBase = czBase + Math.min(cpa - 1, iy >> 3) * cpa;
+        for (let ix = 0; ix < gridN; ix++) {
           const wx = this.gridToWorld(ix);
           const idx = this.gridIndex(ix, iy, iz);
-          const evalRes = this.evalAnalyticalAt(wx, wy, wz, false);
-          this.density[idx] = evalRes.density;
-          this.material[idx] = evalRes.material;
+          const ci = cyzBase + Math.min(cpa - 1, ix >> 3);
+          const r = Math.sqrt(wx * wx + wyz2);
+          if (evalMask[ci] === 0 || r > maxSurfR || r < minEvalR) {
+            let d = cfg.radius - r;
+            if (d <= 0 || r > maxSurfR) {
+              const em = edgeClip - Math.max(ayz, Math.abs(wx));
+              if (em < 0) d = Math.min(d, em * 2.0 - 0.5 * rScale);
+              this.density[idx] = d;
+              this.material[idx] = d > 0 ? (r < cfg.radius * 0.49 ? MaterialId.Basalt : MaterialId.Stone) : MaterialId.Air;
+            } else {
+              this.density[idx] = d;
+              this.material[idx] =
+                r < cfg.radius * 0.49 ? MaterialId.Basalt : MaterialId.Stone;
+            }
+          } else {
+            const evalRes = this.evalAnalyticalAt(wx, wy, wz, includeMicro);
+            this.density[idx] = evalRes.density;
+            this.material[idx] = evalRes.material;
+          }
         }
       }
     }
+
+    this.nonUniformChunks.set(evalMask);
 
     const spawnDir = this.genCtx.spawnDir;
     const spawnR = this.findSurfaceRadiusAlongRay(
@@ -916,6 +1145,7 @@ export class VoxelPlanet {
 
     this.dirtyChunks.fill(1);
     this.hasGenerated = true;
+    this.voxelRevision++;
   }
 
   public async generatePlanetAsync(
@@ -937,36 +1167,65 @@ export class VoxelPlanet {
       .slice(0, 3)
       .map((c) => [c.x, c.y, c.z]);
 
-    onProgress?.(0.02, '初始化星球参数与地质噪声场');
+    onProgress?.(0.02, '初始化星球参数与表面分块掩码');
 
-    const rScale = this.genCtx.rScale;
+    const gridN = this.gridN;
+    const cpa = this.chunksPerAxis;
+    const { minEvalR, maxSurfR, rScale } = this.getRadialEvalBounds();
+    const edgeClip = this.worldHalf * 0.94;
+    const includeMicro = !this.isHighResStreaming || this.gridN <= 64;
+    const evalMask = this.computeChunkEvalMask();
     let sliceStart = performance.now();
 
-    for (let iz = 0; iz < GRID_N; iz++) {
+    for (let iz = 0; iz < gridN; iz++) {
       if (shouldAbort?.()) return false;
       const wz = this.gridToWorld(iz);
-      for (let iy = 0; iy < GRID_N; iy++) {
+      const az = Math.abs(wz);
+      const wz2 = wz * wz;
+      const czBase = Math.min(cpa - 1, iz >> 3) * cpa * cpa;
+      for (let iy = 0; iy < gridN; iy++) {
         const wy = this.gridToWorld(iy);
-        for (let ix = 0; ix < GRID_N; ix++) {
+        const ayz = Math.max(az, Math.abs(wy));
+        const wyz2 = wz2 + wy * wy;
+        const cyzBase = czBase + Math.min(cpa - 1, iy >> 3) * cpa;
+        for (let ix = 0; ix < gridN; ix++) {
           const wx = this.gridToWorld(ix);
           const idx = this.gridIndex(ix, iy, iz);
-          const evalRes = this.evalAnalyticalAt(wx, wy, wz, false);
-          this.density[idx] = evalRes.density;
-          this.material[idx] = evalRes.material;
+          const ci = cyzBase + Math.min(cpa - 1, ix >> 3);
+          const r = Math.sqrt(wx * wx + wyz2);
+          if (evalMask[ci] === 0 || r > maxSurfR || r < minEvalR) {
+            let d = cfg.radius - r;
+            if (d <= 0 || r > maxSurfR) {
+              const em = edgeClip - Math.max(ayz, Math.abs(wx));
+              if (em < 0) d = Math.min(d, em * 2.0 - 0.5 * rScale);
+              this.density[idx] = d;
+              this.material[idx] = d > 0 ? (r < cfg.radius * 0.49 ? MaterialId.Basalt : MaterialId.Stone) : MaterialId.Air;
+            } else {
+              this.density[idx] = d;
+              this.material[idx] =
+                r < cfg.radius * 0.49 ? MaterialId.Basalt : MaterialId.Stone;
+            }
+          } else {
+            const evalRes = this.evalAnalyticalAt(wx, wy, wz, includeMicro);
+            this.density[idx] = evalRes.density;
+            this.material[idx] = evalRes.material;
+          }
         }
       }
 
-      if (performance.now() - sliceStart >= 8 || iz === GRID_N - 1) {
+      if (performance.now() - sliceStart >= 8 || iz === gridN - 1) {
         onProgress?.(
-          0.04 + 0.92 * ((iz + 1) / GRID_N),
-          `体素密度场采样 ${iz + 1}/${GRID_N}`,
+          0.04 + 0.92 * ((iz + 1) / gridN),
+          `体素密度场采样 ${iz + 1}/${gridN} (${this.cellsPerAxis}³)`,
         );
-        if (iz < GRID_N - 1) {
+        if (iz < gridN - 1) {
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
           sliceStart = performance.now();
         }
       }
     }
+
+    this.nonUniformChunks.set(evalMask);
 
     if (shouldAbort?.()) return false;
 
@@ -984,6 +1243,7 @@ export class VoxelPlanet {
 
     this.dirtyChunks.fill(1);
     this.hasGenerated = true;
+    this.voxelRevision++;
     onProgress?.(1.0, '体素场构建完成');
     return true;
   }
@@ -1014,14 +1274,19 @@ export class VoxelPlanet {
   }
 
   public importSnapshot(snapshot: VoxelPlanetSnapshot): void {
+    const snapGridN = Math.round(Math.cbrt(snapshot.density.length));
     if (
-      snapshot.density.length !== this.density.length ||
-      snapshot.material.length !== this.material.length
+      snapGridN < 9 ||
+      snapGridN * snapGridN * snapGridN !== snapshot.density.length ||
+      snapshot.material.length !== snapshot.density.length ||
+      (snapGridN - 1) % CHUNK_CELLS !== 0
     ) {
       throw new Error('Incompatible voxel grid dimensions in snapshot');
     }
     this.seedConfig = sanitizeSeedConfig(snapshot.seedConfig);
     this.updateBoundsForRadius(this.seedConfig.radius, this.seedConfig.voxelRadius);
+    this.resizeGridForChunks((snapGridN - 1) / CHUNK_CELLS);
+    this.voxelSize = (this.worldHalf * 2) / this.cellsPerAxis;
     this.genCtx = this.buildAnalyticalContext(this.seedConfig);
     this.sparseChunks.clear();
     if (snapshot.editedChunks) {
@@ -1052,7 +1317,40 @@ export class VoxelPlanet {
     this.lakeBasinCenters = snapshot.lakeBasinCenters.map(
       (c) => [...c] as [number, number, number],
     );
+    const cpa = this.chunksPerAxis;
+    const sY = this.gridN;
+    const sZ = sY * sY;
+    this.nonUniformChunks.fill(0);
+    for (let cz = 0; cz < cpa; cz++) {
+      const sz = cz * CHUNK_CELLS;
+      for (let cy = 0; cy < cpa; cy++) {
+        const sy = cy * CHUNK_CELLS;
+        for (let cx = 0; cx < cpa; cx++) {
+          const sx = cx * CHUNK_CELLS;
+          let anyS = false;
+          let anyA = false;
+          for (let dz = 0; dz <= CHUNK_CELLS; dz++) {
+            const bz = (sz + dz) * sZ;
+            for (let dy = 0; dy <= CHUNK_CELLS; dy++) {
+              const byz = bz + (sy + dy) * sY + sx;
+              for (let dx = 0; dx <= CHUNK_CELLS; dx++) {
+                if (this.density[byz + dx] > 0) anyS = true;
+                else anyA = true;
+                if (anyS && anyA) break;
+              }
+              if (anyS && anyA) break;
+            }
+            if (anyS && anyA) break;
+          }
+          if (anyS && anyA) {
+            this.nonUniformChunks[this.chunkIndex(cx, cy, cz)] = 1;
+          }
+        }
+      }
+    }
     this.dirtyChunks.fill(1);
+    this.hasGenerated = true;
+    this.voxelRevision++;
   }
 
   public getVoxelStats(): VoxelFormatStats {
@@ -1079,17 +1377,17 @@ export class VoxelPlanet {
       sparseBytes += c.density.byteLength + c.material.byteLength;
     }
     const virtualCellsPerAxis = Math.max(
-      CELLS_PER_AXIS,
+      this.cellsPerAxis,
       Math.round(this.voxelRadius * 2 * 1.54),
     );
     return {
-      gridN: GRID_N,
-      cellsPerAxis: CELLS_PER_AXIS,
+      gridN: this.gridN,
+      cellsPerAxis: this.cellsPerAxis,
       chunkCells: CHUNK_CELLS,
-      chunksPerAxis: CHUNKS_PER_AXIS,
+      chunksPerAxis: this.chunksPerAxis,
       totalVoxels: n,
-      totalCells: CELLS_PER_AXIS * CELLS_PER_AXIS * CELLS_PER_AXIS,
-      totalChunks: CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS,
+      totalCells: this.cellsPerAxis * this.cellsPerAxis * this.cellsPerAxis,
+      totalChunks: this.totalChunks,
       voxelSize: this.voxelSize,
       worldHalf: this.worldHalf,
       densityBytes,
@@ -1099,24 +1397,31 @@ export class VoxelPlanet {
       materialCounts: counts,
       voxelRadius: this.voxelRadius,
       nativeVoxelSize: this.nativeVoxelSize,
-      virtualCellsPerAxis,
+      virtualCellsPerAxis: this.fullCellsPerAxis,
+      fullCellsPerAxis: this.fullCellsPerAxis,
+      fullChunksPerAxis: this.fullChunksPerAxis,
+      fullGridN: this.fullGridN,
+      octreeDepth: this.octreeDepth,
+      fullTotalVoxelsLabel: formatVoxelCountLabel(this.fullCellsPerAxis),
       sparseActiveChunks: this.sparseChunks.size,
       isSparseStreaming: this.isHighResStreaming,
     };
   }
 
   public probeVoxelCell(wx: number, wy: number, wz: number): VoxelCellProbe {
-    const gx = clamp(this.worldToGrid(wx), 0, CELLS_PER_AXIS - 0.001);
-    const gy = clamp(this.worldToGrid(wy), 0, CELLS_PER_AXIS - 0.001);
-    const gz = clamp(this.worldToGrid(wz), 0, CELLS_PER_AXIS - 0.001);
+    const cellsPerAxis = this.cellsPerAxis;
+    const chunksPerAxis = this.chunksPerAxis;
+    const gx = clamp(this.worldToGrid(wx), 0, cellsPerAxis - 0.001);
+    const gy = clamp(this.worldToGrid(wy), 0, cellsPerAxis - 0.001);
+    const gz = clamp(this.worldToGrid(wz), 0, cellsPerAxis - 0.001);
 
     const ix = Math.floor(gx);
     const iy = Math.floor(gy);
     const iz = Math.floor(gz);
 
-    const cx = clamp(Math.floor(ix / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cy = clamp(Math.floor(iy / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cz = clamp(Math.floor(iz / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
+    const cx = clamp(Math.floor(ix / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cy = clamp(Math.floor(iy / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cz = clamp(Math.floor(iz / CHUNK_CELLS), 0, chunksPerAxis - 1);
 
     let cubeIndex = 0;
     const corners: VoxelCellCornerSample[] = [];
@@ -1148,9 +1453,9 @@ export class VoxelPlanet {
 
     const slice5x5: Array<{ dx: number; dz: number; density: number; material: MaterialId }> = [];
     for (let dz = -2; dz <= 2; dz++) {
-      const sz = clamp(iz + dz, 0, CELLS_PER_AXIS);
+      const sz = clamp(iz + dz, 0, cellsPerAxis);
       for (let dx = -2; dx <= 2; dx++) {
-        const sx = clamp(ix + dx, 0, CELLS_PER_AXIS);
+        const sx = clamp(ix + dx, 0, cellsPerAxis);
         const sIdx = this.gridIndex(sx, iy, sz);
         slice5x5.push({
           dx,
@@ -1181,9 +1486,27 @@ export class VoxelPlanet {
     const startR = this.worldHalf - this.voxelSize * 2.0;
     const minR = this.baseRadius * 0.15;
     const stepR = Math.max(this.voxelSize * 0.22, 0.005);
-    for (let r = startR; r >= minR; r -= stepR) {
+    let prevR = startR;
+    if (this.sampleDensity(dx * prevR, dy * prevR, dz * prevR) >= 0) {
+      return prevR;
+    }
+    for (let r = startR - stepR; r >= minR; r -= stepR) {
       const val = this.sampleDensity(dx * r, dy * r, dz * r);
-      if (val >= 0) return r;
+      if (val >= 0) {
+        if (!this.isHighResStreaming) return r;
+        let loAir = prevR;
+        let hiSolid = r;
+        for (let b = 0; b < 28; b++) {
+          const mid = 0.5 * (loAir + hiSolid);
+          if (this.sampleDensity(dx * mid, dy * mid, dz * mid) >= 0) {
+            hiSolid = mid;
+          } else {
+            loAir = mid;
+          }
+        }
+        return 0.5 * (loAir + hiSolid);
+      }
+      prevR = r;
     }
     return this.baseRadius;
   }
@@ -1241,8 +1564,15 @@ export class VoxelPlanet {
 
   /**
    * Fast trilinear interpolation of voxel scalar density at world position (x,y,z).
+   * In high-res SVO mode, refines near-surface queries analytically so raycasts, explorer
+   * footing, and surface focus locks match 1:1 native blocks to sub-nanometer precision.
    */
-  public sampleDensity(wx: number, wy: number, wz: number): number {
+  public sampleDensity(
+    wx: number,
+    wy: number,
+    wz: number,
+    fastMacro = false,
+  ): number {
     if (this.isHighResStreaming && this.sparseChunks.size > 0) {
       const sparseD = this.sampleSparseDensity(wx, wy, wz);
       if (sparseD !== null) return sparseD;
@@ -1252,13 +1582,14 @@ export class VoxelPlanet {
     const gy = this.worldToGrid(wy);
     const gz = this.worldToGrid(wz);
 
+    const cellsPerAxis = this.cellsPerAxis;
     if (
       gx < 0 ||
       gy < 0 ||
       gz < 0 ||
-      gx >= CELLS_PER_AXIS ||
-      gy >= CELLS_PER_AXIS ||
-      gz >= CELLS_PER_AXIS
+      gx >= cellsPerAxis ||
+      gy >= cellsPerAxis ||
+      gz >= cellsPerAxis
     ) {
       return -2.0;
     }
@@ -1270,8 +1601,8 @@ export class VoxelPlanet {
     const fy = gy - iy;
     const fz = gz - iz;
 
-    const sY = GRID_N;
-    const sZ = GRID_N * GRID_N;
+    const sY = this.gridN;
+    const sZ = sY * sY;
     const base = ix + iy * sY + iz * sZ;
 
     const c000 = this.density[base];
@@ -1290,8 +1621,18 @@ export class VoxelPlanet {
 
     const y0 = x00 + (x10 - x00) * fy;
     const y1 = x01 + (x11 - x01) * fy;
+    const macroD = y0 + (y1 - y0) * fz;
 
-    return y0 + (y1 - y0) * fz;
+    if (
+      !fastMacro &&
+      this.isHighResStreaming &&
+      this.hasGenerated &&
+      Math.abs(macroD) <= this.voxelSize * 2.5
+    ) {
+      return this.evalAnalyticalAt(wx, wy, wz, true).density;
+    }
+
+    return macroD;
   }
 
   /**
@@ -1302,23 +1643,25 @@ export class VoxelPlanet {
     wy: number,
     wz: number,
     outNormal: [number, number, number],
+    fastMacro = false,
   ): number {
-    const val = this.sampleDensity(wx, wy, wz);
-    const eps = this.isHighResStreaming
-      ? Math.max(this.nativeVoxelSize * 0.65, this.voxelSize * 0.08)
-      : this.voxelSize * 0.65;
+    const val = this.sampleDensity(wx, wy, wz, fastMacro);
+    const eps =
+      !fastMacro && this.isHighResStreaming
+        ? Math.max(this.nativeVoxelSize * 0.65, 1e-9)
+        : this.voxelSize * 0.65;
     const dx =
-      this.sampleDensity(wx - eps, wy, wz) -
-      this.sampleDensity(wx + eps, wy, wz);
+      this.sampleDensity(wx - eps, wy, wz, fastMacro) -
+      this.sampleDensity(wx + eps, wy, wz, fastMacro);
     const dy =
-      this.sampleDensity(wx, wy - eps, wz) -
-      this.sampleDensity(wx, wy + eps, wz);
+      this.sampleDensity(wx, wy - eps, wz, fastMacro) -
+      this.sampleDensity(wx, wy + eps, wz, fastMacro);
     const dz =
-      this.sampleDensity(wx, wy, wz - eps) -
-      this.sampleDensity(wx, wy, wz + eps);
+      this.sampleDensity(wx, wy, wz - eps, fastMacro) -
+      this.sampleDensity(wx, wy, wz + eps, fastMacro);
 
     const len = Math.hypot(dx, dy, dz);
-    if (len > 1e-6) {
+    if (len > 1e-12) {
       outNormal[0] = dx / len;
       outNormal[1] = dy / len;
       outNormal[2] = dz / len;
@@ -1332,35 +1675,41 @@ export class VoxelPlanet {
   }
 
   public sampleNearestMaterial(wx: number, wy: number, wz: number): MaterialId {
-    if (this.isHighResStreaming && this.sparseChunks.size > 0) {
-      const chunkSpan = CHUNK_CELLS * this.nativeVoxelSize;
-      const cx = Math.floor(wx / chunkSpan);
-      const cy = Math.floor(wy / chunkSpan);
-      const cz = Math.floor(wz / chunkSpan);
-      const chunk = this.sparseChunks.get(`1:${cx},${cy},${cz}`);
-      if (chunk) {
-        const ix = clamp(
-          Math.round((wx - chunk.originX) / chunk.stepSize) + SPARSE_PAD,
-          0,
-          SPARSE_N - 1,
-        );
-        const iy = clamp(
-          Math.round((wy - chunk.originY) / chunk.stepSize) + SPARSE_PAD,
-          0,
-          SPARSE_N - 1,
-        );
-        const iz = clamp(
-          Math.round((wz - chunk.originZ) / chunk.stepSize) + SPARSE_PAD,
-          0,
-          SPARSE_N - 1,
-        );
-        return chunk.material[ix + iy * SPARSE_NY + iz * SPARSE_NZ] as MaterialId;
+    if (this.isHighResStreaming) {
+      if (this.sparseChunks.size > 0) {
+        const chunkSpan = CHUNK_CELLS * this.nativeVoxelSize;
+        const cx = Math.floor(wx / chunkSpan);
+        const cy = Math.floor(wy / chunkSpan);
+        const cz = Math.floor(wz / chunkSpan);
+        const chunk = this.sparseChunks.get(`1:${cx},${cy},${cz}`);
+        if (chunk) {
+          const ix = clamp(
+            Math.round((wx - chunk.originX) / chunk.stepSize) + SPARSE_PAD,
+            0,
+            SPARSE_N - 1,
+          );
+          const iy = clamp(
+            Math.round((wy - chunk.originY) / chunk.stepSize) + SPARSE_PAD,
+            0,
+            SPARSE_N - 1,
+          );
+          const iz = clamp(
+            Math.round((wz - chunk.originZ) / chunk.stepSize) + SPARSE_PAD,
+            0,
+            SPARSE_N - 1,
+          );
+          return chunk.material[ix + iy * SPARSE_NY + iz * SPARSE_NZ] as MaterialId;
+        }
+      }
+      if (this.hasGenerated) {
+        return this.evalAnalyticalAt(wx, wy, wz, true).material;
       }
     }
 
-    const ix = clamp(Math.round(this.worldToGrid(wx)), 0, CELLS_PER_AXIS);
-    const iy = clamp(Math.round(this.worldToGrid(wy)), 0, CELLS_PER_AXIS);
-    const iz = clamp(Math.round(this.worldToGrid(wz)), 0, CELLS_PER_AXIS);
+    const cellsPerAxis = this.cellsPerAxis;
+    const ix = clamp(Math.round(this.worldToGrid(wx)), 0, cellsPerAxis);
+    const iy = clamp(Math.round(this.worldToGrid(wy)), 0, cellsPerAxis);
+    const iz = clamp(Math.round(this.worldToGrid(wz)), 0, cellsPerAxis);
     return this.material[this.gridIndex(ix, iy, iz)] as MaterialId;
   }
 
@@ -1377,25 +1726,32 @@ export class VoxelPlanet {
     maxDist = this.worldHalf * 4.5,
   ): RaycastHit {
     const camR = Math.hypot(ox, oy, oz);
-    const nearSurface = Math.abs(camR - this.baseRadius) < this.voxelSize * 3.0;
-    const step =
+    const estSurfDist = Math.abs(camR - this.baseRadius);
+    const nearSurface = estSurfDist < this.voxelSize * 3.0;
+    const minStep =
       this.isHighResStreaming && nearSurface
-        ? Math.max(this.nativeVoxelSize * 0.45, Math.min(this.voxelSize * 0.25, Math.abs(camR - this.baseRadius) * 0.08 + this.nativeVoxelSize * 0.5))
+        ? Math.max(
+            this.nativeVoxelSize * 0.45,
+            Math.min(this.voxelSize * 0.25, estSurfDist * 0.06 + this.nativeVoxelSize * 0.5),
+          )
         : this.voxelSize * 0.35;
+    const maxStep = this.voxelSize * 0.42;
     let prevT = 0;
     let prevD = this.sampleDensity(ox, oy, oz);
+    let t = minStep;
 
-    for (let t = step; t <= maxDist; t += step) {
+    for (let iter = 0; iter < 2048 && t <= maxDist; iter++) {
       const px = ox + dx * t;
       const py = oy + dy * t;
       const pz = oz + dz * t;
       const d = this.sampleDensity(px, py, pz);
 
       if (d >= 0 && prevD < 0) {
-        // Binary search exact isosurface crossing
+        // Binary search exact isosurface crossing down to sub-voxel precision
         let lo = prevT;
         let hi = t;
-        for (let iter = 0; iter < 8; iter++) {
+        const refineSteps = this.isHighResStreaming ? 28 : 10;
+        for (let b = 0; b < refineSteps; b++) {
           const mid = 0.5 * (lo + hi);
           const md = this.sampleDensity(ox + dx * mid, oy + dy * mid, oz + dz * mid);
           if (md >= 0) hi = mid;
@@ -1420,6 +1776,9 @@ export class VoxelPlanet {
 
       prevT = t;
       prevD = d;
+      const adaptiveStep =
+        d < 0 ? clamp(-d * 0.32, minStep, maxStep) : minStep;
+      t += adaptiveStep;
     }
 
     return { hit: false, x: 0, y: 0, z: 0, nx: 0, ny: 1, nz: 0, distance: maxDist };
@@ -1443,12 +1802,13 @@ export class VoxelPlanet {
     const safeRad = Math.max(minUnit * 0.5, radius);
     const rScale = this.baseRadius / 13.0;
     const pad = safeRad + this.voxelSize * 1.5;
-    const minX = clamp(Math.floor(this.worldToGrid(cx - pad)), 1, CELLS_PER_AXIS - 1);
-    const maxX = clamp(Math.ceil(this.worldToGrid(cx + pad)), 1, CELLS_PER_AXIS - 1);
-    const minY = clamp(Math.floor(this.worldToGrid(cy - pad)), 1, CELLS_PER_AXIS - 1);
-    const maxY = clamp(Math.ceil(this.worldToGrid(cy + pad)), 1, CELLS_PER_AXIS - 1);
-    const minZ = clamp(Math.floor(this.worldToGrid(cz - pad)), 1, CELLS_PER_AXIS - 1);
-    const maxZ = clamp(Math.ceil(this.worldToGrid(cz + pad)), 1, CELLS_PER_AXIS - 1);
+    const cellsPerAxis = this.cellsPerAxis;
+    const minX = clamp(Math.floor(this.worldToGrid(cx - pad)), 1, cellsPerAxis - 1);
+    const maxX = clamp(Math.ceil(this.worldToGrid(cx + pad)), 1, cellsPerAxis - 1);
+    const minY = clamp(Math.floor(this.worldToGrid(cy - pad)), 1, cellsPerAxis - 1);
+    const maxY = clamp(Math.ceil(this.worldToGrid(cy + pad)), 1, cellsPerAxis - 1);
+    const minZ = clamp(Math.floor(this.worldToGrid(cz - pad)), 1, cellsPerAxis - 1);
+    const maxZ = clamp(Math.ceil(this.worldToGrid(cz + pad)), 1, cellsPerAxis - 1);
 
     const targetShellRadius = Math.hypot(cx, cy, cz);
     let deltaVolume = 0;
@@ -1496,8 +1856,8 @@ export class VoxelPlanet {
               this.material[idx] = MaterialId.Air;
             }
           } else if (mode === 'smooth' && copySnapshot) {
-            const sY = GRID_N;
-            const sZ = GRID_N * GRID_N;
+            const sY = this.gridN;
+            const sZ = sY * sY;
             const avg =
               (copySnapshot[idx] * 2 +
                 copySnapshot[idx - 1] +
@@ -1659,12 +2019,13 @@ export class VoxelPlanet {
     }
 
     // Mark touched chunks (plus 1-voxel neighbor border for seamless normal recomputation)
-    const cMinX = clamp(Math.floor((minX - 1) / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cMaxX = clamp(Math.floor((maxX + 1) / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cMinY = clamp(Math.floor((minY - 1) / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cMaxY = clamp(Math.floor((maxY + 1) / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cMinZ = clamp(Math.floor((minZ - 1) / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
-    const cMaxZ = clamp(Math.floor((maxZ + 1) / CHUNK_CELLS), 0, CHUNKS_PER_AXIS - 1);
+    const chunksPerAxis = this.chunksPerAxis;
+    const cMinX = clamp(Math.floor((minX - 1) / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cMaxX = clamp(Math.floor((maxX + 1) / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cMinY = clamp(Math.floor((minY - 1) / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cMaxY = clamp(Math.floor((maxY + 1) / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cMinZ = clamp(Math.floor((minZ - 1) / CHUNK_CELLS), 0, chunksPerAxis - 1);
+    const cMaxZ = clamp(Math.floor((maxZ + 1) / CHUNK_CELLS), 0, chunksPerAxis - 1);
 
     const modifiedChunks: number[] = [];
     for (let cz = cMinZ; cz <= cMaxZ; cz++) {
@@ -1672,11 +2033,13 @@ export class VoxelPlanet {
         for (let cx = cMinX; cx <= cMaxX; cx++) {
           const ci = this.chunkIndex(cx, cy, cz);
           this.dirtyChunks[ci] = 1;
+          this.nonUniformChunks[ci] = 1;
           modifiedChunks.push(ci);
         }
       }
     }
 
+    this.voxelRevision++;
     return { modifiedChunks, center: [cx, cy, cz], deltaVolume };
   }
 
@@ -1696,8 +2059,40 @@ export class VoxelPlanet {
     const startX = cx * CHUNK_CELLS;
     const startY = cy * CHUNK_CELLS;
     const startZ = cz * CHUNK_CELLS;
-    const sY = GRID_N;
-    const sZ = GRID_N * GRID_N;
+    const cellsPerAxis = this.cellsPerAxis;
+    const sY = this.gridN;
+    const sZ = sY * sY;
+
+    // Fast uniform-sign chunk early-out (skips pure-air / pure-core chunks in microseconds)
+    let anySolid = false;
+    let anyAir = false;
+    for (let dz = 0; dz <= CHUNK_CELLS; dz++) {
+      const bz = (startZ + dz) * sZ;
+      for (let dy = 0; dy <= CHUNK_CELLS; dy++) {
+        const byz = bz + (startY + dy) * sY + startX;
+        for (let dx = 0; dx <= CHUNK_CELLS; dx++) {
+          if (this.density[byz + dx] > 0) anySolid = true;
+          else anyAir = true;
+          if (anySolid && anyAir) break;
+        }
+        if (anySolid && anyAir) break;
+      }
+      if (anySolid && anyAir) break;
+    }
+    if (!anySolid || !anyAir) {
+      return {
+        cx,
+        cy,
+        cz,
+        lod,
+        positions: new Float32Array(0),
+        normals: new Float32Array(0),
+        colors: new Float32Array(0),
+        matProps: new Float32Array(0),
+        uvs: new Float32Array(0),
+        vertexCount: 0,
+      };
+    }
 
     let vCount = 0;
 
@@ -1773,9 +2168,9 @@ export class VoxelPlanet {
                 this.edgeNorms[e3 + 2] = nz;
 
                 // Trilinear solid-weighted material interpolation at exact vertex position
-                const gx = clamp(this.worldToGrid(vx), 0, CELLS_PER_AXIS - 0.001);
-                const gy = clamp(this.worldToGrid(vy), 0, CELLS_PER_AXIS - 0.001);
-                const gz = clamp(this.worldToGrid(vz), 0, CELLS_PER_AXIS - 0.001);
+                const gx = clamp(this.worldToGrid(vx), 0, cellsPerAxis - 0.001);
+                const gy = clamp(this.worldToGrid(vy), 0, cellsPerAxis - 0.001);
+                const gz = clamp(this.worldToGrid(vz), 0, cellsPerAxis - 0.001);
                 const bix = Math.floor(gx);
                 const biy = Math.floor(gy);
                 const biz = Math.floor(gz);
@@ -1921,17 +2316,55 @@ export class VoxelPlanet {
     const startX = cx * CHUNK_CELLS;
     const startY = cy * CHUNK_CELLS;
     const startZ = cz * CHUNK_CELLS;
-    const sY = GRID_N;
-    const sZ = GRID_N * GRID_N;
+    const cellsPerAxis = this.cellsPerAxis;
+    const sY = this.gridN;
+    const sZ = sY * sY;
+
+    // Fast uniform-sign early-out including 1-voxel neighbor halo
+    const zMin = Math.max(0, startZ - stride);
+    const zMax = Math.min(cellsPerAxis, startZ + CHUNK_CELLS + stride);
+    const yMin = Math.max(0, startY - stride);
+    const yMax = Math.min(cellsPerAxis, startY + CHUNK_CELLS + stride);
+    const xMin = Math.max(0, startX - stride);
+    const xMax = Math.min(cellsPerAxis, startX + CHUNK_CELLS + stride);
+    let anySolid = false;
+    let anyAir = false;
+    for (let gz = zMin; gz <= zMax; gz++) {
+      const bz = gz * sZ;
+      for (let gy = yMin; gy <= yMax; gy++) {
+        const byz = bz + gy * sY;
+        for (let gx = xMin; gx <= xMax; gx++) {
+          if (this.density[byz + gx] > 0) anySolid = true;
+          else anyAir = true;
+          if (anySolid && anyAir) break;
+        }
+        if (anySolid && anyAir) break;
+      }
+      if (anySolid && anyAir) break;
+    }
+    if (!anySolid || !anyAir) {
+      return {
+        cx,
+        cy,
+        cz,
+        lod,
+        positions: new Float32Array(0),
+        normals: new Float32Array(0),
+        colors: new Float32Array(0),
+        matProps: new Float32Array(0),
+        uvs: new Float32Array(0),
+        vertexCount: 0,
+      };
+    }
 
     const isBlockSolid = (gx: number, gy: number, gz: number): boolean => {
       if (
         gx < 0 ||
         gy < 0 ||
         gz < 0 ||
-        gx >= CELLS_PER_AXIS ||
-        gy >= CELLS_PER_AXIS ||
-        gz >= CELLS_PER_AXIS
+        gx >= cellsPerAxis ||
+        gy >= cellsPerAxis ||
+        gz >= cellsPerAxis
       ) {
         return false;
       }
@@ -1948,25 +2381,25 @@ export class VoxelPlanet {
           this.density[base + sZ + sY + 1];
         return avg > 0;
       }
-      const hx = clamp(gx + (stride >> 1), 0, CELLS_PER_AXIS);
-      const hy = clamp(gy + (stride >> 1), 0, CELLS_PER_AXIS);
-      const hz = clamp(gz + (stride >> 1), 0, CELLS_PER_AXIS);
+      const hx = clamp(gx + (stride >> 1), 0, cellsPerAxis);
+      const hy = clamp(gy + (stride >> 1), 0, cellsPerAxis);
+      const hz = clamp(gz + (stride >> 1), 0, cellsPerAxis);
       return this.density[hx + hy * sY + hz * sZ] > 0;
     };
 
     const pickBlockMaterial = (gx: number, gy: number, gz: number): MaterialId => {
-      const mx = clamp(gx + (stride >> 1), 0, CELLS_PER_AXIS);
-      const my = clamp(gy + (stride >> 1), 0, CELLS_PER_AXIS);
-      const mz = clamp(gz + (stride >> 1), 0, CELLS_PER_AXIS);
+      const mx = clamp(gx + (stride >> 1), 0, cellsPerAxis);
+      const my = clamp(gy + (stride >> 1), 0, cellsPerAxis);
+      const mz = clamp(gz + (stride >> 1), 0, cellsPerAxis);
       const centerMat = this.material[mx + my * sY + mz * sZ] as MaterialId;
       if (centerMat !== MaterialId.Air) return centerMat;
       // Search cell corners for dominant non-Air material
       for (let dz = 0; dz <= 1; dz++) {
         for (let dy = 0; dy <= 1; dy++) {
           for (let dx = 0; dx <= 1; dx++) {
-            const ix = clamp(gx + dx * stride, 0, CELLS_PER_AXIS);
-            const iy = clamp(gy + dy * stride, 0, CELLS_PER_AXIS);
-            const iz = clamp(gz + dz * stride, 0, CELLS_PER_AXIS);
+            const ix = clamp(gx + dx * stride, 0, cellsPerAxis);
+            const iy = clamp(gy + dy * stride, 0, cellsPerAxis);
+            const iz = clamp(gz + dz * stride, 0, cellsPerAxis);
             const m = this.material[ix + iy * sY + iz * sZ] as MaterialId;
             if (m !== MaterialId.Air) return m;
           }
@@ -2198,19 +2631,84 @@ export class VoxelPlanet {
     const density = new Float32Array(total);
     const material = new Uint8Array(total);
 
-    for (let lz = 0; lz < SPARSE_N; lz++) {
-      const wz = originZ + (lz - SPARSE_PAD) * stepSize;
-      for (let ly = 0; ly < SPARSE_N; ly++) {
-        const wy = originY + (ly - SPARSE_PAD) * stepSize;
-        for (let lx = 0; lx < SPARSE_N; lx++) {
-          const wx = originX + (lx - SPARSE_PAD) * stepSize;
-          const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
-          const res = this.evalAnalyticalAt(wx, wy, wz, true);
-          density[idx] = res.density;
-          material[idx] = res.material;
+    const { minEvalR, maxSurfR, rScale } = this.getRadialEvalBounds();
+    const edgeClip = this.worldHalf * 0.94;
+    const minExtent = Math.min(originX, originY, originZ) - SPARSE_PAD * stepSize;
+    const maxExtent = Math.max(originX, originY, originZ) + (CHUNK_CELLS + SPARSE_PAD) * stepSize;
+    const centerR = Math.hypot(
+      originX + chunkSpan * 0.5,
+      originY + chunkSpan * 0.5,
+      originZ + chunkSpan * 0.5,
+    );
+    const halfDiag = chunkSpan * 0.8660254 + SPARSE_PAD * stepSize * 1.732;
+    const fastFullAir = centerR - halfDiag > maxSurfR && maxExtent <= edgeClip;
+    const fastFullSolid = centerR + halfDiag < minEvalR;
+
+    if (fastFullAir) {
+      for (let lz = 0; lz < SPARSE_N; lz++) {
+        const wz = originZ + (lz - SPARSE_PAD) * stepSize;
+        const wz2 = wz * wz;
+        for (let ly = 0; ly < SPARSE_N; ly++) {
+          const wy = originY + (ly - SPARSE_PAD) * stepSize;
+          const wyz2 = wz2 + wy * wy;
+          for (let lx = 0; lx < SPARSE_N; lx++) {
+            const wx = originX + (lx - SPARSE_PAD) * stepSize;
+            const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
+            density[idx] = this.baseRadius - Math.sqrt(wx * wx + wyz2);
+            material[idx] = MaterialId.Air;
+          }
+        }
+      }
+    } else if (fastFullSolid) {
+      for (let lz = 0; lz < SPARSE_N; lz++) {
+        const wz = originZ + (lz - SPARSE_PAD) * stepSize;
+        const wz2 = wz * wz;
+        for (let ly = 0; ly < SPARSE_N; ly++) {
+          const wy = originY + (ly - SPARSE_PAD) * stepSize;
+          const wyz2 = wz2 + wy * wy;
+          for (let lx = 0; lx < SPARSE_N; lx++) {
+            const wx = originX + (lx - SPARSE_PAD) * stepSize;
+            const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
+            const r = Math.sqrt(wx * wx + wyz2);
+            density[idx] = this.baseRadius - r;
+            material[idx] =
+              r < this.baseRadius * 0.49 ? MaterialId.Basalt : MaterialId.Stone;
+          }
+        }
+      }
+    } else {
+      for (let lz = 0; lz < SPARSE_N; lz++) {
+        const wz = originZ + (lz - SPARSE_PAD) * stepSize;
+        const wz2 = wz * wz;
+        const az = Math.abs(wz);
+        for (let ly = 0; ly < SPARSE_N; ly++) {
+          const wy = originY + (ly - SPARSE_PAD) * stepSize;
+          const wyz2 = wz2 + wy * wy;
+          const ayz = Math.max(az, Math.abs(wy));
+          for (let lx = 0; lx < SPARSE_N; lx++) {
+            const wx = originX + (lx - SPARSE_PAD) * stepSize;
+            const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
+            const r = Math.sqrt(wx * wx + wyz2);
+            if (r > maxSurfR) {
+              let d = this.baseRadius - r;
+              const em = edgeClip - Math.max(ayz, Math.abs(wx));
+              if (em < 0) d = Math.min(d, em * 2.0 - 0.5 * rScale);
+              density[idx] = d;
+              material[idx] = MaterialId.Air;
+            } else if (r < minEvalR) {
+              density[idx] = this.baseRadius - r;
+              material[idx] =
+                r < this.baseRadius * 0.49 ? MaterialId.Basalt : MaterialId.Stone;
+            } else {
+              const res = this.evalAnalyticalAt(wx, wy, wz, true);
+              density[idx] = res.density;
+              material[idx] = res.material;
+            }
+          }
         }
       }
     }
+    void minExtent;
 
     const chunk: SparseVoxelChunk = {
       key,
@@ -2232,7 +2730,10 @@ export class VoxelPlanet {
     return chunk;
   }
 
-  private evictUnusedSparseChunks(maxUnedited = 280): void {
+  private evictUnusedSparseChunks(
+    maxUnedited = 4800,
+    keepKeys?: Set<string>,
+  ): void {
     let uneditedCount = 0;
     for (const c of this.sparseChunks.values()) {
       if (!c.edited) uneditedCount++;
@@ -2241,10 +2742,10 @@ export class VoxelPlanet {
 
     const evictable: SparseVoxelChunk[] = [];
     for (const c of this.sparseChunks.values()) {
-      if (!c.edited) evictable.push(c);
+      if (!c.edited && (!keepKeys || !keepKeys.has(c.key))) evictable.push(c);
     }
     evictable.sort((a, b) => a.lastUsedFrame - b.lastUsedFrame);
-    const toRemove = evictable.length - maxUnedited;
+    const toRemove = Math.min(evictable.length, uneditedCount - maxUnedited);
     for (let i = 0; i < toRemove; i++) {
       this.sparseChunks.delete(evictable[i].key);
     }
@@ -2375,14 +2876,17 @@ export class VoxelPlanet {
       for (let lz = 0; lz < CHUNK_CELLS; lz++) {
         const pz = lz + SPARSE_PAD;
         const wz0 = chunk.originZ + lz * stepSize;
+        const lz0 = lz * stepSize;
         for (let ly = 0; ly < CHUNK_CELLS; ly++) {
           const py = ly + SPARSE_PAD;
           const wy0 = chunk.originY + ly * stepSize;
+          const ly0 = ly * stepSize;
           for (let lx = 0; lx < CHUNK_CELLS; lx++) {
             const px = lx + SPARSE_PAD;
             if (!isBlockSolid(px, py, pz)) continue;
 
             const wx0 = chunk.originX + lx * stepSize;
+            const lx0 = lx * stepSize;
             const matId = pickBlockMaterial(px, py, pz);
             const pal = MATERIAL_PALETTE[matId] ?? MATERIAL_PALETTE[MaterialId.Stone];
             const r = Math.hypot(
@@ -2437,9 +2941,9 @@ export class VoxelPlanet {
                 const u2 = vCount * 2;
                 const shade = face.shade * depthShade * aoVals[vi];
 
-                this.scratchPos[p3] = wx0 + vx * stepSize;
-                this.scratchPos[p3 + 1] = wy0 + vy * stepSize;
-                this.scratchPos[p3 + 2] = wz0 + vz * stepSize;
+                this.scratchPos[p3] = lx0 + vx * stepSize;
+                this.scratchPos[p3 + 1] = ly0 + vy * stepSize;
+                this.scratchPos[p3 + 2] = lz0 + vz * stepSize;
 
                 this.scratchNorm[p3] = nx;
                 this.scratchNorm[p3 + 1] = ny;
@@ -2489,13 +2993,13 @@ export class VoxelPlanet {
 
       for (let lz = 0; lz < CHUNK_CELLS; lz++) {
         const pz = lz + SPARSE_PAD;
-        const wz0 = chunk.originZ + lz * stepSize;
+        const lz0 = lz * stepSize;
         for (let ly = 0; ly < CHUNK_CELLS; ly++) {
           const py = ly + SPARSE_PAD;
-          const wy0 = chunk.originY + ly * stepSize;
+          const ly0 = ly * stepSize;
           for (let lx = 0; lx < CHUNK_CELLS; lx++) {
             const px = lx + SPARSE_PAD;
-            const wx0 = chunk.originX + lx * stepSize;
+            const lx0 = lx * stepSize;
 
             let cubeIndex = 0;
             for (let c = 0; c < 8; c++) {
@@ -2508,9 +3012,9 @@ export class VoxelPlanet {
                     (pz + off[2]) * SPARSE_NZ
                 ];
               this.cornerDensity[c] = d;
-              this.cornerPos[c * 3] = wx0 + off[0] * stepSize;
-              this.cornerPos[c * 3 + 1] = wy0 + off[1] * stepSize;
-              this.cornerPos[c * 3 + 2] = wz0 + off[2] * stepSize;
+              this.cornerPos[c * 3] = lx0 + off[0] * stepSize;
+              this.cornerPos[c * 3 + 1] = ly0 + off[1] * stepSize;
+              this.cornerPos[c * 3 + 2] = lz0 + off[2] * stepSize;
               if (d > 0) cubeIndex |= 1 << c;
             }
 
@@ -2544,13 +3048,16 @@ export class VoxelPlanet {
                 const e3 = eIdx * 3;
                 if (this.edgeComputed[eIdx] === 0) {
                   this.edgeComputed[eIdx] = 1;
-                  const vx = this.edgeVerts[e3];
-                  const vy = this.edgeVerts[e3 + 1];
-                  const vz = this.edgeVerts[e3 + 2];
+                  const lvx = this.edgeVerts[e3];
+                  const lvy = this.edgeVerts[e3 + 1];
+                  const lvz = this.edgeVerts[e3 + 2];
+                  const vx = chunk.originX + lvx;
+                  const vy = chunk.originY + lvy;
+                  const vz = chunk.originZ + lvz;
 
-                  const gx = clamp((vx - chunk.originX) / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
-                  const gy = clamp((vy - chunk.originY) / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
-                  const gz = clamp((vz - chunk.originZ) / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
+                  const gx = clamp(lvx / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
+                  const gy = clamp(lvy / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
+                  const gz = clamp(lvz / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
                   sampleLocalGrad(gx, gy, gz, this.tempGrad);
                   const nx = this.tempGrad[0];
                   const ny = this.tempGrad[1];
@@ -2664,6 +3171,7 @@ export class VoxelPlanet {
       cy: chunk.cy,
       cz: chunk.cz,
       lod: 0,
+      origin: [chunk.originX, chunk.originY, chunk.originZ],
       positions: this.scratchPos.slice(0, vCount * 3),
       normals: this.scratchNorm.slice(0, vCount * 3),
       colors: this.scratchCol.slice(0, vCount * 3),
@@ -2674,8 +3182,92 @@ export class VoxelPlanet {
   }
 
   /**
-   * Streams multi-scale sparse voxel chunks around a surface focal point (fx, fy, fz).
-   * Enables planets with tens-of-thousands-of-blocks radius in constant memory.
+   * Sparse Voxel Octree (SVO) spatial query at chunk scale `span`, pruning uniform deep-core,
+   * outer-space, and out-of-cone octants in O(1) before emitting surface-intersecting leaf bricks.
+   */
+  private collectOctreeChunksAtScale(
+    span: number,
+    minEvalR: number,
+    maxSurfR: number,
+    focusDir: [number, number, number],
+    dotMin: number,
+    dotMax: number,
+    out: Array<{ cx: number; cy: number; cz: number; cwx: number; cwy: number; cwz: number; dot: number }>,
+  ): void {
+    const bound = Math.ceil((maxSurfR + span * 1.15) / span);
+    let treeSize = 2;
+    while (treeSize < bound * 2) treeSize <<= 1;
+    const halfTree = treeSize >> 1;
+    const minRBound = Math.max(0, minEvalR - span * 1.05);
+    const maxRBound = maxSurfR + span * 1.05;
+    const fx = focusDir[0];
+    const fy = focusDir[1];
+    const fz = focusDir[2];
+
+    const visit = (cx0: number, cy0: number, cz0: number, size: number) => {
+      const minX = cx0 * span;
+      const maxX = (cx0 + size) * span;
+      const minY = cy0 * span;
+      const maxY = (cy0 + size) * span;
+      const minZ = cz0 * span;
+      const maxZ = (cz0 + size) * span;
+
+      const clX = minX > 0 ? minX : maxX < 0 ? maxX : 0;
+      const clY = minY > 0 ? minY : maxY < 0 ? maxY : 0;
+      const clZ = minZ > 0 ? minZ : maxZ < 0 ? maxZ : 0;
+      if (clX * clX + clY * clY + clZ * clZ > maxRBound * maxRBound) return;
+
+      const farX = Math.max(Math.abs(minX), Math.abs(maxX));
+      const farY = Math.max(Math.abs(minY), Math.abs(maxY));
+      const farZ = Math.max(Math.abs(minZ), Math.abs(maxZ));
+      if (farX * farX + farY * farY + farZ * farZ < minRBound * minRBound) return;
+
+      const halfWorld = size * span * 0.5;
+      const cwx = minX + halfWorld;
+      const cwy = minY + halfWorld;
+      const cwz = minZ + halfWorld;
+      const ncR = Math.hypot(cwx, cwy, cwz);
+      const nodeHalfDiag = halfWorld * 1.7320508;
+
+      if (ncR > nodeHalfDiag + 1e-5) {
+        const centerDot = (cwx * fx + cwy * fy + cwz * fz) / ncR;
+        if (dotMin > -0.999 || dotMax < 0.999) {
+          const sinA = Math.min(1, nodeHalfDiag / ncR);
+          const cosA = Math.sqrt(Math.max(0, 1 - sinA * sinA));
+          const sinC = Math.sqrt(Math.max(0, 1 - centerDot * centerDot));
+          const boxMaxDot = centerDot > cosA ? 1.0 : centerDot * cosA + sinC * sinA;
+          const boxMinDot = centerDot < -cosA ? -1.0 : centerDot * cosA - sinC * sinA;
+          if (boxMaxDot < dotMin || boxMinDot > dotMax) return;
+        }
+        if (size === 1) {
+          out.push({ cx: cx0, cy: cy0, cz: cz0, cwx, cwy, cwz, dot: centerDot });
+          return;
+        }
+      } else if (size === 1) {
+        if (ncR < 1e-5) return;
+        const centerDot = (cwx * fx + cwy * fy + cwz * fz) / ncR;
+        if (centerDot >= dotMin && centerDot <= dotMax) {
+          out.push({ cx: cx0, cy: cy0, cz: cz0, cwx, cwy, cwz, dot: centerDot });
+        }
+        return;
+      }
+
+      const half = size >> 1;
+      for (let dz = 0; dz < 2; dz++) {
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            visit(cx0 + dx * half, cy0 + dy * half, cz0 + dz * half, half);
+          }
+        }
+      }
+    };
+
+    visit(-halfTree, -halfTree, -halfTree, treeSize);
+  }
+
+  /**
+   * Streams 360° full-sphere sparse voxel octree bricks (globe + horizon hemi +
+   * dual-cascade altitude-adaptive mid tiers + 1:1 native leaf blocks + edited chunks).
    */
   public streamHighResAround(
     fx: number,
@@ -2683,6 +3275,7 @@ export class VoxelPlanet {
     fz: number,
     renderMode: TerrainRenderMode,
     maxBuildPerFrame = 28,
+    camDistToFocus?: number,
   ): HighResStreamBatch {
     this.streamFrame++;
     const desiredKeys = new Set<string>();
@@ -2692,9 +3285,16 @@ export class VoxelPlanet {
       return {
         active: false,
         hideMacro: false,
+        globeBuiltComplete: false,
+        hemiCenter: [fx, fy, fz],
+        hemiDiscardRadius: 0,
+        midOuterCenter: [fx, fy, fz],
+        midOuterDiscardRadius: 0,
+        midCenter: [fx, fy, fz],
+        midDiscardRadius: 0,
         nativeCenter: [fx, fy, fz],
         nativeDiscardRadius: 0,
-        midDiscardRadius: 0,
+        pendingTotal: 0,
         desiredKeys,
         rebuiltMeshes,
       };
@@ -2703,13 +3303,14 @@ export class VoxelPlanet {
     const blocky = renderMode === 'blocky';
     const nativeSpan = CHUNK_CELLS * this.nativeVoxelSize;
     const fLen = Math.hypot(fx, fy, fz);
-    // Project focal point near surface if far out in deep space
-    const surfF =
+    const focusDir: [number, number, number] =
+      fLen > 1e-4 ? [fx / fLen, fy / fLen, fz / fLen] : [0, 1, 0];
+    const surfF: [number, number, number] =
       fLen > 1e-4 && fLen > this.baseRadius * 1.35
         ? [
-            (fx / fLen) * this.baseRadius,
-            (fy / fLen) * this.baseRadius,
-            (fz / fLen) * this.baseRadius,
+            focusDir[0] * this.baseRadius,
+            focusDir[1] * this.baseRadius,
+            focusDir[2] * this.baseRadius,
           ]
         : [fx, fy, fz];
 
@@ -2718,11 +3319,29 @@ export class VoxelPlanet {
       cy: number;
       cz: number;
       scaleMult: number;
-      tier: 'native' | 'mid';
+      tier: 'globe' | 'hemi' | 'midOuter' | 'mid' | 'native';
       prio: number;
+      inCore?: boolean;
     }> = [];
 
-    // Small custom-resolution planet (voxelRadius < 18, e.g., 6..17 blocks): replace entire macro planet
+    // Always retain & rebuild all user-edited chunks regardless of camera position
+    for (const chunk of this.sparseChunks.values()) {
+      if (!chunk.edited) continue;
+      desiredKeys.add(chunk.key);
+      chunk.lastUsedFrame = this.streamFrame;
+      if (chunk.dirty) {
+        wantQueue.push({
+          cx: chunk.cx,
+          cy: chunk.cy,
+          cz: chunk.cz,
+          scaleMult: chunk.scaleMult,
+          tier: 'native',
+          prio: -100,
+        });
+      }
+    }
+
+    // Small custom-resolution planet (voxelRadius < 18): replace entire macro planet at 1:1
     if (this.voxelRadius < 18) {
       const cBound = Math.ceil(this.worldHalf / nativeSpan);
       let pending = 0;
@@ -2770,96 +3389,263 @@ export class VoxelPlanet {
             tier: 'native',
             mesh: this.extractSparseChunkMesh(ch, blocky),
           });
-          pending--;
+          pending = Math.max(0, pending - 1);
         }
       }
       this.evictUnusedSparseChunks(340);
       return {
         active: true,
         hideMacro: pending === 0,
+        globeBuiltComplete: pending === 0,
+        hemiCenter: [surfF[0], surfF[1], surfF[2]],
+        hemiDiscardRadius: 0,
+        midOuterCenter: [surfF[0], surfF[1], surfF[2]],
+        midOuterDiscardRadius: 0,
+        midCenter: [surfF[0], surfF[1], surfF[2]],
+        midDiscardRadius: 0,
         nativeCenter: [surfF[0], surfF[1], surfF[2]],
         nativeDiscardRadius: pending === 0 ? this.worldHalf * 2.0 : 0,
-        midDiscardRadius: 0,
+        pendingTotal: pending,
         desiredKeys,
         rebuiltMeshes,
       };
     }
 
-    // Large high-res planet (voxelRadius > 18, e.g. 64, 500, 20000, 50000):
-    // Stream a 5x5x5 native patch (1x) + optional geometric-mean mid-LOD ring around surfF
-    const centerCx = Math.floor(surfF[0] / nativeSpan);
-    const centerCy = Math.floor(surfF[1] / nativeSpan);
-    const centerCz = Math.floor(surfF[2] / nativeSpan);
-    const nCenterX = (centerCx + 0.5) * nativeSpan;
-    const nCenterY = (centerCy + 0.5) * nativeSpan;
-    const nCenterZ = (centerCz + 0.5) * nativeSpan;
+    // Large / Ultra-high-res 360° sparse octree planet (up to >1,000,000,000³+)
+    const estCamR =
+      camDistToFocus !== undefined
+        ? Math.max(this.baseRadius * 1.00001, this.baseRadius + camDistToFocus * 0.92)
+        : this.baseRadius * 2.35;
+    const horizonCos = clamp(this.baseRadius / estCamR, 0.12, 0.96);
+    const minHemiDot = Math.max(-0.06, horizonCos - 0.32);
+    const capFrac = clamp((1 - minHemiDot) * 0.5, 0.18, 0.54);
+    const targetHemiBlocks = clamp(
+      Math.round(CHUNK_CELLS * Math.sqrt(420 / (capFrac * 4 * Math.PI))),
+      68,
+      136,
+    );
+    const hemiScaleMult = Math.max(1, Math.round(this.voxelRadius / targetHemiBlocks));
+    const hemiStep = this.nativeVoxelSize * hemiScaleMult;
+    const hemiSpan = CHUNK_CELLS * hemiStep;
+    const hemiHalfDiag = hemiSpan * 0.8660254;
+    const hemiCenter: [number, number, number] = [
+      focusDir[0] * this.baseRadius,
+      focusDir[1] * this.baseRadius,
+      focusDir[2] * this.baseRadius,
+    ];
 
-    let pendingNative = 0;
-    for (let dz = -2; dz <= 2; dz++) {
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dx = -2; dx <= 2; dx++) {
-          const cx = centerCx + dx;
-          const cy = centerCy + dy;
-          const cz = centerCz + dz;
-          const key = `1:${cx},${cy},${cz}`;
-          desiredKeys.add(key);
-          const existing = this.sparseChunks.get(key);
-          if (!existing || existing.dirty) {
-            pendingNative++;
-            const cwx = (cx + 0.5) * nativeSpan;
-            const cwy = (cy + 0.5) * nativeSpan;
-            const cwz = (cz + 0.5) * nativeSpan;
-            const dSq =
-              (cwx - surfF[0]) * (cwx - surfF[0]) +
-              (cwy - surfF[1]) * (cwy - surfF[1]) +
-              (cwz - surfF[2]) * (cwz - surfF[2]);
-            wantQueue.push({
-              cx,
-              cy,
-              cz,
-              scaleMult: 1,
-              tier: 'native',
-              prio: (existing?.edited ? 0 : 1e3) + dSq,
-            });
-          } else {
-            existing.lastUsedFrame = this.streamFrame;
-          }
-        }
+    const { minEvalR, maxSurfR } = this.getRadialEvalBounds();
+    const coreDotThresh = clamp(minHemiDot + 0.12, 0.04, 0.92);
+
+    // 1. hemiTier: High-density visible horizon cap via Octree query
+    const hemiLeaves: Array<{ cx: number; cy: number; cz: number; cwx: number; cwy: number; cwz: number; dot: number }> = [];
+    this.collectOctreeChunksAtScale(
+      hemiSpan,
+      minEvalR,
+      maxSurfR,
+      focusDir,
+      minHemiDot,
+      1.01,
+      hemiLeaves,
+    );
+
+    const microMargin =
+      Math.min(0.24, this.genCtx.detailLogScale * 0.032) * (this.baseRadius / 13.0) +
+      this.nativeVoxelSize * 3.0;
+
+    let pendingHemiCore = 0;
+    for (let i = 0; i < hemiLeaves.length; i++) {
+      const leaf = hemiLeaves[i];
+      const key = `${hemiScaleMult}:${leaf.cx},${leaf.cy},${leaf.cz}`;
+      const existing = this.sparseChunks.get(key);
+      if (!existing) {
+        const dApprox = this.evalAnalyticalAt(leaf.cwx, leaf.cwy, leaf.cwz, false).density;
+        if (Math.abs(dApprox) > hemiHalfDiag * 1.04 + microMargin) continue;
+      }
+      desiredKeys.add(key);
+      if (!existing || existing.dirty) {
+        const inCore = leaf.dot >= coreDotThresh;
+        if (inCore) pendingHemiCore++;
+        const dSq =
+          (leaf.cwx - surfF[0]) * (leaf.cwx - surfF[0]) +
+          (leaf.cwy - surfF[1]) * (leaf.cwy - surfF[1]) +
+          (leaf.cwz - surfF[2]) * (leaf.cwz - surfF[2]);
+        wantQueue.push({
+          cx: leaf.cx,
+          cy: leaf.cy,
+          cz: leaf.cz,
+          scaleMult: hemiScaleMult,
+          tier: 'hemi',
+          prio: 1e9 + dSq,
+          inCore,
+        });
+      } else {
+        existing.lastUsedFrame = this.streamFrame;
       }
     }
 
-    let pendingMid = 0;
+    // 2. globeTier: Full 360° back-hemisphere & limb sparse octree complement (closes entire 360° sphere!)
+    const targetGlobeBlocks = 42;
+    const globeScaleMult = Math.max(hemiScaleMult, Math.round(this.voxelRadius / targetGlobeBlocks));
+    const globeSpan = CHUNK_CELLS * this.nativeVoxelSize * globeScaleMult;
+    const globeHalfDiag = globeSpan * 0.8660254;
+    const globeLeaves: Array<{ cx: number; cy: number; cz: number; cwx: number; cwy: number; cwz: number; dot: number }> = [];
+    this.collectOctreeChunksAtScale(
+      globeSpan,
+      minEvalR,
+      maxSurfR,
+      focusDir,
+      -1.01,
+      coreDotThresh + 0.08,
+      globeLeaves,
+    );
+
+    let pendingGlobe = 0;
+    for (let i = 0; i < globeLeaves.length; i++) {
+      const leaf = globeLeaves[i];
+      const key = `${globeScaleMult}:${leaf.cx},${leaf.cy},${leaf.cz}`;
+      if (desiredKeys.has(key)) continue;
+      const existing = this.sparseChunks.get(key);
+      if (!existing) {
+        const dApprox = this.evalAnalyticalAt(leaf.cwx, leaf.cwy, leaf.cwz, false).density;
+        if (Math.abs(dApprox) > globeHalfDiag * 1.04 + microMargin) continue;
+      }
+      desiredKeys.add(key);
+      if (!existing || existing.dirty) {
+        pendingGlobe++;
+        const dSq =
+          (leaf.cwx - surfF[0]) * (leaf.cwx - surfF[0]) +
+          (leaf.cwy - surfF[1]) * (leaf.cwy - surfF[1]) +
+          (leaf.cwz - surfF[2]) * (leaf.cwz - surfF[2]);
+        wantQueue.push({
+          cx: leaf.cx,
+          cy: leaf.cy,
+          cz: leaf.cz,
+          scaleMult: globeScaleMult,
+          tier: 'globe',
+          prio: 1e12 + dSq,
+        });
+      } else {
+        existing.lastUsedFrame = this.streamFrame;
+      }
+    }
+
+    // 3. midTier + optional midOuterTier cascade: continuous altitude-adaptive zoom down to 10^-9 R
+    const useMidTier = hemiScaleMult > 2;
+    let midScaleMult = 1;
     let midSpan = 0;
-    let midCenterX = nCenterX;
-    let midCenterY = nCenterY;
-    let midCenterZ = nCenterZ;
-    const ratio = this.voxelSize / this.nativeVoxelSize;
-    const useMidTier = ratio > 5.0;
+    let midCenterX = surfF[0];
+    let midCenterY = surfF[1];
+    let midCenterZ = surfF[2];
+    let pendingMid = 0;
+
+    let useMidOuter = false;
+    let midOuterScaleMult = 1;
+    let midOuterSpan = 0;
+    let midOuterCenterX = surfF[0];
+    let midOuterCenterY = surfF[1];
+    let midOuterCenterZ = surfF[2];
+    let pendingMidOuter = 0;
 
     if (useMidTier) {
-      const midScaleMult = 1 << Math.max(1, Math.floor(Math.log2(Math.sqrt(ratio))));
+      const targetMidStep =
+        camDistToFocus !== undefined
+          ? clamp(
+              Math.min(hemiStep * 0.25, camDistToFocus / 72),
+              this.nativeVoxelSize * 2,
+              hemiStep * 0.45,
+            )
+          : Math.min(hemiStep * 0.45, this.nativeVoxelSize * Math.sqrt(hemiScaleMult));
+      midScaleMult = clamp(
+        Math.round(targetMidStep / this.nativeVoxelSize),
+        2,
+        Math.max(2, Math.floor(hemiScaleMult * 0.5)),
+      );
+      if (midScaleMult === hemiScaleMult) {
+        midScaleMult = Math.max(2, hemiScaleMult - 1);
+      }
+
+      if (hemiScaleMult / midScaleMult >= 10) {
+        useMidOuter = true;
+        midOuterScaleMult = clamp(
+          Math.round(Math.sqrt(hemiScaleMult * midScaleMult)),
+          midScaleMult + 1,
+          Math.max(midScaleMult + 1, hemiScaleMult - 1),
+        );
+        midOuterSpan = CHUNK_CELLS * this.nativeVoxelSize * midOuterScaleMult;
+        const midOuterHalfDiag = midOuterSpan * 0.8660254;
+        const moCx = Math.floor(surfF[0] / midOuterSpan);
+        const moCy = Math.floor(surfF[1] / midOuterSpan);
+        const moCz = Math.floor(surfF[2] / midOuterSpan);
+        midOuterCenterX = (moCx + 0.5) * midOuterSpan;
+        midOuterCenterY = (moCy + 0.5) * midOuterSpan;
+        midOuterCenterZ = (moCz + 0.5) * midOuterSpan;
+
+        for (let dz = -3; dz <= 3; dz++) {
+          for (let dy = -3; dy <= 3; dy++) {
+            for (let dx = -3; dx <= 3; dx++) {
+              const cx = moCx + dx;
+              const cy = moCy + dy;
+              const cz = moCz + dz;
+              const cwx = (cx + 0.5) * midOuterSpan;
+              const cwy = (cy + 0.5) * midOuterSpan;
+              const cwz = (cz + 0.5) * midOuterSpan;
+              const key = `${midOuterScaleMult}:${cx},${cy},${cz}`;
+              const existing = this.sparseChunks.get(key);
+              if (!existing) {
+                const dApprox = this.evalAnalyticalAt(cwx, cwy, cwz, true).density;
+                if (Math.abs(dApprox) > midOuterHalfDiag * 1.45) continue;
+              }
+              desiredKeys.add(key);
+              if (!existing || existing.dirty) {
+                pendingMidOuter++;
+                const dSq =
+                  (cwx - surfF[0]) * (cwx - surfF[0]) +
+                  (cwy - surfF[1]) * (cwy - surfF[1]) +
+                  (cwz - surfF[2]) * (cwz - surfF[2]);
+                wantQueue.push({
+                  cx,
+                  cy,
+                  cz,
+                  scaleMult: midOuterScaleMult,
+                  tier: 'midOuter',
+                  prio: 1e7 + dSq,
+                });
+              } else {
+                existing.lastUsedFrame = this.streamFrame;
+              }
+            }
+          }
+        }
+      }
+
       midSpan = CHUNK_CELLS * this.nativeVoxelSize * midScaleMult;
-      const mCx = Math.floor(nCenterX / midSpan);
-      const mCy = Math.floor(nCenterY / midSpan);
-      const mCz = Math.floor(nCenterZ / midSpan);
+      const midHalfDiag = midSpan * 0.8660254;
+      const mCx = Math.floor(surfF[0] / midSpan);
+      const mCy = Math.floor(surfF[1] / midSpan);
+      const mCz = Math.floor(surfF[2] / midSpan);
       midCenterX = (mCx + 0.5) * midSpan;
       midCenterY = (mCy + 0.5) * midSpan;
       midCenterZ = (mCz + 0.5) * midSpan;
 
-      for (let dz = -2; dz <= 2; dz++) {
-        for (let dy = -2; dy <= 2; dy++) {
-          for (let dx = -2; dx <= 2; dx++) {
+      for (let dz = -4; dz <= 4; dz++) {
+        for (let dy = -4; dy <= 4; dy++) {
+          for (let dx = -4; dx <= 4; dx++) {
             const cx = mCx + dx;
             const cy = mCy + dy;
             const cz = mCz + dz;
+            const cwx = (cx + 0.5) * midSpan;
+            const cwy = (cy + 0.5) * midSpan;
+            const cwz = (cz + 0.5) * midSpan;
             const key = `${midScaleMult}:${cx},${cy},${cz}`;
-            desiredKeys.add(key);
             const existing = this.sparseChunks.get(key);
+            if (!existing) {
+              const dApprox = this.evalAnalyticalAt(cwx, cwy, cwz, true).density;
+              if (Math.abs(dApprox) > midHalfDiag * 1.45) continue;
+            }
+            desiredKeys.add(key);
             if (!existing || existing.dirty) {
               pendingMid++;
-              const cwx = (cx + 0.5) * midSpan;
-              const cwy = (cy + 0.5) * midSpan;
-              const cwz = (cz + 0.5) * midSpan;
               const dSq =
                 (cwx - surfF[0]) * (cwx - surfF[0]) +
                 (cwy - surfF[1]) * (cwy - surfF[1]) +
@@ -2870,7 +3656,7 @@ export class VoxelPlanet {
                 cz,
                 scaleMult: midScaleMult,
                 tier: 'mid',
-                prio: 1e6 + dSq,
+                prio: 1e5 + dSq,
               });
             } else {
               existing.lastUsedFrame = this.streamFrame;
@@ -2880,6 +3666,57 @@ export class VoxelPlanet {
       }
     }
 
+    // 4. nativeTier: 1:1 native 5x5x5 leaf blocks at exact fullCellsPerAxis³ resolution
+    const useSeparateNative = hemiScaleMult > 1;
+    const centerCx = Math.floor(surfF[0] / nativeSpan);
+    const centerCy = Math.floor(surfF[1] / nativeSpan);
+    const centerCz = Math.floor(surfF[2] / nativeSpan);
+    const nCenterX = (centerCx + 0.5) * nativeSpan;
+    const nCenterY = (centerCy + 0.5) * nativeSpan;
+    const nCenterZ = (centerCz + 0.5) * nativeSpan;
+    let pendingNative = 0;
+
+    if (useSeparateNative) {
+      const nativeHalfDiag = nativeSpan * 0.8660254;
+      for (let dz = -2; dz <= 2; dz++) {
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const cx = centerCx + dx;
+            const cy = centerCy + dy;
+            const cz = centerCz + dz;
+            const cwx = (cx + 0.5) * nativeSpan;
+            const cwy = (cy + 0.5) * nativeSpan;
+            const cwz = (cz + 0.5) * nativeSpan;
+            const key = `1:${cx},${cy},${cz}`;
+            const existing = this.sparseChunks.get(key);
+            if (!existing) {
+              const dApprox = this.evalAnalyticalAt(cwx, cwy, cwz, true).density;
+              if (Math.abs(dApprox) > nativeHalfDiag * 1.55) continue;
+            }
+            desiredKeys.add(key);
+            if (!existing || existing.dirty) {
+              pendingNative++;
+              const dSq =
+                (cwx - surfF[0]) * (cwx - surfF[0]) +
+                (cwy - surfF[1]) * (cwy - surfF[1]) +
+                (cwz - surfF[2]) * (cwz - surfF[2]);
+              wantQueue.push({
+                cx,
+                cy,
+                cz,
+                scaleMult: 1,
+                tier: 'native',
+                prio: (existing?.edited ? 0 : 1e3) + dSq,
+              });
+            } else {
+              existing.lastUsedFrame = this.streamFrame;
+            }
+          }
+        }
+      }
+    }
+
+    const totalPendingBefore = wantQueue.length;
     if (wantQueue.length > 0) {
       wantQueue.sort((a, b) => a.prio - b.prio);
       const lim = Math.min(maxBuildPerFrame, wantQueue.length);
@@ -2892,27 +3729,46 @@ export class VoxelPlanet {
           tier: w.tier,
           mesh: this.extractSparseChunkMesh(ch, blocky),
         });
-        if (w.tier === 'native') pendingNative--;
-        else pendingMid--;
+        if (w.tier === 'native') pendingNative = Math.max(0, pendingNative - 1);
+        else if (w.tier === 'mid') pendingMid = Math.max(0, pendingMid - 1);
+        else if (w.tier === 'midOuter') pendingMidOuter = Math.max(0, pendingMidOuter - 1);
+        else if (w.tier === 'globe') pendingGlobe = Math.max(0, pendingGlobe - 1);
+        else if (w.inCore) pendingHemiCore = Math.max(0, pendingHemiCore - 1);
       }
     }
 
-    this.evictUnusedSparseChunks(320);
+    this.evictUnusedSparseChunks(4800, desiredKeys);
 
-    const nativeDiscardRadius = pendingNative === 0 ? nativeSpan * 1.82 : 0;
-    const midDiscardRadius = useMidTier && pendingMid === 0 ? midSpan * 1.82 : 0;
-    // Note: mid tier discard uses its own center ≈ surfF; keep macro discard using whichever covers
-    const effectiveMacroDiscard =
-      useMidTier && midDiscardRadius > 0
-        ? Math.max(0, midDiscardRadius - Math.hypot(midCenterX - nCenterX, midCenterY - nCenterY, midCenterZ - nCenterZ))
-        : nativeDiscardRadius;
+    const safeCapDot = clamp(minHemiDot + 0.1, -0.05, 0.92);
+    const safeEdgeDist =
+      safeCapDot > 0
+        ? this.baseRadius * Math.sqrt(Math.max(0.08, 2 * (1 - safeCapDot) * 0.82))
+        : this.baseRadius * 1.32;
+    const hemiDiscardRadius =
+      pendingHemiCore === 0
+        ? clamp(safeEdgeDist, this.baseRadius * 0.45, this.baseRadius * 1.32)
+        : 0;
+    const midOuterDiscardRadius =
+      useMidOuter && pendingMidOuter === 0 ? midOuterSpan * 2.45 : 0;
+    const midDiscardRadius =
+      useMidTier && pendingMid === 0 ? midSpan * 3.25 : 0;
+    const nativeDiscardRadius =
+      useSeparateNative && pendingNative === 0 ? nativeSpan * 1.82 : 0;
+    const globeBuiltComplete = pendingHemiCore === 0 && pendingGlobe === 0;
 
     return {
       active: true,
-      hideMacro: false,
+      hideMacro: globeBuiltComplete,
+      globeBuiltComplete,
+      hemiCenter,
+      hemiDiscardRadius,
+      midOuterCenter: [midOuterCenterX, midOuterCenterY, midOuterCenterZ],
+      midOuterDiscardRadius,
+      midCenter: [midCenterX, midCenterY, midCenterZ],
+      midDiscardRadius,
       nativeCenter: [nCenterX, nCenterY, nCenterZ],
       nativeDiscardRadius,
-      midDiscardRadius: effectiveMacroDiscard,
+      pendingTotal: Math.max(0, totalPendingBefore - rebuiltMeshes.length),
       desiredKeys,
       rebuiltMeshes,
     };

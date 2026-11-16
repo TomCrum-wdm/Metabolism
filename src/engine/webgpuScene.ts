@@ -18,6 +18,7 @@ import {
   normalLocal,
   normalWorld,
   positionLocal,
+  positionView,
   positionWorld,
   pow,
   sin,
@@ -43,8 +44,8 @@ import {
 import {
   BrushMode,
   CHUNK_CELLS,
-  CHUNKS_PER_AXIS,
   ChunkLodLevel,
+  HighResStreamBatch,
   MaterialId,
   PlanetSeedConfig,
   TerrainOverlayMode,
@@ -118,6 +119,7 @@ export interface SandboxTelemetry {
   playerLonDeg: number;
   sunDir: [number, number, number];
   simTimeSec: number;
+  voxelRevision: number;
 }
 
 export interface SandboxConfig {
@@ -160,7 +162,6 @@ function detectSoftwareRenderer(): boolean {
   }
 }
 
-const TOTAL_CHUNKS = CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS;
 const BOX_EDGES: ReadonlyArray<[number, number, number, number, number, number]> = [
   [0, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 1], [1, 0, 1, 0, 0, 1], [0, 0, 1, 0, 0, 0],
   [0, 1, 0, 1, 1, 0], [1, 1, 0, 1, 1, 1], [1, 1, 1, 0, 1, 1], [0, 1, 1, 0, 1, 0],
@@ -231,28 +232,39 @@ export class PlanetarySandboxEngine {
 
   // Terrain chunks + LOD tracking + high-res sparse streaming
   private chunkMeshes: Array<THREE.Mesh | null> = [];
-  private chunkLod = new Int8Array(TOTAL_CHUNKS).fill(-1);
-  private chunkCenters = new Float32Array(TOTAL_CHUNKS * 3);
+  private chunkLod = new Int8Array(343).fill(-1);
+  private chunkCenters = new Float32Array(343 * 3);
   private terrainMaterial!: THREE.MeshStandardNodeMaterial;
+  private highResGlobeMaterial!: THREE.MeshStandardNodeMaterial;
+  private highResHemiMaterial!: THREE.MeshStandardNodeMaterial;
+  private highResMidOuterMaterial!: THREE.MeshStandardNodeMaterial;
   private highResMidMaterial!: THREE.MeshStandardNodeMaterial;
   private highResNativeMaterial!: THREE.MeshStandardNodeMaterial;
-  private macroDiscardCenterNode = uniform(new THREE.Vector3(0, 0, 0));
-  private macroDiscardRadiusNode = uniform(0.0);
-  private midDiscardCenterNode = uniform(new THREE.Vector3(0, 0, 0));
+  private readonly hemiDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
+  private readonly midOuterDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
+  private readonly midDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
+  private readonly nativeDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
+  private hemiDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
+  private hemiDiscardRadiusNode = uniform(0.0);
+  private midOuterDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
+  private midOuterDiscardRadiusNode = uniform(0.0);
+  private midDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
   private midDiscardRadiusNode = uniform(0.0);
+  private nativeDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
+  private nativeDiscardRadiusNode = uniform(0.0);
   private highResGroup!: THREE.Group;
   private highResMeshes = new Map<string, THREE.Mesh>();
   private highResVertices = 0;
   private highResActiveCount = 0;
   private lastHighResFocus = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
   private totalTerrainVertices = 0;
-  private lodCounts: [number, number, number, number] = [0, 0, 0, TOTAL_CHUNKS];
+  private lodCounts: [number, number, number, number] = [0, 0, 0, 343];
   private activeChunks = 0;
 
   // Chunk Bounds Debug Lines
   private chunkBoundsLines!: THREE.LineSegments;
-  private chunkBoundsPos = new Float32Array(TOTAL_CHUNKS * 24 * 3);
-  private chunkBoundsCol = new Float32Array(TOTAL_CHUNKS * 24 * 3);
+  private chunkBoundsPos = new Float32Array(343 * 24 * 3);
+  private chunkBoundsCol = new Float32Array(343 * 24 * 3);
   private chunkBoundsDirty = true;
 
   // Fluid rendering
@@ -410,8 +422,31 @@ export class PlanetarySandboxEngine {
     return Math.max(this.planet.baseRadius / 13.0, 0.005);
   }
 
+  private ensureMacroChunkCapacity(): void {
+    const needed = this.planet.totalChunks;
+    if (this.chunkLod.length === needed) return;
+
+    for (const m of this.chunkMeshes) {
+      if (m) {
+        this.scene?.remove(m);
+        m.geometry.dispose();
+      }
+    }
+    this.chunkMeshes = new Array(needed).fill(null);
+    this.chunkLod = new Int8Array(needed).fill(-1);
+    this.chunkCenters = new Float32Array(needed * 3);
+    if (this.chunkBoundsLines) {
+      this.chunkBoundsLines.geometry.setDrawRange(0, 0);
+    }
+    this.lodCounts = [0, 0, 0, needed];
+    this.activeChunks = 0;
+    this.totalTerrainVertices = 0;
+    this.chunkBoundsDirty = true;
+  }
+
   private rebuildChunkCenters(): void {
-    const n = CHUNKS_PER_AXIS;
+    this.ensureMacroChunkCapacity();
+    const n = this.planet.chunksPerAxis;
     for (let cz = 0; cz < n; cz++) {
       for (let cy = 0; cy < n; cy++) {
         for (let cx = 0; cx < n; cx++) {
@@ -802,9 +837,22 @@ export class PlanetarySandboxEngine {
     this.scene.add(this.cloudPuffsMesh);
   }
 
+  private syncDiscardViewUniforms(): void {
+    if (!this.camera) return;
+    this.camera.updateMatrixWorld();
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+    const inv = this.camera.matrixWorldInverse;
+    this.hemiDiscardCenterViewNode.value.copy(this.hemiDiscardCenterWorld).applyMatrix4(inv);
+    this.midOuterDiscardCenterViewNode.value.copy(this.midOuterDiscardCenterWorld).applyMatrix4(inv);
+    this.midDiscardCenterViewNode.value.copy(this.midDiscardCenterWorld).applyMatrix4(inv);
+    this.nativeDiscardCenterViewNode.value.copy(this.nativeDiscardCenterWorld).applyMatrix4(inv);
+  }
+
   private createTerrainMaterial(
-    discardCenterNode?: typeof this.macroDiscardCenterNode,
-    discardRadiusNode?: typeof this.macroDiscardRadiusNode,
+    discardSpheres: Array<{
+      centerView: PlanetarySandboxEngine['hemiDiscardCenterViewNode'];
+      radius: PlanetarySandboxEngine['hemiDiscardRadiusNode'];
+    }> = [],
   ): THREE.MeshStandardNodeMaterial {
     const mat = new THREE.MeshStandardNodeMaterial();
     mat.vertexColors = true;
@@ -824,7 +872,7 @@ export class PlanetarySandboxEngine {
     const greenhouseNode = this.greenhouseNode;
 
     const computeThermalColor = Fn(() => {
-      const p = positionLocal;
+      const p = positionWorld;
       const r = length(p);
       const safeR0 = max(planetRadiusNode, 0.05);
       const dir = p.div(max(r, 0.001));
@@ -861,12 +909,20 @@ export class PlanetarySandboxEngine {
     });
 
     mat.colorNode = Fn(() => {
-      if (discardCenterNode && discardRadiusNode) {
-        const dPatch = length(positionLocal.sub(discardCenterNode));
-        Discard(dPatch.lessThan(discardRadiusNode).and(discardRadiusNode.greaterThan(0.0001)));
+      if (discardSpheres.length > 0) {
+        let shouldDiscard = length(positionView.sub(discardSpheres[0].centerView))
+          .lessThan(discardSpheres[0].radius)
+          .and(discardSpheres[0].radius.greaterThan(1e-12));
+        for (let i = 1; i < discardSpheres.length; i++) {
+          const cond = length(positionView.sub(discardSpheres[i].centerView))
+            .lessThan(discardSpheres[i].radius)
+            .and(discardSpheres[i].radius.greaterThan(1e-12));
+          shouldDiscard = shouldDiscard.or(cond);
+        }
+        Discard(shouldDiscard);
       }
 
-      const p = positionLocal;
+      const p = positionWorld;
       const radialDist = p.length();
       const strata = sin(radialDist.mul(5.2).add(sin(p.x.mul(1.8)).mul(0.7)))
         .mul(0.5)
@@ -931,15 +987,31 @@ export class PlanetarySandboxEngine {
   }
 
   private setupMaterials(): void {
-    this.terrainMaterial = this.createTerrainMaterial(
-      this.macroDiscardCenterNode,
-      this.macroDiscardRadiusNode,
-    );
-    this.highResMidMaterial = this.createTerrainMaterial(
-      this.midDiscardCenterNode,
-      this.midDiscardRadiusNode,
-    );
-    this.highResNativeMaterial = this.createTerrainMaterial();
+    this.terrainMaterial = this.createTerrainMaterial([
+      { centerView: this.hemiDiscardCenterViewNode, radius: this.hemiDiscardRadiusNode },
+      { centerView: this.midOuterDiscardCenterViewNode, radius: this.midOuterDiscardRadiusNode },
+      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
+      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
+    ]);
+    this.highResGlobeMaterial = this.createTerrainMaterial([
+      { centerView: this.hemiDiscardCenterViewNode, radius: this.hemiDiscardRadiusNode },
+      { centerView: this.midOuterDiscardCenterViewNode, radius: this.midOuterDiscardRadiusNode },
+      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
+      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
+    ]);
+    this.highResHemiMaterial = this.createTerrainMaterial([
+      { centerView: this.midOuterDiscardCenterViewNode, radius: this.midOuterDiscardRadiusNode },
+      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
+      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
+    ]);
+    this.highResMidOuterMaterial = this.createTerrainMaterial([
+      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
+      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
+    ]);
+    this.highResMidMaterial = this.createTerrainMaterial([
+      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
+    ]);
+    this.highResNativeMaterial = this.createTerrainMaterial([]);
 
     this.waterMaterial = new THREE.MeshPhysicalNodeMaterial();
     this.waterMaterial.colorNode = Fn(() => {
@@ -1000,8 +1072,21 @@ export class PlanetarySandboxEngine {
   private refreshChunkBoundsOverlay(): void {
     if (!this.chunkBoundsLines || !this.config.showChunkBounds) return;
     this.chunkBoundsDirty = false;
+    const neededVerts = Math.max(1, this.activeChunks) * 24;
+    if (this.chunkBoundsPos.length < neededVerts * 3) {
+      this.chunkBoundsPos = new Float32Array(neededVerts * 3);
+      this.chunkBoundsCol = new Float32Array(neededVerts * 3);
+      this.chunkBoundsLines.geometry.setAttribute(
+        'position',
+        new THREE.BufferAttribute(this.chunkBoundsPos, 3),
+      );
+      this.chunkBoundsLines.geometry.setAttribute(
+        'color',
+        new THREE.BufferAttribute(this.chunkBoundsCol, 3),
+      );
+    }
     const chunkWorldSize = CHUNK_CELLS * this.planet.voxelSize;
-    const n = CHUNKS_PER_AXIS;
+    const n = this.planet.chunksPerAxis;
     let v = 0;
 
     // LOD colors: LOD0 green, LOD1 sky blue, LOD2 amber
@@ -1087,8 +1172,10 @@ export class PlanetarySandboxEngine {
     }
     this.highResVertices = 0;
     this.highResActiveCount = 0;
-    this.macroDiscardRadiusNode.value = 0;
+    this.hemiDiscardRadiusNode.value = 0;
+    this.midOuterDiscardRadiusNode.value = 0;
     this.midDiscardRadiusNode.value = 0;
+    this.nativeDiscardRadiusNode.value = 0;
     for (const m of this.chunkMeshes) {
       if (m) m.visible = true;
     }
@@ -1100,35 +1187,52 @@ export class PlanetarySandboxEngine {
   private updateHighResStreaming(
     hoveredHit: ReturnType<VoxelPlanet['raycastTerrain']> | null,
     budget = 28,
-  ): void {
+  ): HighResStreamBatch | null {
+    void hoveredHit;
     if (!this.planet.isHighResStreaming || !this.highResGroup) {
       if (this.highResMeshes.size > 0) {
         this.clearHighResMeshes();
       }
-      return;
+      return null;
     }
 
-    if (hoveredHit && hoveredHit.hit) {
-      this.lastHighResFocus.set(hoveredHit.x, hoveredHit.y, hoveredHit.z);
-    } else if (this.phase === 'playing' && this.config.cameraMode === 'explorer') {
+    // Anchor streaming focus to the camera-facing / explorer-facing hemisphere surface
+    // (never jump the planet's visible high-res shell to follow cursor hover)
+    let fx = 0;
+    let fy = 1;
+    let fz = 0;
+    if (this.config.cameraMode === 'explorer' && (this.phase === 'playing' || this.isGenerating)) {
       const pLen = this.playerPos.length();
       if (pLen > 1e-4) {
-        const dx = this.playerPos.x / pLen;
-        const dy = this.playerPos.y / pLen;
-        const dz = this.playerPos.z / pLen;
-        const surfR = this.planet.findSurfaceRadiusAlongRay(dx, dy, dz);
-        this.lastHighResFocus.set(dx * surfR, dy * surfR, dz * surfR);
+        fx = this.playerPos.x / pLen;
+        fy = this.playerPos.y / pLen;
+        fz = this.playerPos.z / pLen;
       }
-    } else {
+    } else if (this.config.cameraMode === 'orbit' && (this.phase === 'playing' || this.isGenerating)) {
+      const cosP = Math.cos(this.orbitPitch);
+      fx = cosP * Math.cos(this.orbitYaw);
+      fy = Math.sin(this.orbitPitch);
+      fz = cosP * Math.sin(this.orbitYaw);
+    } else if (this.config.cameraMode === 'fps' && (this.phase === 'playing' || this.isGenerating)) {
+      const fLen = this.fpsPos.length();
+      if (fLen > 1e-4) {
+        fx = this.fpsPos.x / fLen;
+        fy = this.fpsPos.y / fLen;
+        fz = this.fpsPos.z / fLen;
+      }
+    } else if (this.camera) {
       const cLen = this.camera.position.length();
       if (cLen > 1e-4) {
-        const dx = this.camera.position.x / cLen;
-        const dy = this.camera.position.y / cLen;
-        const dz = this.camera.position.z / cLen;
-        const surfR = this.planet.findSurfaceRadiusAlongRay(dx, dy, dz);
-        this.lastHighResFocus.set(dx * surfR, dy * surfR, dz * surfR);
+        fx = this.camera.position.x / cLen;
+        fy = this.camera.position.y / cLen;
+        fz = this.camera.position.z / cLen;
       }
     }
+    const surfR = this.planet.findSurfaceRadiusAlongRay(fx, fy, fz);
+    this.lastHighResFocus.set(fx * surfR, fy * surfR, fz * surfR);
+    const camDistToFocus = this.camera
+      ? this.camera.position.distanceTo(this.lastHighResFocus)
+      : this.planet.baseRadius * 2.0;
 
     const batch = this.planet.streamHighResAround(
       this.lastHighResFocus.x,
@@ -1136,11 +1240,12 @@ export class PlanetarySandboxEngine {
       this.lastHighResFocus.z,
       this.config.terrainRenderMode,
       budget,
+      camDistToFocus,
     );
 
     if (!batch.active) {
       if (this.highResMeshes.size > 0) this.clearHighResMeshes();
-      return;
+      return batch;
     }
 
     // Evict stale meshes outside active window
@@ -1172,14 +1277,28 @@ export class PlanetarySandboxEngine {
       geo.computeBoundingSphere();
 
       const targetMat =
-        item.tier === 'native' ? this.highResNativeMaterial : this.highResMidMaterial;
+        item.tier === 'native'
+          ? this.highResNativeMaterial
+          : item.tier === 'mid'
+            ? this.highResMidMaterial
+            : item.tier === 'midOuter'
+              ? this.highResMidOuterMaterial
+              : item.tier === 'hemi'
+                ? this.highResHemiMaterial
+                : this.highResGlobeMaterial;
+
+      const ox = item.mesh.origin ? item.mesh.origin[0] : 0;
+      const oy = item.mesh.origin ? item.mesh.origin[1] : 0;
+      const oz = item.mesh.origin ? item.mesh.origin[2] : 0;
 
       if (existing) {
         existing.geometry.dispose();
         existing.geometry = geo;
         existing.material = targetMat;
+        existing.position.set(ox, oy, oz);
       } else {
         const mesh = new THREE.Mesh(geo, targetMat);
+        mesh.position.set(ox, oy, oz);
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         this.highResGroup.add(mesh);
@@ -1192,20 +1311,35 @@ export class PlanetarySandboxEngine {
       if (m) m.visible = showMacro;
     }
 
-    this.macroDiscardCenterNode.value.set(
-      batch.nativeCenter[0],
-      batch.nativeCenter[1],
-      batch.nativeCenter[2],
+    this.hemiDiscardCenterWorld.set(
+      batch.hemiCenter[0],
+      batch.hemiCenter[1],
+      batch.hemiCenter[2],
     );
-    this.macroDiscardRadiusNode.value =
-      batch.midDiscardRadius > 0 ? batch.midDiscardRadius : batch.nativeDiscardRadius;
+    this.hemiDiscardRadiusNode.value = batch.hemiDiscardRadius;
 
-    this.midDiscardCenterNode.value.set(
+    this.midOuterDiscardCenterWorld.set(
+      batch.midOuterCenter[0],
+      batch.midOuterCenter[1],
+      batch.midOuterCenter[2],
+    );
+    this.midOuterDiscardRadiusNode.value = batch.midOuterDiscardRadius;
+
+    this.midDiscardCenterWorld.set(
+      batch.midCenter[0],
+      batch.midCenter[1],
+      batch.midCenter[2],
+    );
+    this.midDiscardRadiusNode.value = batch.midDiscardRadius;
+
+    this.nativeDiscardCenterWorld.set(
       batch.nativeCenter[0],
       batch.nativeCenter[1],
       batch.nativeCenter[2],
     );
-    this.midDiscardRadiusNode.value = batch.nativeDiscardRadius;
+    this.nativeDiscardRadiusNode.value = batch.nativeDiscardRadius;
+
+    this.syncDiscardViewUniforms();
 
     let verts = 0;
     for (const mesh of this.highResMeshes.values()) {
@@ -1213,6 +1347,7 @@ export class PlanetarySandboxEngine {
     }
     this.highResVertices = verts;
     this.highResActiveCount = this.highResMeshes.size;
+    return batch;
   }
 
   private setPlanetRigVisible(visible: boolean): void {
@@ -1236,26 +1371,31 @@ export class PlanetarySandboxEngine {
 
   private rebuildAllChunks(): void {
     this.clearHighResMeshes();
-    if (this.chunkMeshes.length !== TOTAL_CHUNKS) {
-      this.chunkMeshes = new Array(TOTAL_CHUNKS).fill(null);
-    } else {
-      for (let i = 0; i < TOTAL_CHUNKS; i++) {
-        const existing = this.chunkMeshes[i];
-        if (existing) {
-          this.scene.remove(existing);
-          existing.geometry.dispose();
-          this.chunkMeshes[i] = null;
-        }
+    this.ensureMacroChunkCapacity();
+    const total = this.planet.totalChunks;
+    for (let i = 0; i < total; i++) {
+      const existing = this.chunkMeshes[i];
+      if (existing) {
+        this.scene.remove(existing);
+        existing.geometry.dispose();
+        this.chunkMeshes[i] = null;
       }
     }
     this.chunkLod.fill(-1);
-    this.planet.dirtyChunks.fill(1);
-    this.updateChunksWithLod(TOTAL_CHUNKS);
-    this.updateHighResStreaming(null, 64);
+    for (let i = 0; i < total; i++) {
+      this.planet.dirtyChunks[i] = this.planet.nonUniformChunks[i];
+    }
+    this.updateChunksWithLod(total);
+    for (let pass = 0; pass < 36; pass++) {
+      const b = this.updateHighResStreaming(null, 48);
+      if (!b || b.pendingTotal === 0) break;
+    }
   }
 
   private updateChunksWithLod(budget = 14): void {
-    const n = CHUNKS_PER_AXIS;
+    const n = this.planet.chunksPerAxis;
+    const total = this.planet.totalChunks;
+    const nonUniform = this.planet.nonUniformChunks;
     const candidates: Array<{ ci: number; cx: number; cy: number; cz: number; lod: ChunkLodLevel; prio: number }> = [];
 
     for (let cz = 0; cz < n; cz++) {
@@ -1263,9 +1403,10 @@ export class PlanetarySandboxEngine {
         for (let cx = 0; cx < n; cx++) {
           const ci = this.planet.chunkIndex(cx, cy, cz);
           const dirty = this.planet.dirtyChunks[ci] === 1;
+          const hasMesh = this.chunkMeshes[ci] !== null;
+          if (nonUniform[ci] === 0 && !dirty && !hasMesh) continue;
           const wantLod = this.desiredLodForChunk(ci);
           const curLod = this.chunkLod[ci];
-          const hasMesh = this.chunkMeshes[ci] !== null;
 
           // Only rebuild LOD if dirty, or never built, or already has geometry (skip empty air/core chunks)
           if (dirty || curLod === -1 || (hasMesh && wantLod !== curLod)) {
@@ -1332,7 +1473,7 @@ export class PlanetarySandboxEngine {
     let c1 = 0;
     let c2 = 0;
     let culled = 0;
-    for (let i = 0; i < TOTAL_CHUNKS; i++) {
+    for (let i = 0; i < total; i++) {
       const m = this.chunkMeshes[i];
       if (!m) {
         culled++;
@@ -1691,32 +1832,60 @@ export class PlanetarySandboxEngine {
     this.isGenerating = false;
   }
 
+  private async prewarmHighResAsync(
+    onProgress: (fraction: number, detail: string) => void,
+    shouldAbort: () => boolean,
+  ): Promise<boolean> {
+    if (!this.planet.isHighResStreaming) return true;
+    const maxPasses = 64;
+    let sliceStart = performance.now();
+    let initialPending = 0;
+    for (let pass = 0; pass < maxPasses; pass++) {
+      if (shouldAbort()) return false;
+      const batch = this.updateHighResStreaming(null, 42);
+      if (!batch) break;
+      if (pass === 0) {
+        initialPending = Math.max(1, batch.pendingTotal + batch.rebuiltMeshes.length);
+      }
+      if (batch.pendingTotal === 0) break;
+      if (performance.now() - sliceStart >= 8 || pass === maxPasses - 1) {
+        const done = Math.max(1, initialPending - batch.pendingTotal);
+        const frac = clamp(done / initialPending, 0.05, 0.99);
+        onProgress(frac, `流式构建高分辨率半球表面区块 (剩余 ${batch.pendingTotal})`);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (shouldAbort()) return false;
+        sliceStart = performance.now();
+      }
+    }
+    return true;
+  }
+
   private async rebuildAllChunksAsync(
     onProgress: (fraction: number, detail: string) => void,
     shouldAbort: () => boolean,
   ): Promise<boolean> {
     this.clearHighResMeshes();
-    if (this.chunkMeshes.length !== TOTAL_CHUNKS) {
-      this.chunkMeshes = new Array(TOTAL_CHUNKS).fill(null);
-    } else {
-      for (let i = 0; i < TOTAL_CHUNKS; i++) {
-        const existing = this.chunkMeshes[i];
-        if (existing) {
-          this.scene.remove(existing);
-          existing.geometry.dispose();
-          this.chunkMeshes[i] = null;
-        }
+    this.ensureMacroChunkCapacity();
+    const total = this.planet.totalChunks;
+    for (let i = 0; i < total; i++) {
+      const existing = this.chunkMeshes[i];
+      if (existing) {
+        this.scene.remove(existing);
+        existing.geometry.dispose();
+        this.chunkMeshes[i] = null;
       }
     }
     this.chunkLod.fill(-1);
-    this.planet.dirtyChunks.fill(1);
+    this.planet.dirtyChunks.fill(0);
 
-    const n = CHUNKS_PER_AXIS;
+    const n = this.planet.chunksPerAxis;
+    const nonUniform = this.planet.nonUniformChunks;
     const tasks: Array<{ ci: number; cx: number; cy: number; cz: number; lod: ChunkLodLevel; prio: number }> = [];
     for (let cz = 0; cz < n; cz++) {
       for (let cy = 0; cy < n; cy++) {
         for (let cx = 0; cx < n; cx++) {
           const ci = this.planet.chunkIndex(cx, cy, cz);
+          if (nonUniform[ci] === 0) continue;
           const lod = this.desiredLodForChunk(ci);
           const dx = this.camera.position.x - this.chunkCenters[ci * 3];
           const dy = this.camera.position.y - this.chunkCenters[ci * 3 + 1];
@@ -1769,7 +1938,7 @@ export class PlanetarySandboxEngine {
     let c1 = 0;
     let c2 = 0;
     let culled = 0;
-    for (let i = 0; i < TOTAL_CHUNKS; i++) {
+    for (let i = 0; i < total; i++) {
       const m = this.chunkMeshes[i];
       if (!m) {
         culled++;
@@ -1838,7 +2007,7 @@ export class PlanetarySandboxEngine {
       const okVoxel = await this.planet.generatePlanetAsync(
         targetSeed,
         (fraction, detail) => {
-          emit(4 + fraction * 40, '合成体素密度场', detail);
+          emit(4 + fraction * 36, '合成体素密度场', detail);
         },
         shouldAbort,
       );
@@ -1849,26 +2018,31 @@ export class PlanetarySandboxEngine {
       this.resetPlayerToSpawn();
 
       const okMesh = await this.rebuildAllChunksAsync((fraction, detail) => {
-        emit(44 + fraction * 30, '提取分块等值面几何', detail);
+        emit(40 + fraction * 28, '提取分块等值面几何', detail);
       }, shouldAbort);
       if (!okMesh || shouldAbort()) return false;
 
       const okFluid = await this.fluid.seedInitialLakesAsync(
         this.planet,
         (fraction, detail) => {
-          emit(74 + fraction * 18, '注水与静水压平衡', detail);
+          emit(68 + fraction * 16, '注水与静水压平衡', detail);
         },
         shouldAbort,
       );
       if (!okFluid || shouldAbort()) return false;
 
-      emit(94, '合成流体网格与高精度流式块', '构建地表水面与近景稀疏体素');
+      emit(85, '合成地表水体网格', '提取平滑水面与流体粒子');
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (shouldAbort()) return false;
 
       this.rebuildWaterMesh();
       this.updateSplashInstances();
-      this.updateHighResStreaming(null, 64);
+
+      const okHiRes = await this.prewarmHighResAsync((fraction, detail) => {
+        emit(86 + fraction * 13, '构建全视角高分辨率表面', detail);
+      }, shouldAbort);
+      if (!okHiRes || shouldAbort()) return false;
+
       this.refreshGravityVisualizer();
 
       this.hasWorld = true;
@@ -1927,17 +2101,21 @@ export class PlanetarySandboxEngine {
       this.syncPlayerTransform();
 
       const okMesh = await this.rebuildAllChunksAsync((fraction, detail) => {
-        emit(22 + fraction * 62, '重建存档区块网格', detail);
+        emit(20 + fraction * 58, '重建存档区块网格', detail);
       }, shouldAbort);
       if (!okMesh || shouldAbort()) return false;
 
-      emit(88, '重建水面与高精度切片', '恢复 SPH 流体粒子与近景块');
+      emit(80, '重建水面与流体系统', '恢复 SPH 流体粒子');
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (shouldAbort()) return false;
 
       this.rebuildWaterMesh();
       this.updateSplashInstances();
-      this.updateHighResStreaming(null, 64);
+
+      const okHiRes = await this.prewarmHighResAsync((fraction, detail) => {
+        emit(82 + fraction * 16, '重建全视角高分辨率表面', detail);
+      }, shouldAbort);
+      if (!okHiRes || shouldAbort()) return false;
 
       this.updateConfig({
         gravityScale: payload.gravityScale ?? this.config.gravityScale,
@@ -2220,13 +2398,17 @@ export class PlanetarySandboxEngine {
     if (this.terrainMaterial && this.config.wireframe !== prevWireframe) {
       this.terrainMaterial.wireframe = this.config.wireframe;
       this.terrainMaterial.needsUpdate = true;
-      if (this.highResMidMaterial) {
-        this.highResMidMaterial.wireframe = this.config.wireframe;
-        this.highResMidMaterial.needsUpdate = true;
-      }
-      if (this.highResNativeMaterial) {
-        this.highResNativeMaterial.wireframe = this.config.wireframe;
-        this.highResNativeMaterial.needsUpdate = true;
+      for (const m of [
+        this.highResGlobeMaterial,
+        this.highResHemiMaterial,
+        this.highResMidOuterMaterial,
+        this.highResMidMaterial,
+        this.highResNativeMaterial,
+      ]) {
+        if (m) {
+          m.wireframe = this.config.wireframe;
+          m.needsUpdate = true;
+        }
       }
     }
 
@@ -2243,7 +2425,7 @@ export class PlanetarySandboxEngine {
       this.rebuildAllChunks();
       this.rebuildWaterMesh();
     } else if (this.config.lodMode !== prevLodMode && this.scene) {
-      this.updateChunksWithLod(TOTAL_CHUNKS);
+      this.updateChunksWithLod(this.planet.totalChunks);
     }
 
     const toolColorMap: Record<BrushMode, number> = {
@@ -2370,7 +2552,7 @@ export class PlanetarySandboxEngine {
 
   private applyZoomDelta(delta: number): void {
     const scale = this.getPlanetScale();
-    const minBlockSpan = Math.max(0.004, this.planet.nativeVoxelSize * 8);
+    const minBlockSpan = Math.max(1e-8 * scale, this.planet.nativeVoxelSize * 6);
     if (this.config.cameraMode === 'explorer') {
       const minDist = Math.min(2.0 * scale, minBlockSpan);
       const factor = Math.exp(delta * 0.1);
@@ -2386,7 +2568,10 @@ export class PlanetarySandboxEngine {
       );
       this.orbitDistance = floorR + nextClearance;
     } else {
-      const minFps = Math.min(0.1 * scale, Math.max(0.003, this.planet.nativeVoxelSize * 10));
+      const minFps = Math.min(
+        0.1 * scale,
+        Math.max(1e-8 * scale, this.planet.nativeVoxelSize * 8),
+      );
       this.fpsSpeed = clamp(
         this.fpsSpeed * Math.exp(-delta * 0.1),
         minFps,
@@ -2821,7 +3006,10 @@ export class PlanetarySandboxEngine {
     const tangentN = this._v3.crossVectors(tangentE, up).normalize();
 
     const horiz = Math.cos(this.camPitch) * this.camDistance;
-    const shoulderLift = Math.min(2.2 * scale, Math.max(0.02, this.camDistance * 0.25));
+    const shoulderLift = Math.min(
+      2.2 * scale,
+      Math.max(this.planet.nativeVoxelSize * 1.5, this.camDistance * 0.25),
+    );
     const vert = Math.sin(this.camPitch) * this.camDistance + shoulderLift;
 
     const desiredPos = this._v4
@@ -2830,7 +3018,11 @@ export class PlanetarySandboxEngine {
       .addScaledVector(tangentN, Math.cos(this.camYaw) * horiz)
       .addScaledVector(tangentE, Math.sin(this.camYaw) * horiz);
 
-    const desiredLook = this._v1.copy(this.playerPos).addScaledVector(up, 1.25 * scale);
+    const lookLift = Math.min(
+      1.25 * scale,
+      Math.max(this.planet.nativeVoxelSize * 2.0, this.camDistance * 0.2),
+    );
+    const desiredLook = this._v1.copy(this.playerPos).addScaledVector(up, lookLift);
 
     const damp = 1 - Math.exp(-10 * dt);
     this.camPosSmooth.lerp(desiredPos, damp);
@@ -2957,20 +3149,27 @@ export class PlanetarySandboxEngine {
     this.updateCamera(dt);
     if (this.planet.isHighResStreaming) {
       const camR = this.camera.position.length();
-      const surfDist = Math.max(0.0005, Math.abs(camR - this.planet.baseRadius));
-      const focusDist = this.camera.position.distanceTo(this.lastHighResFocus);
+      const surfDist = Math.max(
+        this.planet.nativeVoxelSize * 0.25,
+        Math.abs(camR - this.planet.baseRadius),
+      );
+      const focusDist = Math.max(
+        this.planet.nativeVoxelSize * 0.5,
+        this.camera.position.distanceTo(this.lastHighResFocus),
+      );
       const targetNear = clamp(
         Math.min(0.15 * scale, surfDist * 0.12, focusDist * 0.08),
-        Math.max(0.00005, this.planet.nativeVoxelSize * 0.2),
+        Math.max(1e-9 * scale, this.planet.nativeVoxelSize * 0.25),
         0.15 * scale,
       );
-      if (Math.abs(this.camera.near - targetNear) / Math.max(this.camera.near, 1e-6) > 0.15) {
+      if (Math.abs(this.camera.near - targetNear) / Math.max(this.camera.near, 1e-10) > 0.15) {
         this.camera.near = targetNear;
         this.camera.updateProjectionMatrix();
       }
     }
     this.updateChunksWithLod(this.isSoftware ? 8 : 14);
     this.updateHighResStreaming(hoveredHit, this.isSoftware ? 16 : 28);
+    this.syncDiscardViewUniforms();
     if (this.config.showChunkBounds && this.chunkBoundsDirty) {
       this.refreshChunkBoundsOverlay();
     }
@@ -3059,6 +3258,7 @@ export class PlanetarySandboxEngine {
         playerLonDeg: (sph.lonRad * 180) / Math.PI,
         sunDir: sunDirArr,
         simTimeSec: this.simTimeSec,
+        voxelRevision: this.planet.voxelRevision,
       });
     }
 

@@ -12,3 +12,4 @@
 <img width="2558" height="1437" alt="屏幕截图 2026-11-15 192735" src="https://github.com/user-attachments/assets/2a388a38-3edb-4b06-a5ea-175951511ad5" />
 <img width="2559" height="1439" alt="屏幕截图 2026-11-15 192824" src="https://github.com/user-attachments/assets/04072474-b809-4c86-844c-3b8ee4bd3453" />
 <img width="2559" height="1439" alt="屏幕截图 2026-11-15 192922" src="https://github.com/user-attachments/assets/67a8ea65-bd5c-4d8d-97bc-cea1124e6c49" />
+从细胞到动物到文明和星球生态，都不断获取能量维持自身存续和排出废物，可以叫新陈代谢（metabolism）

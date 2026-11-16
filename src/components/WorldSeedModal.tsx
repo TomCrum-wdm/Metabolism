@@ -41,6 +41,13 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
   );
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
+  const currentSeedCode = encodeSeedCode(currentSeedConfig);
+  useEffect(() => {
+    setDraft({ ...currentSeedConfig });
+    setSeedText(String(currentSeedConfig.seed));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSeedCode]);
+
   useEffect(() => {
     setCodeInput(encodeSeedCode(draft));
   }, [draft]);
@@ -53,7 +60,7 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
   const handleApplyCode = () => {
     const decoded = decodeSeedCode(codeInput);
     if (!decoded) {
-      setStatusMsg('种子编码格式无效 (支持 TS2|... 或 TS1-... 12段编码)');
+      setStatusMsg('种子编码格式无效 (支持 TS3|..., TS2|... 或 TS1-...)');
       return;
     }
     setDraft(decoded);
@@ -138,13 +145,21 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                 <div className="flex gap-1">
                   <input
                     type="text"
+                    data-testid="seed-text-input"
                     value={seedText}
                     onChange={(e) => handleSeedInputChange(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        onGenerateWithSeed(draft);
+                      }
+                    }}
                     className="flex-1 min-w-0 h-7 rounded-xs border border-slate-700 bg-[#050810] px-2 text-xs font-mono-tabular text-white focus:border-sky-400 focus:outline-none"
                   />
                   <button
                     type="button"
                     tabIndex={-1}
+                    data-testid="random-seed-btn"
                     onClick={handleRandomSeed}
                     className="h-7 px-2 rounded-xs border border-slate-700 hover:border-sky-400 text-[11px] text-slate-200 cursor-pointer shrink-0"
                   >
@@ -160,8 +175,15 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                 <div className="flex gap-1">
                   <input
                     type="text"
+                    data-testid="seed-code-input"
                     value={codeInput}
                     onChange={(e) => setCodeInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleApplyCode();
+                      }
+                    }}
                     className="flex-1 min-w-0 h-7 rounded-xs border border-slate-700 bg-[#050810] px-2 text-[11px] font-mono-tabular text-sky-300 focus:border-sky-400 focus:outline-none"
                   />
                   <button
@@ -186,10 +208,56 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   unit="m"
                   ariaLabel="星球半径"
                   testId="seed-radius-input"
-                  className="h-7 w-full"
+                  sliderScale="log"
+                  sliderMin={1}
+                  sliderMax={20000}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, radius: v }))}
                 />
               </label>
+
+              <div className="col-span-2 flex flex-col gap-1 rounded-xs border border-sky-500/30 bg-[#070b15] px-2.5 py-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-sky-300 font-medium">
+                    体素分辨率 (方块半径 · 支持几万方块)
+                  </span>
+                  <span className="text-[10px] font-mono-tabular text-slate-400">
+                    单块 {(draft.radius / Math.max(4, draft.voxelRadius)).toPrecision(3)}m ·{' '}
+                    {Math.round(Math.max(4, draft.voxelRadius) * 2 * 1.54).toLocaleString()}³
+                  </span>
+                </div>
+                <NumericCadInput
+                  value={draft.voxelRadius}
+                  minValid={4}
+                  integer
+                  unit="块"
+                  ariaLabel="体素方块半径"
+                  testId="seed-voxel-res-input"
+                  sliderScale="log"
+                  sliderMin={6}
+                  sliderMax={50000}
+                  className="w-full"
+                  onChangeValue={(v) => setDraft((p) => ({ ...p, voxelRadius: v }))}
+                />
+                <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                  {[18, 64, 512, 5000, 20000, 50000].map((res) => (
+                    <button
+                      key={res}
+                      type="button"
+                      tabIndex={-1}
+                      data-testid={`voxel-res-preset-${res}`}
+                      onClick={() => setDraft((p) => ({ ...p, voxelRadius: res }))}
+                      className={`px-1.5 py-0.5 rounded-xs border text-[10px] font-mono-tabular cursor-pointer transition-colors ${
+                        Math.round(draft.voxelRadius) === res
+                          ? 'border-sky-400 bg-sky-950/70 text-sky-200'
+                          : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {res >= 1000 ? `${res / 1000}k` : res}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
               <label className="flex flex-col gap-1">
                 <span className="text-[11px] text-slate-400">初始水体倍率</span>
@@ -199,7 +267,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   unit="x"
                   ariaLabel="初始水体倍率"
                   testId="seed-water-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={3}
+                  sliderStep={0.05}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, waterFill: v }))}
                 />
               </label>
@@ -210,7 +281,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   value={draft.continentAmp}
                   ariaLabel="大陆起伏幅度"
                   testId="seed-continent-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={8}
+                  sliderStep={0.1}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, continentAmp: v }))}
                 />
               </label>
@@ -221,7 +295,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   value={draft.ridgeAmp}
                   ariaLabel="山脊崎岖度"
                   testId="seed-ridge-amp-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={8}
+                  sliderStep={0.1}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, ridgeAmp: v }))}
                 />
               </label>
@@ -232,7 +309,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   value={draft.ridgeFreq}
                   ariaLabel="山脉噪声频率"
                   testId="seed-ridge-freq-input"
-                  className="h-7 w-full"
+                  sliderMin={0.4}
+                  sliderMax={10}
+                  sliderStep={0.1}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, ridgeFreq: v }))}
                 />
               </label>
@@ -246,7 +326,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   unit="个"
                   ariaLabel="陨石坑数量"
                   testId="seed-crater-count-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={48}
+                  sliderStep={1}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, craterCount: v }))}
                 />
               </label>
@@ -258,7 +341,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   unit="m"
                   ariaLabel="陨石坑深度"
                   testId="seed-crater-depth-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={12}
+                  sliderStep={0.1}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, craterDepth: v }))}
                 />
               </label>
@@ -271,7 +357,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   unit="x"
                   ariaLabel="地下洞穴孔隙率"
                   testId="seed-cave-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={3}
+                  sliderStep={0.05}
+                  className="w-full"
                   onChangeValue={(v) => setDraft((p) => ({ ...p, caveDensity: v }))}
                 />
               </label>
@@ -282,7 +371,10 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                   value={draft.crystalRichness}
                   ariaLabel="晶矿脉丰度"
                   testId="seed-crystal-input"
-                  className="h-7 w-full"
+                  sliderMin={0}
+                  sliderMax={3}
+                  sliderStep={0.05}
+                  className="w-full"
                   onChangeValue={(v) =>
                     setDraft((p) => ({ ...p, crystalRichness: v }))
                   }
@@ -316,8 +408,20 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
                 tabIndex={-1}
                 data-testid="apply-seed-btn"
                 onClick={() => {
-                  onGenerateWithSeed(draft);
-                  setStatusMsg(`已按种子 #${draft.seed} (R=${draft.radius}m) 生成星球`);
+                  let targetCfg = draft;
+                  const trimmedCode = codeInput.trim();
+                  if (trimmedCode && trimmedCode !== encodeSeedCode(draft)) {
+                    const decoded = decodeSeedCode(trimmedCode);
+                    if (!decoded) {
+                      setStatusMsg('复合种子编码格式无效 (支持 TS3|..., TS2|... 或 TS1-...)');
+                      return;
+                    }
+                    targetCfg = decoded;
+                    setDraft(decoded);
+                    setSeedText(String(decoded.seed));
+                  }
+                  onGenerateWithSeed(targetCfg);
+                  setStatusMsg(`已按种子 #${targetCfg.seed} (R=${targetCfg.radius}m) 生成星球`);
                 }}
                 className="flex-1 h-8 rounded-xs bg-sky-500 hover:bg-sky-400 text-slate-950 font-display font-semibold text-xs cursor-pointer transition-colors"
               >

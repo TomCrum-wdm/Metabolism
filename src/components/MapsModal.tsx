@@ -709,6 +709,9 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                   <NumericCadInput
                     value={azimuthDeg}
                     unit="°"
+                    sliderMin={0}
+                    sliderMax={360}
+                    sliderStep={1}
                     className="w-24"
                     onChangeValue={setAzimuthDeg}
                   />
@@ -719,6 +722,9 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                   <NumericCadInput
                     value={offsetRatio}
                     unit="R₀"
+                    sliderMin={-1}
+                    sliderMax={1}
+                    sliderStep={0.05}
                     className="w-24"
                     onChangeValue={(v) => setOffsetRatio(Math.max(-1.2, Math.min(1.2, v)))}
                   />
@@ -816,7 +822,10 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                   value={contourLevels}
                   minValid={2}
                   integer
-                  className="w-20"
+                  sliderMin={2}
+                  sliderMax={32}
+                  sliderStep={1}
+                  className="w-24"
                   onChangeValue={setContourLevels}
                 />
               </div>
@@ -833,6 +842,9 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                       value={centerLonDeg}
                       unit="°"
                       integer
+                      sliderMin={-180}
+                      sliderMax={180}
+                      sliderStep={1}
                       onChangeValue={setCenterLonDeg}
                     />
                   </label>
@@ -842,6 +854,9 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                       value={centerLatDeg}
                       unit="°"
                       integer
+                      sliderMin={-89}
+                      sliderMax={89}
+                      sliderStep={1}
                       onChangeValue={(v) =>
                         setCenterLatDeg(Math.max(-89, Math.min(89, v)))
                       }

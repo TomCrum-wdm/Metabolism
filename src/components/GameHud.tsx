@@ -154,10 +154,26 @@ export const GameHud: React.FC<GameHudProps> = ({
             <span className="text-[10px] text-sky-400">{telemetry.backend}</span>
           </div>
 
+          <div className="hidden sm:flex items-center gap-1">
+            <span className="text-slate-500">SEED</span>
+            <span className="text-sky-300 font-medium" data-testid="hud-seed-readout">
+              #{telemetry.seed}
+            </span>
+          </div>
+
           <div className="flex items-center gap-1">
             <span className="text-slate-500">R₀</span>
             <span className="text-slate-100 font-medium" data-testid="hud-radius-readout">
               {fmtRadius(telemetry.planetRadius)}
+            </span>
+          </div>
+
+          <div className="hidden lg:flex items-center gap-1">
+            <span className="text-slate-500">RES</span>
+            <span className="text-emerald-300 font-medium" data-testid="hud-res-readout">
+              {telemetry.voxelRadius >= 1000
+                ? `${telemetry.voxelRadius.toLocaleString()}块`
+                : `${Math.round(telemetry.voxelRadius)}块`}
             </span>
           </div>
 
@@ -584,11 +600,17 @@ export const GameHud: React.FC<GameHudProps> = ({
                   <span className="text-slate-400">笔刷半径</span>
                   <NumericCadInput
                     value={config.brushRadius}
-                    minValid={0.05}
+                    minValid={0.001}
                     unit="m"
                     ariaLabel="笔刷半径"
                     testId="hud-brush-radius-input"
-                    className="w-20"
+                    sliderScale="log"
+                    sliderMin={Math.max(
+                      0.002,
+                      Number((telemetry.nativeVoxelSize * 1.5).toPrecision(2)),
+                    )}
+                    sliderMax={Math.max(10, Number((telemetry.planetRadius * 0.6).toFixed(1)))}
+                    className="w-24"
                     onChangeValue={(v) => onUpdateConfig({ brushRadius: v })}
                   />
                 </label>
@@ -600,7 +622,10 @@ export const GameHud: React.FC<GameHudProps> = ({
                     minValid={0.01}
                     ariaLabel="笔刷强度"
                     testId="hud-brush-strength-input"
-                    className="w-16"
+                    sliderMin={0.1}
+                    sliderMax={6}
+                    sliderStep={0.05}
+                    className="w-20"
                     onChangeValue={(v) => onUpdateConfig({ brushStrength: v })}
                   />
                 </label>
@@ -612,7 +637,10 @@ export const GameHud: React.FC<GameHudProps> = ({
                     unit="g"
                     ariaLabel="引力系数"
                     testId="hud-gravity-scale-input"
-                    className="w-16"
+                    sliderMin={0}
+                    sliderMax={4}
+                    sliderStep={0.05}
+                    className="w-20"
                     onChangeValue={(v) => onUpdateConfig({ gravityScale: v })}
                   />
                 </label>
@@ -624,7 +652,10 @@ export const GameHud: React.FC<GameHudProps> = ({
                     unit="°"
                     ariaLabel="太阳高度角"
                     testId="hud-sun-el-input"
-                    className="w-16"
+                    sliderMin={-90}
+                    sliderMax={90}
+                    sliderStep={1}
+                    className="w-20"
                     onChangeValue={(v) =>
                       onUpdateConfig({ sunElevationDeg: v })
                     }

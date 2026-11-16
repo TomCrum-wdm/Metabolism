@@ -204,6 +204,9 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                     unit="m"
                     ariaLabel="LOD0 切换距离"
                     testId="debug-lod0-dist-input"
+                    sliderMin={1}
+                    sliderMax={Math.max(100, Math.round(telemetry.planetRadius * 5))}
+                    sliderStep={0.5}
                     onChangeValue={(v) => onUpdateConfig({ lod0Dist: v })}
                   />
                 </label>
@@ -215,6 +218,9 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                     unit="m"
                     ariaLabel="LOD1 切换距离"
                     testId="debug-lod1-dist-input"
+                    sliderMin={2}
+                    sliderMax={Math.max(150, Math.round(telemetry.planetRadius * 8))}
+                    sliderStep={0.5}
                     onChangeValue={(v) => onUpdateConfig({ lod1Dist: v })}
                   />
                 </label>
@@ -290,7 +296,16 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                 <div>采样点网格: {voxelStats.gridN}³ ({voxelStats.totalVoxels.toLocaleString()})</div>
                 <div>体素单元: {voxelStats.cellsPerAxis}³ ({voxelStats.totalCells.toLocaleString()})</div>
                 <div>分块结构: {voxelStats.chunksPerAxis}³ × {voxelStats.chunkCells}³</div>
-                <div>体素步长: {formatMetric(voxelStats.voxelSize, 4)} m</div>
+                <div>宏步长: {formatMetric(voxelStats.voxelSize, 4)} m</div>
+                <div>方块半径: {voxelStats.voxelRadius.toLocaleString()} 块</div>
+                <div>原生块尺寸: {formatMetric(voxelStats.nativeVoxelSize, 5)} m</div>
+                <div>虚拟全局维: {voxelStats.virtualCellsPerAxis.toLocaleString()}³</div>
+                <div>
+                  稀疏流式块:{' '}
+                  {voxelStats.isSparseStreaming
+                    ? `${voxelStats.sparseActiveChunks} 活跃`
+                    : '标准 56³'}
+                </div>
                 <div>空间范围: ±{formatMetric(voxelStats.worldHalf, 2)} m</div>
                 <div>实心占空比: {solidPct}%</div>
               </div>

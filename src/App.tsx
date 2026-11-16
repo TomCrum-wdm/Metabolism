@@ -10,6 +10,7 @@ import { DEFAULT_PLANET_RADIUS } from './engine/gravity';
 import {
   CameraMode,
   GamePhase,
+  GenerationProgress,
   PlanetarySandboxEngine,
   SandboxConfig,
   SandboxTelemetry,
@@ -36,6 +37,7 @@ import { WorldSeedModal } from './components/WorldSeedModal';
 import { TouchControlsOverlay } from './components/TouchControlsOverlay';
 import { MapsModal } from './components/MapsModal';
 import { AtmosphereThermalPanel } from './components/AtmosphereThermalPanel';
+import { GenerationProgressOverlay } from './components/GenerationProgressOverlay';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'orbit',
@@ -133,6 +135,8 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   lodCounts: [120, 0, 0, 223],
   activeChunks: 120,
   planetRadius: DEFAULT_SEED_CONFIG.radius,
+  voxelRadius: DEFAULT_SEED_CONFIG.voxelRadius,
+  nativeVoxelSize: DEFAULT_SEED_CONFIG.radius / DEFAULT_SEED_CONFIG.voxelRadius,
   seed: DEFAULT_SEED_CONFIG.seed,
   fpsSpeed: 12.0,
   hoveredProbe: null,
@@ -171,6 +175,10 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<SandboxTelemetry>(() => ({
     ...INITIAL_TELEMETRY,
     planetRadius: launchParams.seedConfig?.radius ?? DEFAULT_SEED_CONFIG.radius,
+    voxelRadius: launchParams.seedConfig?.voxelRadius ?? DEFAULT_SEED_CONFIG.voxelRadius,
+    nativeVoxelSize:
+      (launchParams.seedConfig?.radius ?? DEFAULT_SEED_CONFIG.radius) /
+      (launchParams.seedConfig?.voxelRadius ?? DEFAULT_SEED_CONFIG.voxelRadius),
     seed: launchParams.seedConfig?.seed ?? DEFAULT_SEED_CONFIG.seed,
   }));
   const [initError, setInitError] = useState<string | null>(null);
@@ -190,6 +198,7 @@ export default function App() {
     () => loadStoredPrefs().autoSaveEnabled,
   );
   const [seedVersion, setSeedVersion] = useState(0);
+  const [genProgress, setGenProgress] = useState<GenerationProgress | null>(null);
 
   const phaseRef = useRef<GamePhase>(phase);
   phaseRef.current = phase;
@@ -244,11 +253,18 @@ export default function App() {
     const container = mountRef.current;
     if (!container) return;
 
+    const hasExplicitLaunch = Boolean(
+      launchParams.autostart || launchParams.slotId,
+    );
+    const shouldDeferInitialPlanet =
+      !hasExplicitLaunch || Boolean(launchParams.slotId);
+
     const engine = new PlanetarySandboxEngine(
       container,
       (t) => setTelemetry(t),
       configRef.current,
       launchParams.seedConfig,
+      { deferInitialPlanet: shouldDeferInitialPlanet },
     );
     engineRef.current = engine;
     engine.setPhase(phaseRef.current);
@@ -260,7 +276,7 @@ export default function App() {
       .init()
       .then(async () => {
         if (cancelled) return;
-        // If opened from another tab via IndexedDB handoff slot, restore full sculpted state
+        // If opened from another tab via IndexedDB handoff slot, restore full sculpted state asynchronously
         if (launchParams.slotId) {
           let payload = await loadPlanetFromDb(launchParams.slotId);
           if (!payload && !cancelled) {
@@ -269,16 +285,23 @@ export default function App() {
           }
           if (payload && !cancelled) {
             const oldR = engine.planet.baseRadius;
-            engine.applySavePayload(payload);
-            const newR = engine.planet.baseRadius;
-            syncScaledConfigForRadius(oldR, newR);
-            setConfig((prev) => ({
-              ...prev,
-              gravityScale: payload.gravityScale ?? prev.gravityScale,
-              sunElevationDeg: payload.sunElevationDeg ?? prev.sunElevationDeg,
-              sunAzimuthDeg: payload.sunAzimuthDeg ?? prev.sunAzimuthDeg,
-            }));
-            setSeedVersion((v) => v + 1);
+            const ok = await engine.applySavePayloadAsync(payload, (p) => {
+              if (!cancelled) setGenProgress(p);
+            });
+            if (!cancelled) {
+              setGenProgress(null);
+            }
+            if (ok && !cancelled) {
+              const newR = engine.planet.baseRadius;
+              syncScaledConfigForRadius(oldR, newR);
+              setConfig((prev) => ({
+                ...prev,
+                gravityScale: payload.gravityScale ?? prev.gravityScale,
+                sunElevationDeg: payload.sunElevationDeg ?? prev.sunElevationDeg,
+                sunAzimuthDeg: payload.sunAzimuthDeg ?? prev.sunAzimuthDeg,
+              }));
+              setSeedVersion((v) => v + 1);
+            }
           }
         }
       })
@@ -345,11 +368,6 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [autoSaveEnabled, phase, refreshSavesList]);
 
-  const handleStart = useCallback(() => {
-    setPhase('playing');
-    document.body.dataset.state = 'playing';
-    engineRef.current?.setPhase('playing');
-  }, []);
 
   const handleUpdateConfig = useCallback((partial: Partial<SandboxConfig>) => {
     setConfig((prev) => {
@@ -381,31 +399,64 @@ export default function App() {
     void savePlanetToDb(payload).catch(() => {});
   }, []);
 
-  const handleResetPlanet = useCallback(() => {
+  const handleCancelGeneration = useCallback(() => {
+    engineRef.current?.cancelGeneration();
+    setGenProgress(null);
+  }, []);
+
+  const handleResetPlanet = useCallback(async () => {
     const eng = engineRef.current;
     if (!eng) return;
     const oldR = eng.planet.baseRadius;
-    eng.resetPlanet();
+    const nextSeed = Math.floor(100000 + Math.random() * 899999);
+    const nextCfg: PlanetSeedConfig = {
+      ...eng.planet.seedConfig,
+      seed: nextSeed,
+    };
+    setGenProgress({
+      active: true,
+      percent: 1,
+      stage: '初始化随机星球参数',
+      detail: `准备种子 #${nextCfg.seed}`,
+      seed: nextCfg.seed,
+      radius: nextCfg.radius,
+      voxelRadius: nextCfg.voxelRadius,
+    });
+    const ok = await eng.generateWorldAsync(nextCfg, (p) => setGenProgress(p));
+    setGenProgress(null);
+    if (!ok) return;
     syncScaledConfigForRadius(oldR, eng.planet.baseRadius);
     setSeedVersion((v) => v + 1);
-    if (phaseRef.current === 'paused') {
+    if (phaseRef.current !== 'playing') {
       setPhase('playing');
+      document.body.dataset.state = 'playing';
+      eng.setPhase('playing');
     }
   }, [syncScaledConfigForRadius]);
 
   const handleGenerateWithSeed = useCallback(
-    (seedCfg: PlanetSeedConfig) => {
+    async (seedCfg: PlanetSeedConfig) => {
       const eng = engineRef.current;
-      if (eng) {
-        const oldR = eng.planet.baseRadius;
-        eng.regenerateWithSeed(seedCfg);
-        syncScaledConfigForRadius(oldR, eng.planet.baseRadius);
-      }
+      if (!eng) return;
+      const oldR = eng.planet.baseRadius;
+      setGenProgress({
+        active: true,
+        percent: 1,
+        stage: '初始化星球体素与物理场',
+        detail: `准备种子 #${seedCfg.seed} · R₀=${seedCfg.radius}m`,
+        seed: seedCfg.seed,
+        radius: seedCfg.radius,
+        voxelRadius: seedCfg.voxelRadius,
+      });
+      const ok = await eng.generateWorldAsync(seedCfg, (p) => setGenProgress(p));
+      setGenProgress(null);
+      if (!ok) return;
+      syncScaledConfigForRadius(oldR, eng.planet.baseRadius);
       setSeedVersion((v) => v + 1);
       setSeedModalOpen(false);
-      if (phaseRef.current !== 'playing') {
-        setPhase('playing');
-      }
+      setPhase('playing');
+      document.body.dataset.state = 'playing';
+      eng.setPhase('playing');
     },
     [syncScaledConfigForRadius],
   );
@@ -417,7 +468,7 @@ export default function App() {
   const handleSaveSlot = useCallback(
     async (name: string) => {
       const eng = engineRef.current;
-      if (!eng) return;
+      if (!eng || !eng.hasWorld) return;
       const id = `slot_${Date.now()}`;
       const payload = eng.exportSavePayload(id, name);
       await savePlanetToDb(payload);
@@ -428,7 +479,7 @@ export default function App() {
 
   const handleQuickSave = useCallback(async () => {
     const eng = engineRef.current;
-    if (!eng) return;
+    if (!eng || !eng.hasWorld) return;
     const payload = eng.exportSavePayload(
       AUTOSAVE_SLOT_ID,
       `星球 #${eng.planet.seedConfig.seed}`,
@@ -444,7 +495,21 @@ export default function App() {
       const payload = await loadPlanetFromDb(id);
       if (!payload) return;
       const oldR = eng.planet.baseRadius;
-      eng.applySavePayload(payload);
+      const cfg = payload.planet.seedConfig;
+      setGenProgress({
+        active: true,
+        percent: 4,
+        stage: '读取持久化体素存档',
+        detail: `载入 ${payload.name}`,
+        seed: cfg.seed,
+        radius: cfg.radius,
+        voxelRadius: cfg.voxelRadius ?? 18,
+      });
+      const ok = await eng.applySavePayloadAsync(payload, (p) =>
+        setGenProgress(p),
+      );
+      setGenProgress(null);
+      if (!ok) return;
       syncScaledConfigForRadius(oldR, eng.planet.baseRadius);
       setConfig((prev) => ({
         ...prev,
@@ -455,6 +520,8 @@ export default function App() {
       setSeedVersion((v) => v + 1);
       setSeedModalOpen(false);
       setPhase('playing');
+      document.body.dataset.state = 'playing';
+      eng.setPhase('playing');
     },
     [syncScaledConfigForRadius],
   );
@@ -467,14 +534,6 @@ export default function App() {
     [refreshSavesList],
   );
 
-  const handleContinueSaved = useCallback(() => {
-    if (saves.length > 0) {
-      void handleLoadSlot(saves[0].id);
-    } else {
-      handleStart();
-    }
-  }, [saves, handleLoadSlot, handleStart]);
-
   // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -482,10 +541,6 @@ export default function App() {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
       if (phaseRef.current === 'title') {
-        if (e.code === 'Enter' && !seedModalOpen) {
-          e.preventDefault();
-          handleStart();
-        }
         return;
       }
 
@@ -565,7 +620,7 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleStart, handleToggleDebug, handleUpdateConfig, mapsOpen, seedModalOpen]);
+  }, [handleToggleDebug, handleUpdateConfig, mapsOpen, seedModalOpen]);
 
   const voxelStats = useMemo(() => {
     void seedVersion;
@@ -595,6 +650,11 @@ export default function App() {
             [MaterialId.Ice]: 0,
             [MaterialId.Sandstone]: 0,
           },
+          voxelRadius: DEFAULT_SEED_CONFIG.voxelRadius,
+          nativeVoxelSize: DEFAULT_SEED_CONFIG.radius / DEFAULT_SEED_CONFIG.voxelRadius,
+          virtualCellsPerAxis: 56,
+          sparseActiveChunks: 0,
+          isSparseStreaming: false,
         };
   }, [seedVersion, telemetry.terrainVertices, debugOpen]);
 
@@ -611,8 +671,6 @@ export default function App() {
       DEFAULT_SEED_CONFIG;
     return buildNewTabLaunchUrl(cfg, tabHandoffIdRef.current);
   }, [launchParams.seedConfig, seedVersion]);
-
-  const latestSave = saves[0];
 
   return (
     <main className="relative w-full h-full overflow-hidden bg-[#050810]">
@@ -637,12 +695,12 @@ export default function App() {
 
       {phase === 'title' && (
         <TitleOverlay
-          hasSavedWorld={saves.length > 0}
-          savedWorldLabel={latestSave ? `#${latestSave.seed}` : undefined}
-          newTabUrl={newTabUrl}
-          onStart={handleStart}
-          onContinueSaved={handleContinueSaved}
-          onOpenSeedModal={() => setSeedModalOpen(true)}
+          saves={saves}
+          initialSeedConfig={launchParams.seedConfig}
+          isGenerating={Boolean(genProgress?.active)}
+          onGenerateAndEnter={(cfg) => void handleGenerateWithSeed(cfg)}
+          onLoadSaveSlot={(id) => void handleLoadSlot(id)}
+          onDeleteSaveSlot={(id) => void handleDeleteSlot(id)}
         />
       )}
 
@@ -739,13 +797,18 @@ export default function App() {
           saves={saves}
           autoSaveEnabled={autoSaveEnabled}
           onToggleAutoSave={setAutoSaveEnabled}
-          onGenerateWithSeed={handleGenerateWithSeed}
+          onGenerateWithSeed={(cfg) => void handleGenerateWithSeed(cfg)}
           onSaveSlot={handleSaveSlot}
           onLoadSlot={handleLoadSlot}
           onDeleteSlot={handleDeleteSlot}
           onClose={() => setSeedModalOpen(false)}
         />
       )}
+
+      <GenerationProgressOverlay
+        progress={genProgress}
+        onCancel={handleCancelGeneration}
+      />
     </main>
   );
 }

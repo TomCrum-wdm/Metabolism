@@ -270,13 +270,18 @@ test('Unrestricted seed parameters support arbitrary extreme radii (2m & 150m), 
     waterFill: 1.0,
   };
   const tinyCode = encodeSeedCode(tinyCfg);
-  assert.ok(tinyCode.startsWith('TS2|'), `Expected TS2| prefix, got ${tinyCode}`);
+  assert.ok(tinyCode.startsWith('TS3|'), `Expected TS3| prefix, got ${tinyCode}`);
   const decodedTiny = decodeSeedCode(tinyCode);
   assert.ok(decodedTiny !== null);
   assert.equal(decodedTiny.radius, 2.0);
   assert.equal(decodedTiny.craterCount, 12);
 
-  // Backwards-compatible TS1 decode without upper clamps
+  // Backwards-compatible TS2 and TS1 decode
+  const ts2Decoded = decodeSeedCode('TS2|888|240|3.5|4.1|2.5|10|6.2|1.5|0.8|2.0|1');
+  assert.ok(ts2Decoded !== null);
+  assert.equal(ts2Decoded.radius, 240);
+  assert.equal(ts2Decoded.voxelRadius, 18);
+
   const legacyDecoded = decodeSeedCode('TS1-888-240-3.5-4.1-2.5-10-6.2-1.5-0.8-2.0-1');
   assert.ok(legacyDecoded !== null);
   assert.equal(legacyDecoded.radius, 240);
@@ -478,5 +483,88 @@ test('Cartographic projections round-trip cleanly and planetary atlas / cross-se
   assert.equal(section.radialElevProfile.length, 180);
   assert.equal(section.radialTempProfile.length, 180);
 });
+
+test('Ultra-high voxel resolution (voxelRadius=20000) streams sparse chunks, sculpts single blocks, and persists editedChunks', () => {
+  const hiCfg = {
+    ...DEFAULT_SEED_CONFIG,
+    seed: 99123,
+    radius: 20.0,
+    voxelRadius: 20000,
+  };
+  const code = encodeSeedCode(hiCfg);
+  assert.ok(code.startsWith('TS3|'));
+  const decoded = decodeSeedCode(code);
+  assert.ok(decoded !== null && decoded.voxelRadius === 20000);
+
+  const planet = new VoxelPlanet(hiCfg);
+  assert.equal(planet.isHighResStreaming, true);
+  assert.ok(Math.abs(planet.nativeVoxelSize - 0.001) < 1e-6);
+
+  const stats = planet.getVoxelStats();
+  assert.equal(stats.voxelRadius, 20000);
+  assert.equal(stats.isSparseStreaming, true);
+  assert.ok(stats.virtualCellsPerAxis >= 60000);
+
+  // Stream around actual surface hit point in smooth and blocky modes
+  const [sx, sy, sz] = planet.spawnPosition;
+  const sLen = Math.hypot(sx, sy, sz);
+  const hit = planet.raycastTerrain(sx, sy, sz, -sx / sLen, -sy / sLen, -sz / sLen, 10);
+  assert.equal(hit.hit, true);
+
+  let nonEmpty = 0;
+  for (let pass = 0; pass < 4; pass++) {
+    const batch = planet.streamHighResAround(hit.x, hit.y, hit.z, 'blocky', 48);
+    assert.equal(batch.active, true);
+    for (const m of batch.rebuiltMeshes) {
+      if (m.mesh.vertexCount > 0) nonEmpty++;
+    }
+  }
+  assert.ok(planet.sparseChunks.size > 0, 'Expected sparse chunks streamed');
+  assert.ok(nonEmpty > 0, 'Expected non-empty blocky high-res surface chunks');
+
+  // Sculpt single crystal tower at fine brush radius inside streamed native chunks
+  const fineHit = planet.raycastTerrain(sx, sy, sz, -sx / sLen, -sy / sLen, -sz / sLen, 10);
+  assert.equal(fineHit.hit, true);
+
+  const bx = fineHit.x + fineHit.nx * 0.004;
+  const by = fineHit.y + fineHit.ny * 0.004;
+  const bz = fineHit.z + fineHit.nz * 0.004;
+  planet.applyBrush(bx, by, bz, 'build', 0.006, 3.0, MaterialId.Crystal);
+
+  const editedCount = Array.from(planet.sparseChunks.values()).filter((c) => c.edited).length;
+  assert.ok(editedCount >= 1, 'Fine brush must mark native sparse chunks as edited');
+  assert.ok(planet.sampleDensity(bx, by, bz) > 0, 'Built fine crystal spire must be solid');
+  assert.equal(planet.sampleNearestMaterial(bx, by, bz), MaterialId.Crystal);
+
+  // Verify snapshot preserves sparse edited chunks
+  const snap = planet.exportSnapshot();
+  assert.ok(snap.editedChunks && snap.editedChunks.length === editedCount);
+  const restored = new VoxelPlanet(1);
+  restored.importSnapshot(snap);
+  assert.equal(restored.voxelRadius, 20000);
+  assert.equal(restored.sampleNearestMaterial(bx, by, bz), MaterialId.Crystal);
+});
+
+test('Deferred VoxelPlanet skipGenerate + generatePlanetAsync + FluidSim.seedInitialLakesAsync match sync results without blocking', async () => {
+  const deferred = new VoxelPlanet(482910, { skipGenerate: true });
+  assert.equal(deferred.hasGenerated, false);
+
+  const slices: number[] = [];
+  const okVoxel = await deferred.generatePlanetAsync(
+    { ...DEFAULT_SEED_CONFIG, seed: 482910, radius: 14.5 },
+    (fraction) => slices.push(fraction),
+  );
+  assert.equal(okVoxel, true);
+  assert.equal(deferred.hasGenerated, true);
+  assert.ok(slices.length >= 1 && slices[slices.length - 1] === 1);
+
+  const fluid = new FluidSim();
+  const fluidSteps: number[] = [];
+  const okFluid = await fluid.seedInitialLakesAsync(deferred, (f) => fluidSteps.push(f));
+  assert.equal(okFluid, true);
+  assert.ok(fluid.activeCount > 300);
+  assert.ok(fluidSteps.length >= 1 && fluidSteps[fluidSteps.length - 1] === 1);
+});
+
 
 

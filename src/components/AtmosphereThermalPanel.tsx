@@ -195,6 +195,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
                 minValid={0}
                 unit="atm"
                 testId="atmos-pressure-input"
+                sliderMin={0}
+                sliderMax={8}
+                sliderStep={0.05}
                 onChangeValue={(v) => patchAtmos({ surfacePressureAtm: v })}
               />
             </label>
@@ -204,6 +207,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.atmosphere.scaleHeightRatio}
                 minValid={0.01}
+                sliderMin={0.02}
+                sliderMax={0.6}
+                sliderStep={0.01}
                 onChangeValue={(v) => patchAtmos({ scaleHeightRatio: v })}
               />
             </label>
@@ -213,6 +219,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.atmosphere.rayleighStrength}
                 minValid={0}
+                sliderMin={0}
+                sliderMax={3}
+                sliderStep={0.05}
                 onChangeValue={(v) => patchAtmos({ rayleighStrength: v })}
               />
             </label>
@@ -222,6 +231,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.atmosphere.mieHaze}
                 minValid={0}
+                sliderMin={0}
+                sliderMax={2.5}
+                sliderStep={0.05}
                 onChangeValue={(v) => patchAtmos({ mieHaze: v })}
               />
             </label>
@@ -232,6 +244,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
                 value={config.atmosphere.cloudCover}
                 minValid={0}
                 testId="atmos-cloud-input"
+                sliderMin={0}
+                sliderMax={1.2}
+                sliderStep={0.02}
                 onChangeValue={(v) => patchAtmos({ cloudCover: v })}
               />
             </label>
@@ -241,6 +256,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.atmosphere.cloudAltitudeRatio}
                 minValid={0.02}
+                sliderMin={0.03}
+                sliderMax={0.5}
+                sliderStep={0.01}
                 onChangeValue={(v) => patchAtmos({ cloudAltitudeRatio: v })}
               />
             </label>
@@ -250,6 +268,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.atmosphere.windSpeed}
                 unit="x"
+                sliderMin={0}
+                sliderMax={6}
+                sliderStep={0.1}
                 onChangeValue={(v) => patchAtmos({ windSpeed: v })}
               />
             </label>
@@ -259,6 +280,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.atmosphere.greenhouseFactor}
                 minValid={0}
+                sliderMin={0}
+                sliderMax={4}
+                sliderStep={0.05}
                 onChangeValue={(v) => patchAtmos({ greenhouseFactor: v })}
               />
             </label>
@@ -280,6 +304,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
                 minValid={0}
                 unit="W/m²"
                 testId="thermal-solar-input"
+                sliderScale="log"
+                sliderMin={100}
+                sliderMax={10000}
                 onChangeValue={(v) => patchThermal({ solarIrradiance: v })}
               />
             </label>
@@ -293,6 +320,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
                 value={config.thermal.coreTempC}
                 unit="°C"
                 testId="thermal-core-input"
+                sliderMin={0}
+                sliderMax={6000}
+                sliderStep={50}
                 onChangeValue={(v) => patchThermal({ coreTempC: v })}
               />
             </label>
@@ -302,6 +332,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.thermal.lapseRateCPerScale}
                 unit="°C"
+                sliderMin={0}
+                sliderMax={80}
+                sliderStep={1}
                 onChangeValue={(v) => patchThermal({ lapseRateCPerScale: v })}
               />
             </label>
@@ -311,6 +344,9 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               <NumericCadInput
                 value={config.thermal.baseEquilibriumC}
                 unit="°C"
+                sliderMin={-100}
+                sliderMax={100}
+                sliderStep={1}
                 onChangeValue={(v) => patchThermal({ baseEquilibriumC: v })}
               />
             </label>

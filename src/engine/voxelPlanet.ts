@@ -25,6 +25,7 @@ export type TerrainOverlayMode = 'material' | 'temperature' | 'density' | 'lod';
 export interface PlanetSeedConfig {
   seed: number;
   radius: number; // Base planet radius R0 in meters (unrestricted > 0.05)
+  voxelRadius: number; // Voxel blocks across planetary radius R0 (e.g. 18 .. 50000+)
   continentAmp: number; // Continent elevation amplitude (unrestricted)
   ridgeAmp: number; // Mountain ridge amplitude (unrestricted)
   ridgeFreq: number; // Mountain ridge frequency (unrestricted)
@@ -39,6 +40,7 @@ export interface PlanetSeedConfig {
 export const DEFAULT_SEED_CONFIG: PlanetSeedConfig = {
   seed: 202611,
   radius: DEFAULT_PLANET_RADIUS,
+  voxelRadius: 18,
   continentAmp: 2.15,
   ridgeAmp: 2.25,
   ridgeFreq: 2.6,
@@ -69,6 +71,7 @@ export const PLANET_PRESETS: ReadonlyArray<{
     config: {
       seed: 482910,
       radius: 15.2,
+      voxelRadius: 18,
       continentAmp: 2.4,
       ridgeAmp: 3.1,
       ridgeFreq: 3.2,
@@ -87,6 +90,7 @@ export const PLANET_PRESETS: ReadonlyArray<{
     config: {
       seed: 77419,
       radius: 9.2,
+      voxelRadius: 18,
       continentAmp: 1.2,
       ridgeAmp: 1.5,
       ridgeFreq: 2.1,
@@ -105,6 +109,7 @@ export const PLANET_PRESETS: ReadonlyArray<{
     config: {
       seed: 903152,
       radius: 12.6,
+      voxelRadius: 18,
       continentAmp: 1.7,
       ridgeAmp: 2.8,
       ridgeFreq: 3.6,
@@ -137,6 +142,10 @@ function sanitizeSeedConfig(raw: Partial<PlanetSeedConfig>): PlanetSeedConfig {
   return {
     seed: Number.isFinite(merged.seed) ? Math.max(1, Math.floor(Math.abs(merged.seed))) : DEFAULT_SEED_CONFIG.seed,
     radius: Number.isFinite(merged.radius) && merged.radius > 0.05 ? merged.radius : DEFAULT_SEED_CONFIG.radius,
+    voxelRadius:
+      Number.isFinite(merged.voxelRadius) && merged.voxelRadius >= 4
+        ? merged.voxelRadius
+        : DEFAULT_SEED_CONFIG.voxelRadius,
     continentAmp: Number.isFinite(merged.continentAmp) ? merged.continentAmp : DEFAULT_SEED_CONFIG.continentAmp,
     ridgeAmp: Number.isFinite(merged.ridgeAmp) ? merged.ridgeAmp : DEFAULT_SEED_CONFIG.ridgeAmp,
     ridgeFreq: Number.isFinite(merged.ridgeFreq) ? merged.ridgeFreq : DEFAULT_SEED_CONFIG.ridgeFreq,
@@ -152,7 +161,7 @@ function sanitizeSeedConfig(raw: Partial<PlanetSeedConfig>): PlanetSeedConfig {
 export function encodeSeedCode(cfg: PlanetSeedConfig): string {
   const fmt = (n: number) => (Number.isFinite(n) ? Number(n.toPrecision(6)).toString() : '0');
   return [
-    'TS2',
+    'TS3',
     Math.max(1, Math.floor(Math.abs(cfg.seed))) >>> 0,
     fmt(cfg.radius),
     fmt(cfg.continentAmp),
@@ -164,20 +173,21 @@ export function encodeSeedCode(cfg: PlanetSeedConfig): string {
     fmt(cfg.crystalRichness),
     fmt(cfg.waterFill),
     cfg.hasArch ? 1 : 0,
+    fmt(cfg.voxelRadius),
   ].join('|');
 }
 
 export function decodeSeedCode(code: string): PlanetSeedConfig | null {
   const trimmed = code.trim();
   let parts: string[];
-  if (trimmed.startsWith('TS2|')) {
+  if (trimmed.startsWith('TS3|') || trimmed.startsWith('TS2|')) {
     parts = trimmed.split('|');
   } else if (trimmed.startsWith('TS1-')) {
     parts = trimmed.split('-');
   } else {
     return null;
   }
-  if (parts.length !== 12) return null;
+  if (parts.length !== 12 && parts.length !== 13) return null;
   const nums = parts.slice(1).map((v) => Number(v));
   if (nums.some((n) => !Number.isFinite(n))) return null;
   return sanitizeSeedConfig({
@@ -192,6 +202,7 @@ export function decodeSeedCode(code: string): PlanetSeedConfig | null {
     crystalRichness: nums[8],
     waterFill: Math.max(0, nums[9]),
     hasArch: nums[10] >= 0.5,
+    voxelRadius: nums.length >= 12 ? nums[11] : DEFAULT_SEED_CONFIG.voxelRadius,
   });
 }
 
@@ -240,6 +251,11 @@ export interface VoxelFormatStats {
   totalBytes: number;
   solidVoxels: number;
   materialCounts: Record<MaterialId, number>;
+  voxelRadius: number;
+  nativeVoxelSize: number;
+  virtualCellsPerAxis: number;
+  sparseActiveChunks: number;
+  isSparseStreaming: boolean;
 }
 
 export interface VoxelCellCornerSample {
@@ -267,12 +283,23 @@ export interface VoxelCellProbe {
   slice5x5: Array<{ dx: number; dz: number; density: number; material: MaterialId }>;
 }
 
+export interface SparseChunkSnapshot {
+  key: string;
+  cx: number;
+  cy: number;
+  cz: number;
+  scaleMult: number;
+  density: Float32Array;
+  material: Uint8Array;
+}
+
 export interface VoxelPlanetSnapshot {
   seedConfig: PlanetSeedConfig;
   density: Float32Array;
   material: Uint8Array;
   spawnPosition: [number, number, number];
   lakeBasinCenters: Array<[number, number, number]>;
+  editedChunks?: SparseChunkSnapshot[];
 }
 
 export const CELLS_PER_AXIS = 56;
@@ -314,6 +341,62 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
   return t * t * (3 - 2 * t);
 }
 
+export interface SparseVoxelChunk {
+  key: string;
+  cx: number;
+  cy: number;
+  cz: number;
+  scaleMult: number;
+  stepSize: number;
+  originX: number;
+  originY: number;
+  originZ: number;
+  density: Float32Array; // 11x11x11 (pad=1 around 8x8x8 cells)
+  material: Uint8Array; // 11x11x11
+  edited: boolean;
+  dirty: boolean;
+  lastUsedFrame: number;
+}
+
+interface AnalyticalContext {
+  cfg: PlanetSeedConfig;
+  rScale: number;
+  seedOffX: number;
+  seedOffY: number;
+  seedOffZ: number;
+  iceLatThresh: number;
+  sandBias: number;
+  craters: Array<{ x: number; y: number; z: number; rad: number; depth: number }>;
+  spawnDir: [number, number, number];
+  spawnBaseR: number;
+  archCenter: [number, number, number];
+  archDir: [number, number, number];
+  archSpan: [number, number, number];
+  archBinorm: [number, number, number];
+  crystalThreshInner: number;
+  crystalThreshMid: number;
+  detailLogScale: number;
+}
+
+export interface HighResStreamBatch {
+  active: boolean;
+  hideMacro: boolean;
+  nativeCenter: [number, number, number];
+  nativeDiscardRadius: number;
+  midDiscardRadius: number;
+  desiredKeys: Set<string>;
+  rebuiltMeshes: Array<{
+    key: string;
+    tier: 'native' | 'mid';
+    mesh: ChunkMeshData;
+  }>;
+}
+
+const SPARSE_PAD = 1;
+const SPARSE_N = CHUNK_CELLS + 1 + SPARSE_PAD * 2; // 11
+const SPARSE_NY = SPARSE_N;
+const SPARSE_NZ = SPARSE_N * SPARSE_N;
+
 export class VoxelPlanet {
   public readonly gridN = GRID_N;
   public readonly cellsPerAxis = CELLS_PER_AXIS;
@@ -323,11 +406,18 @@ export class VoxelPlanet {
   public voxelSize = VOXEL_SIZE;
 
   public baseRadius = DEFAULT_PLANET_RADIUS;
+  public voxelRadius = DEFAULT_SEED_CONFIG.voxelRadius;
+  public nativeVoxelSize = DEFAULT_PLANET_RADIUS / DEFAULT_SEED_CONFIG.voxelRadius;
+  public isHighResStreaming = false;
   public seedConfig: PlanetSeedConfig = { ...DEFAULT_SEED_CONFIG };
 
   public readonly density: Float32Array;
   public readonly material: Uint8Array;
   public readonly dirtyChunks: Uint8Array;
+
+  public readonly sparseChunks = new Map<string, SparseVoxelChunk>();
+  private streamFrame = 0;
+  private genCtx!: AnalyticalContext;
 
   // Pre-allocated scratch buffers for chunk extraction (zero GC)
   private readonly cornerDensity = new Float32Array(8);
@@ -346,8 +436,12 @@ export class VoxelPlanet {
 
   public spawnPosition: [number, number, number] = [0, DEFAULT_PLANET_RADIUS + 2.2, 0];
   public lakeBasinCenters: Array<[number, number, number]> = [];
+  public hasGenerated = false;
 
-  constructor(seedOrConfig: number | Partial<PlanetSeedConfig> = 202611) {
+  constructor(
+    seedOrConfig: number | Partial<PlanetSeedConfig> = 202611,
+    options?: { skipGenerate?: boolean },
+  ) {
     const total = GRID_N * GRID_N * GRID_N;
     this.density = new Float32Array(total);
     this.material = new Uint8Array(total);
@@ -363,7 +457,19 @@ export class VoxelPlanet {
     this.scratchMat = new Float32Array(maxVerts * 3);
     this.scratchUv = new Float32Array(maxVerts * 2);
 
-    this.generatePlanet(seedOrConfig);
+    if (options?.skipGenerate) {
+      const raw: Partial<PlanetSeedConfig> =
+        typeof seedOrConfig === 'number'
+          ? { ...DEFAULT_SEED_CONFIG, seed: seedOrConfig }
+          : seedOrConfig;
+      const cfg = sanitizeSeedConfig(raw);
+      this.seedConfig = cfg;
+      this.updateBoundsForRadius(cfg.radius, cfg.voxelRadius);
+      this.genCtx = this.buildAnalyticalContext(cfg);
+      this.hasGenerated = false;
+    } else {
+      this.generatePlanet(seedOrConfig);
+    }
   }
 
   public gridIndex(ix: number, iy: number, iz: number): number {
@@ -391,10 +497,379 @@ export class VoxelPlanet {
     return (w + this.worldHalf) / this.voxelSize;
   }
 
-  private updateBoundsForRadius(radius: number): void {
+  private updateBoundsForRadius(radius: number, voxelRadius: number): void {
     this.baseRadius = radius;
+    this.voxelRadius = Math.max(4, voxelRadius);
     this.worldHalf = Math.max(0.25, radius * 1.54);
     this.voxelSize = (this.worldHalf * 2) / CELLS_PER_AXIS;
+    this.nativeVoxelSize = this.baseRadius / this.voxelRadius;
+    this.isHighResStreaming = Math.abs(this.voxelRadius - 18) > 0.45;
+  }
+
+  private buildAnalyticalContext(cfg: PlanetSeedConfig): AnalyticalContext {
+    seedNoise(cfg.seed);
+
+    let rng = (cfg.seed ^ 0x9e3779b9) >>> 0;
+    const rand = () => {
+      rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0;
+      return rng / 4294967296;
+    };
+
+    const seedOffX = (rand() - 0.5) * 90;
+    const seedOffY = (rand() - 0.5) * 90;
+    const seedOffZ = (rand() - 0.5) * 90;
+    const iceLatThresh = 0.72 + rand() * 0.2;
+    const sandBias = -0.26 + rand() * 0.28;
+
+    const rScale = cfg.radius / 13.0;
+
+    // Seed-driven spawn direction (temperate/varied biomes across different seeds)
+    let spawnDir: [number, number, number];
+    if (cfg.seed === 202611) {
+      spawnDir = [0.0, 0.94, 0.34];
+    } else {
+      const sy = (rand() - 0.45) * 1.45; // bias away from extreme poles unless randomly hit
+      const clampedY = clamp(sy, -0.88, 0.88);
+      const rXZ = Math.sqrt(Math.max(0.01, 1 - clampedY * clampedY));
+      const phi = rand() * Math.PI * 2;
+      spawnDir = [Math.cos(phi) * rXZ, clampedY, Math.sin(phi) * rXZ];
+    }
+    const sLen = Math.hypot(spawnDir[0], spawnDir[1], spawnDir[2]) || 1;
+    spawnDir[0] /= sLen;
+    spawnDir[1] /= sLen;
+    spawnDir[2] /= sLen;
+
+    // Orthonormal tangent frame around spawnDir so crater #0 & arch sit in scenic view per seed
+    const refAxis: [number, number, number] =
+      Math.abs(spawnDir[1]) < 0.85 ? [0, 1, 0] : [1, 0, 0];
+    let t1x = refAxis[1] * spawnDir[2] - refAxis[2] * spawnDir[1];
+    let t1y = refAxis[2] * spawnDir[0] - refAxis[0] * spawnDir[2];
+    let t1z = refAxis[0] * spawnDir[1] - refAxis[1] * spawnDir[0];
+    const t1Len = Math.hypot(t1x, t1y, t1z) || 1;
+    t1x /= t1Len; t1y /= t1Len; t1z /= t1Len;
+    const t2x = spawnDir[1] * t1z - spawnDir[2] * t1y;
+    const t2y = spawnDir[2] * t1x - spawnDir[0] * t1z;
+    const t2z = spawnDir[0] * t1y - spawnDir[1] * t1x;
+
+    const effectiveCraters = Math.min(cfg.craterCount, 48);
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+    const phaseOffset = rand() * Math.PI * 2;
+    const craters: Array<{ x: number; y: number; z: number; rad: number; depth: number }> = [];
+    for (let i = 0; i < effectiveCraters; i++) {
+      let bx: number;
+      let by: number;
+      let bz: number;
+      let brad: number;
+      if (i === 0) {
+        // Place primary scenic lake crater ~32-52 deg from spawn at a seed-varied azimuth
+        const ang = phaseOffset;
+        const tilt = 0.56 + rand() * 0.28;
+        const cosT = Math.cos(tilt);
+        const sinT = Math.sin(tilt);
+        bx = spawnDir[0] * cosT + (t1x * Math.cos(ang) + t2x * Math.sin(ang)) * sinT;
+        by = spawnDir[1] * cosT + (t1y * Math.cos(ang) + t2y * Math.sin(ang)) * sinT;
+        bz = spawnDir[2] * cosT + (t1z * Math.cos(ang) + t2z * Math.sin(ang)) * sinT;
+        brad = 0.42 + rand() * 0.12;
+      } else {
+        const y = 1 - ((i - 0.5) / Math.max(1, effectiveCraters)) * 2;
+        const rAtY = Math.sqrt(Math.max(0, 1 - y * y));
+        const theta = goldenAngle * i + phaseOffset + (rand() - 0.5) * 0.85;
+        bx = Math.cos(theta) * rAtY;
+        by = y;
+        bz = Math.sin(theta) * rAtY;
+        brad = 0.28 + rand() * 0.18;
+      }
+      const len = Math.hypot(bx, by, bz) || 1;
+      const rSurf = cfg.radius * 0.99;
+      craters.push({
+        x: (bx / len) * rSurf,
+        y: (by / len) * rSurf,
+        z: (bz / len) * rSurf,
+        rad: cfg.radius * brad,
+        depth: cfg.craterDepth * (i === 0 ? 1.05 : 0.85 + rand() * 0.28),
+      });
+    }
+
+    // Place natural rock arch ~25-36 deg away from spawn in a distinct azimuth
+    const archAz = phaseOffset + 1.65 + (rand() - 0.5) * 0.9;
+    const archTilt = 0.44 + rand() * 0.16;
+    const archCos = Math.cos(archTilt);
+    const archSin = Math.sin(archTilt);
+    const adx = spawnDir[0] * archCos + (t1x * Math.cos(archAz) + t2x * Math.sin(archAz)) * archSin;
+    const ady = spawnDir[1] * archCos + (t1y * Math.cos(archAz) + t2y * Math.sin(archAz)) * archSin;
+    const adz = spawnDir[2] * archCos + (t1z * Math.cos(archAz) + t2z * Math.sin(archAz)) * archSin;
+    const adLen = Math.hypot(adx, ady, adz) || 1;
+    const archDir: [number, number, number] = [adx / adLen, ady / adLen, adz / adLen];
+
+    const archRef: [number, number, number] =
+      Math.abs(archDir[1]) < 0.85 ? [0, 1, 0] : [1, 0, 0];
+    let asx = archRef[1] * archDir[2] - archRef[2] * archDir[1];
+    let asy = archRef[2] * archDir[0] - archRef[0] * archDir[2];
+    let asz = archRef[0] * archDir[1] - archRef[1] * archDir[0];
+    const asLen = Math.hypot(asx, asy, asz) || 1;
+    asx /= asLen; asy /= asLen; asz /= asLen;
+    const archSpan: [number, number, number] = [asx, asy, asz];
+    const archBinorm: [number, number, number] = [
+      archDir[1] * asz - archDir[2] * asy,
+      archDir[2] * asx - archDir[0] * asz,
+      archDir[0] * asy - archDir[1] * asx,
+    ];
+
+    const ctx: AnalyticalContext = {
+      cfg,
+      rScale,
+      seedOffX,
+      seedOffY,
+      seedOffZ,
+      iceLatThresh,
+      sandBias,
+      craters,
+      spawnDir,
+      spawnBaseR: this.baseRadius + 0.8 * rScale,
+      archCenter: [
+        archDir[0] * cfg.radius * 0.96,
+        archDir[1] * cfg.radius * 0.96,
+        archDir[2] * cfg.radius * 0.96,
+      ],
+      archDir,
+      archSpan,
+      archBinorm,
+      crystalThreshInner: 0.86 - cfg.crystalRichness * 0.32,
+      crystalThreshMid: 0.90 - cfg.crystalRichness * 0.30,
+      detailLogScale: Math.max(0, Math.log2(Math.max(18, cfg.voxelRadius) / 18)),
+    };
+
+    // Sample actual unflattened terrain radius at spawnDir & archDir so spawn blends naturally
+    this.genCtx = ctx;
+    const spawnRawR = this.evalUnflattenedRadius(spawnDir[0], spawnDir[1], spawnDir[2]);
+    ctx.spawnBaseR = Math.max(cfg.radius * 0.72, spawnRawR);
+
+    const archSurfR = this.evalUnflattenedRadius(archDir[0], archDir[1], archDir[2]);
+    ctx.archCenter = [
+      archDir[0] * (archSurfR - 0.15 * rScale),
+      archDir[1] * (archSurfR - 0.15 * rScale),
+      archDir[2] * (archSurfR - 0.15 * rScale),
+    ];
+
+    return ctx;
+  }
+
+  private evalUnflattenedRadius(nx: number, ny: number, nz: number): number {
+    const { cfg, rScale, seedOffX, seedOffY, seedOffZ, craters } = this.genCtx;
+    const wx = nx * this.baseRadius;
+    const wy = ny * this.baseRadius;
+    const wz = nz * this.baseRadius;
+    const wxN = wx / rScale;
+    const wyN = wy / rScale;
+    const wzN = wz / rScale;
+
+    const continent = fbm3D(
+      nx * 1.45 + seedOffX * 0.08,
+      ny * 1.45 + seedOffY * 0.08,
+      nz * 1.45 + seedOffZ * 0.08,
+      4,
+    );
+    const ridge = ridged3D(
+      nx * cfg.ridgeFreq + 5.1 + seedOffX * 0.11,
+      ny * cfg.ridgeFreq + seedOffY * 0.11,
+      nz * cfg.ridgeFreq - 3.2 + seedOffZ * 0.11,
+      3,
+    );
+    const micro =
+      fbm3D(wxN * 0.22 + seedOffX * 0.05, wyN * 0.22 + seedOffY * 0.05, wzN * 0.22 + seedOffZ * 0.05, 2) *
+      0.42 *
+      rScale;
+
+    let targetRadius =
+      this.baseRadius +
+      continent * cfg.continentAmp * rScale +
+      (ridge - 0.38) * cfg.ridgeAmp * rScale +
+      micro;
+
+    for (let c = 0; c < craters.length; c++) {
+      const cr = craters[c];
+      const dist = Math.hypot(wx - cr.x, wy - cr.y, wz - cr.z);
+      if (dist < cr.rad) {
+        const t = 1 - smoothstep(cr.rad * 0.22, cr.rad, dist);
+        targetRadius -= t * cr.depth * rScale;
+      }
+    }
+    return targetRadius;
+  }
+
+  /**
+   * Pure analytical SDF + geological material evaluation at any continuous world position (wx, wy, wz).
+   * Enables O(1) lazy chunk streaming for tens-of-thousands-of-blocks resolution worlds.
+   */
+  public evalAnalyticalAt(
+    wx: number,
+    wy: number,
+    wz: number,
+    includeMicroDetail = true,
+  ): { density: number; material: MaterialId } {
+    const {
+      cfg,
+      rScale,
+      seedOffX,
+      seedOffY,
+      seedOffZ,
+      iceLatThresh,
+      sandBias,
+      craters,
+      spawnDir,
+      spawnBaseR,
+      archCenter,
+      archDir,
+      archSpan,
+      archBinorm,
+      crystalThreshInner,
+      crystalThreshMid,
+      detailLogScale,
+    } = this.genCtx;
+
+    const r = Math.hypot(wx, wy, wz);
+    const nx = r > 1e-6 ? wx / r : 0;
+    const ny = r > 1e-6 ? wy / r : 1;
+    const nz = r > 1e-6 ? wz / r : 0;
+
+    const wxN = wx / rScale;
+    const wyN = wy / rScale;
+    const wzN = wz / rScale;
+
+    const continent = fbm3D(
+      nx * 1.45 + seedOffX * 0.08,
+      ny * 1.45 + seedOffY * 0.08,
+      nz * 1.45 + seedOffZ * 0.08,
+      4,
+    );
+    const ridge = ridged3D(
+      nx * cfg.ridgeFreq + 5.1 + seedOffX * 0.11,
+      ny * cfg.ridgeFreq + seedOffY * 0.11,
+      nz * cfg.ridgeFreq - 3.2 + seedOffZ * 0.11,
+      3,
+    );
+    const micro =
+      fbm3D(
+        wxN * 0.22 + seedOffX * 0.05,
+        wyN * 0.22 + seedOffY * 0.05,
+        wzN * 0.22 + seedOffZ * 0.05,
+        2,
+      ) *
+      0.42 *
+      rScale;
+
+    let targetRadius =
+      this.baseRadius +
+      continent * cfg.continentAmp * rScale +
+      (ridge - 0.38) * cfg.ridgeAmp * rScale +
+      micro;
+
+    // Multi-octave high-resolution terrain terraces & cliff relief when voxelRadius >> 18
+    if (includeMicroDetail && detailLogScale > 0.3) {
+      const fineAmp = Math.min(0.24, detailLogScale * 0.032) * rScale;
+      const fineWave = fbm3D(wxN * 1.85 + seedOffX, wyN * 1.85 + seedOffY, wzN * 1.85 + seedOffZ, 2) * fineAmp;
+      targetRadius += fineWave;
+      if (detailLogScale > 2.2) {
+        const blockWaveFreq = 1 / Math.max(this.nativeVoxelSize * 14, 1e-5);
+        const blockRelief =
+          fbm3D(wx * blockWaveFreq + seedOffX, wy * blockWaveFreq + seedOffY, wz * blockWaveFreq + seedOffZ, 2) *
+          this.nativeVoxelSize *
+          2.6;
+        targetRadius += blockRelief;
+      }
+    }
+
+    let inCraterRim = false;
+    for (let c = 0; c < craters.length; c++) {
+      const cr = craters[c];
+      const dist = Math.hypot(wx - cr.x, wy - cr.y, wz - cr.z);
+      if (dist < cr.rad) {
+        const t = 1 - smoothstep(cr.rad * 0.22, cr.rad, dist);
+        targetRadius -= t * cr.depth * rScale;
+        if (dist < cr.rad * 0.88) {
+          inCraterRim = true;
+        }
+      }
+    }
+
+    // Small landing pad gently blended toward actual local terrain elevation at spawnDir
+    const dotSpawn = nx * spawnDir[0] + ny * spawnDir[1] + nz * spawnDir[2];
+    if (dotSpawn > 0.968) {
+      const flatBlend = smoothstep(0.968, 0.994, dotSpawn);
+      targetRadius = targetRadius * (1 - flatBlend) + spawnBaseR * flatBlend;
+    }
+
+    let d = targetRadius - r;
+
+    const caveMinR = cfg.radius * 0.28;
+    const caveMaxR = cfg.radius * 0.72;
+    if (cfg.caveDensity > 0.01 && r > caveMinR && r < caveMaxR) {
+      const caveNoise = fbm3D(
+        wxN * 0.19 + 11.3 + seedOffX * 0.07,
+        wyN * 0.19 + seedOffY * 0.07,
+        wzN * 0.19 + seedOffZ * 0.07,
+        3,
+      );
+      const shellWeight =
+        smoothstep(caveMinR, caveMinR + 1.4 * rScale, r) *
+        (1 - smoothstep(caveMaxR - 1.4 * rScale, caveMaxR, r));
+      if (caveNoise > 0.18) {
+        d -= (caveNoise - 0.18) * 13.5 * cfg.caveDensity * shellWeight * rScale;
+      }
+    }
+
+    if (cfg.hasArch) {
+      const adx = (wx - archCenter[0]) / rScale;
+      const ady = (wy - archCenter[1]) / rScale;
+      const adz = (wz - archCenter[2]) / rScale;
+      if (adx * adx + ady * ady + adz * adz < 16.0) {
+        const h = adx * archDir[0] + ady * archDir[1] + adz * archDir[2];
+        const px = adx - h * archDir[0];
+        const py = ady - h * archDir[1];
+        const pz = adz - h * archDir[2];
+        const spanCoord = px * archSpan[0] + py * archSpan[1] + pz * archSpan[2];
+        const perpCoord = px * archBinorm[0] + py * archBinorm[1] + pz * archBinorm[2];
+        const torusMajor = Math.hypot(spanCoord, h) - 2.2;
+        const torusDist = Math.hypot(torusMajor, perpCoord);
+        if (torusDist < 1.15 && h > -0.35) {
+          d = Math.max(d, (1.05 - torusDist) * rScale);
+        }
+      }
+    }
+
+    const edgeMargin =
+      this.worldHalf * 0.94 - Math.max(Math.abs(wx), Math.abs(wy), Math.abs(wz));
+    if (edgeMargin < 0) {
+      d = Math.min(d, edgeMargin * 2.0 - 0.5 * rScale);
+    }
+
+    if (d <= 0) {
+      return { density: d, material: MaterialId.Air };
+    }
+
+    const absLat = Math.abs(ny);
+    const crystalVein = ridged3D(
+      wxN * 0.28 + seedOffX * 0.04,
+      wyN * 0.28 + seedOffY * 0.04,
+      wzN * 0.28 + seedOffZ * 0.04,
+      2,
+    );
+    let mat: MaterialId;
+    if (r < cfg.radius * 0.49) {
+      mat = crystalVein > crystalThreshInner ? MaterialId.Crystal : MaterialId.Basalt;
+    } else if (r < cfg.radius * 0.81) {
+      mat = crystalVein > crystalThreshMid ? MaterialId.Crystal : MaterialId.Stone;
+    } else if (absLat > iceLatThresh && r > this.baseRadius + 0.65 * rScale) {
+      mat = MaterialId.Ice;
+    } else if (r > this.baseRadius + 1.85 * rScale) {
+      mat = MaterialId.Stone;
+    } else if (inCraterRim || continent < sandBias) {
+      mat = MaterialId.Sandstone;
+    } else {
+      mat = MaterialId.Soil;
+    }
+
+    return { density: d, material: mat };
   }
 
   public generatePlanet(seedOrConfig: number | Partial<PlanetSeedConfig> = 202611): void {
@@ -405,79 +880,14 @@ export class VoxelPlanet {
 
     const cfg = sanitizeSeedConfig(raw);
     this.seedConfig = cfg;
-    this.updateBoundsForRadius(cfg.radius);
-    seedNoise(cfg.seed);
+    this.updateBoundsForRadius(cfg.radius, cfg.voxelRadius);
+    this.sparseChunks.clear();
+    this.genCtx = this.buildAnalyticalContext(cfg);
+    this.lakeBasinCenters = this.genCtx.craters
+      .slice(0, 3)
+      .map((c) => [c.x, c.y, c.z]);
 
-    // Deterministic seeded PRNG for crater placement
-    let rng = (cfg.seed ^ 0x9e3779b9) >>> 0;
-    const rand = () => {
-      rng = (Math.imul(rng, 1664525) + 1013904223) >>> 0;
-      return rng / 4294967296;
-    };
-
-    // Scenic crater lake basins placed relative to current planet radius
-    const baseDirs: Array<[number, number, number, number]> = [
-      [0.4, 0.81, 0.42, 0.49],   // Front-upper scenic lake
-      [-0.64, 0.61, 0.47, 0.43], // Left-upper crater
-      [0.12, -0.91, -0.39, 0.46],// South pole basin
-      [0.78, -0.25, -0.57, 0.42],
-      [-0.55, -0.52, 0.65, 0.41],
-      [-0.22, 0.25, -0.94, 0.44],
-    ];
-
-    const effectiveCraters = Math.min(cfg.craterCount, 48);
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    const craters: Array<{ x: number; y: number; z: number; rad: number; depth: number }> = [];
-    for (let i = 0; i < effectiveCraters; i++) {
-      let bx: number;
-      let by: number;
-      let bz: number;
-      let brad: number;
-      if (i < baseDirs.length) {
-        const base = baseDirs[i];
-        const jitter = i === 0 ? 0.05 : 0.22;
-        bx = base[0] + (rand() - 0.5) * jitter;
-        by = base[1] + (rand() - 0.5) * jitter;
-        bz = base[2] + (rand() - 0.5) * jitter;
-        brad = base[3];
-      } else {
-        const y = 1 - ((i - baseDirs.length + 0.5) / Math.max(1, effectiveCraters - baseDirs.length)) * 2;
-        const rAtY = Math.sqrt(Math.max(0, 1 - y * y));
-        const theta = goldenAngle * i + rand() * 0.4;
-        bx = Math.cos(theta) * rAtY;
-        by = y;
-        bz = Math.sin(theta) * rAtY;
-        brad = 0.28 + rand() * 0.16;
-      }
-      const len = Math.hypot(bx, by, bz) || 1;
-      const rSurf = cfg.radius * 0.99;
-      craters.push({
-        x: (bx / len) * rSurf,
-        y: (by / len) * rSurf,
-        z: (bz / len) * rSurf,
-        rad: cfg.radius * brad,
-        depth: cfg.craterDepth * (i === 0 ? 1.05 : 0.88 + rand() * 0.22),
-      });
-    }
-    this.lakeBasinCenters = craters.slice(0, 3).map((c) => [c.x, c.y, c.z]);
-
-    // Spawn highland plateau overlooking crater 0 & natural arch
-    const spawnDir = [0.0, 0.94, 0.34];
-    const sLen = Math.hypot(spawnDir[0], spawnDir[1], spawnDir[2]);
-    spawnDir[0] /= sLen;
-    spawnDir[1] /= sLen;
-    spawnDir[2] /= sLen;
-
-    const rScale = cfg.radius / 13.0;
-    const archCenter: [number, number, number] = [
-      2.9 * rScale,
-      11.6 * rScale,
-      2.2 * rScale,
-    ];
-
-    const crystalThreshInner = 0.86 - cfg.crystalRichness * 0.32;
-    const crystalThreshMid = 0.90 - cfg.crystalRichness * 0.30;
-
+    const rScale = this.genCtx.rScale;
     for (let iz = 0; iz < GRID_N; iz++) {
       const wz = this.gridToWorld(iz);
       for (let iy = 0; iy < GRID_N; iy++) {
@@ -485,121 +895,14 @@ export class VoxelPlanet {
         for (let ix = 0; ix < GRID_N; ix++) {
           const wx = this.gridToWorld(ix);
           const idx = this.gridIndex(ix, iy, iz);
-
-          const r = Math.hypot(wx, wy, wz);
-          const nx = r > 1e-6 ? wx / r : 0;
-          const ny = r > 1e-6 ? wy / r : 1;
-          const nz = r > 1e-6 ? wz / r : 0;
-
-          // Scale-normalized coordinates for coherent geological features at any planet radius
-          const wxN = wx / rScale;
-          const wyN = wy / rScale;
-          const wzN = wz / rScale;
-
-          // Continents + mountain ridges
-          const continent = fbm3D(nx * 1.45, ny * 1.45, nz * 1.45, 4);
-          const ridge = ridged3D(
-            nx * cfg.ridgeFreq + 5.1,
-            ny * cfg.ridgeFreq,
-            nz * cfg.ridgeFreq - 3.2,
-            3,
-          );
-          const micro = fbm3D(wxN * 0.22, wyN * 0.22, wzN * 0.22, 2) * 0.42 * rScale;
-
-          let targetRadius =
-            this.baseRadius +
-            continent * cfg.continentAmp * rScale +
-            (ridge - 0.38) * cfg.ridgeAmp * rScale +
-            micro;
-
-          // Carve crater lake basins smoothly
-          let inCraterRim = false;
-          for (let c = 0; c < craters.length; c++) {
-            const cr = craters[c];
-            const dist = Math.hypot(wx - cr.x, wy - cr.y, wz - cr.z);
-            if (dist < cr.rad) {
-              const t = 1 - smoothstep(cr.rad * 0.22, cr.rad, dist);
-              targetRadius -= t * cr.depth * rScale;
-              if (dist < cr.rad * 0.88) {
-                inCraterRim = true;
-              }
-            }
-          }
-
-          // Smooth highland spawn plateau so explorer spawns on stable ground
-          const dotSpawn =
-            nx * spawnDir[0] + ny * spawnDir[1] + nz * spawnDir[2];
-          if (dotSpawn > 0.91) {
-            const flatBlend = smoothstep(0.91, 0.985, dotSpawn);
-            const desiredSpawnR = this.baseRadius + 1.05 * rScale;
-            targetRadius =
-              targetRadius * (1 - flatBlend) + desiredSpawnR * flatBlend;
-          }
-
-          // Positive density = inside solid
-          let d = targetRadius - r;
-
-          // Carve subterranean crystal caves in mantle shell
-          const caveMinR = cfg.radius * 0.28;
-          const caveMaxR = cfg.radius * 0.72;
-          if (cfg.caveDensity > 0.01 && r > caveMinR && r < caveMaxR) {
-            const caveNoise = fbm3D(wxN * 0.19 + 11.3, wyN * 0.19, wzN * 0.19, 3);
-            const shellWeight =
-              smoothstep(caveMinR, caveMinR + 1.4 * rScale, r) *
-              (1 - smoothstep(caveMaxR - 1.4 * rScale, caveMaxR, r));
-            if (caveNoise > 0.18) {
-              d -= (caveNoise - 0.18) * 13.5 * cfg.caveDensity * shellWeight * rScale;
-            }
-          }
-
-          // Scenic natural rock arch bridging near the vista
-          if (cfg.hasArch) {
-            const adx = (wx - archCenter[0]) / rScale;
-            const ady = (wy - archCenter[1]) / rScale;
-            const adz = (wz - archCenter[2]) / rScale;
-            const torusMajor = Math.hypot(adx, adz) - 2.3;
-            const torusDist = Math.hypot(torusMajor, ady - 0.45);
-            if (torusDist < 1.15 && ady > -0.3) {
-              d = Math.max(d, (1.05 - torusDist) * rScale);
-            }
-          }
-
-          // Keep outer boundary strictly air so planet never clips grid edges
-          const edgeMargin =
-            this.worldHalf * 0.94 - Math.max(Math.abs(wx), Math.abs(wy), Math.abs(wz));
-          if (edgeMargin < 0) {
-            d = Math.min(d, edgeMargin * 2.0 - 0.5 * rScale);
-          }
-
-          this.density[idx] = d;
-
-          // Assign coherent geological material without noisy threshold flipping
-          if (d <= 0) {
-            this.material[idx] = MaterialId.Air;
-          } else {
-            const absLat = Math.abs(ny);
-            const crystalVein = ridged3D(wxN * 0.28, wyN * 0.28, wzN * 0.28, 2);
-            if (r < cfg.radius * 0.49) {
-              this.material[idx] =
-                crystalVein > crystalThreshInner ? MaterialId.Crystal : MaterialId.Basalt;
-            } else if (r < cfg.radius * 0.81) {
-              this.material[idx] =
-                crystalVein > crystalThreshMid ? MaterialId.Crystal : MaterialId.Stone;
-            } else if (absLat > 0.87 && r > this.baseRadius + 0.75 * rScale) {
-              this.material[idx] = MaterialId.Ice;
-            } else if (r > this.baseRadius + 1.85 * rScale) {
-              this.material[idx] = MaterialId.Stone;
-            } else if (inCraterRim || continent < -0.18) {
-              this.material[idx] = MaterialId.Sandstone;
-            } else {
-              this.material[idx] = MaterialId.Soil;
-            }
-          }
+          const evalRes = this.evalAnalyticalAt(wx, wy, wz, false);
+          this.density[idx] = evalRes.density;
+          this.material[idx] = evalRes.material;
         }
       }
     }
 
-    // Re-enforce flat spawn surface height accurately
+    const spawnDir = this.genCtx.spawnDir;
     const spawnR = this.findSurfaceRadiusAlongRay(
       spawnDir[0],
       spawnDir[1],
@@ -612,15 +915,101 @@ export class VoxelPlanet {
     ];
 
     this.dirtyChunks.fill(1);
+    this.hasGenerated = true;
+  }
+
+  public async generatePlanetAsync(
+    seedOrConfig: number | Partial<PlanetSeedConfig> = 202611,
+    onProgress?: (fraction: number, detail: string) => void,
+    shouldAbort?: () => boolean,
+  ): Promise<boolean> {
+    const raw: Partial<PlanetSeedConfig> =
+      typeof seedOrConfig === 'number'
+        ? { ...DEFAULT_SEED_CONFIG, seed: seedOrConfig }
+        : seedOrConfig;
+
+    const cfg = sanitizeSeedConfig(raw);
+    this.seedConfig = cfg;
+    this.updateBoundsForRadius(cfg.radius, cfg.voxelRadius);
+    this.sparseChunks.clear();
+    this.genCtx = this.buildAnalyticalContext(cfg);
+    this.lakeBasinCenters = this.genCtx.craters
+      .slice(0, 3)
+      .map((c) => [c.x, c.y, c.z]);
+
+    onProgress?.(0.02, '初始化星球参数与地质噪声场');
+
+    const rScale = this.genCtx.rScale;
+    let sliceStart = performance.now();
+
+    for (let iz = 0; iz < GRID_N; iz++) {
+      if (shouldAbort?.()) return false;
+      const wz = this.gridToWorld(iz);
+      for (let iy = 0; iy < GRID_N; iy++) {
+        const wy = this.gridToWorld(iy);
+        for (let ix = 0; ix < GRID_N; ix++) {
+          const wx = this.gridToWorld(ix);
+          const idx = this.gridIndex(ix, iy, iz);
+          const evalRes = this.evalAnalyticalAt(wx, wy, wz, false);
+          this.density[idx] = evalRes.density;
+          this.material[idx] = evalRes.material;
+        }
+      }
+
+      if (performance.now() - sliceStart >= 8 || iz === GRID_N - 1) {
+        onProgress?.(
+          0.04 + 0.92 * ((iz + 1) / GRID_N),
+          `体素密度场采样 ${iz + 1}/${GRID_N}`,
+        );
+        if (iz < GRID_N - 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          sliceStart = performance.now();
+        }
+      }
+    }
+
+    if (shouldAbort?.()) return false;
+
+    const spawnDir = this.genCtx.spawnDir;
+    const spawnR = this.findSurfaceRadiusAlongRay(
+      spawnDir[0],
+      spawnDir[1],
+      spawnDir[2],
+    );
+    this.spawnPosition = [
+      spawnDir[0] * (spawnR + 1.35 * rScale),
+      spawnDir[1] * (spawnR + 1.35 * rScale),
+      spawnDir[2] * (spawnR + 1.35 * rScale),
+    ];
+
+    this.dirtyChunks.fill(1);
+    this.hasGenerated = true;
+    onProgress?.(1.0, '体素场构建完成');
+    return true;
   }
 
   public exportSnapshot(): VoxelPlanetSnapshot {
+    const editedChunks: SparseChunkSnapshot[] = [];
+    for (const chunk of this.sparseChunks.values()) {
+      if (chunk.edited) {
+        editedChunks.push({
+          key: chunk.key,
+          cx: chunk.cx,
+          cy: chunk.cy,
+          cz: chunk.cz,
+          scaleMult: chunk.scaleMult,
+          density: new Float32Array(chunk.density),
+          material: new Uint8Array(chunk.material),
+        });
+      }
+    }
     return {
       seedConfig: { ...this.seedConfig },
       density: new Float32Array(this.density),
       material: new Uint8Array(this.material),
       spawnPosition: [...this.spawnPosition] as [number, number, number],
       lakeBasinCenters: this.lakeBasinCenters.map((c) => [...c] as [number, number, number]),
+      editedChunks: editedChunks.length > 0 ? editedChunks : undefined,
     };
   }
 
@@ -632,7 +1021,31 @@ export class VoxelPlanet {
       throw new Error('Incompatible voxel grid dimensions in snapshot');
     }
     this.seedConfig = sanitizeSeedConfig(snapshot.seedConfig);
-    this.updateBoundsForRadius(this.seedConfig.radius);
+    this.updateBoundsForRadius(this.seedConfig.radius, this.seedConfig.voxelRadius);
+    this.genCtx = this.buildAnalyticalContext(this.seedConfig);
+    this.sparseChunks.clear();
+    if (snapshot.editedChunks) {
+      for (const sc of snapshot.editedChunks) {
+        const stepSize = this.nativeVoxelSize * sc.scaleMult;
+        const chunkSpan = CHUNK_CELLS * stepSize;
+        this.sparseChunks.set(sc.key, {
+          key: sc.key,
+          cx: sc.cx,
+          cy: sc.cy,
+          cz: sc.cz,
+          scaleMult: sc.scaleMult,
+          stepSize,
+          originX: sc.cx * chunkSpan,
+          originY: sc.cy * chunkSpan,
+          originZ: sc.cz * chunkSpan,
+          density: new Float32Array(sc.density),
+          material: new Uint8Array(sc.material),
+          edited: true,
+          dirty: true,
+          lastUsedFrame: this.streamFrame,
+        });
+      }
+    }
     this.density.set(snapshot.density);
     this.material.set(snapshot.material);
     this.spawnPosition = [...snapshot.spawnPosition] as [number, number, number];
@@ -661,6 +1074,14 @@ export class VoxelPlanet {
     }
     const densityBytes = this.density.byteLength;
     const materialBytes = this.material.byteLength;
+    let sparseBytes = 0;
+    for (const c of this.sparseChunks.values()) {
+      sparseBytes += c.density.byteLength + c.material.byteLength;
+    }
+    const virtualCellsPerAxis = Math.max(
+      CELLS_PER_AXIS,
+      Math.round(this.voxelRadius * 2 * 1.54),
+    );
     return {
       gridN: GRID_N,
       cellsPerAxis: CELLS_PER_AXIS,
@@ -673,9 +1094,14 @@ export class VoxelPlanet {
       worldHalf: this.worldHalf,
       densityBytes,
       materialBytes,
-      totalBytes: densityBytes + materialBytes + this.dirtyChunks.byteLength,
+      totalBytes: densityBytes + materialBytes + this.dirtyChunks.byteLength + sparseBytes,
       solidVoxels: solid,
       materialCounts: counts,
+      voxelRadius: this.voxelRadius,
+      nativeVoxelSize: this.nativeVoxelSize,
+      virtualCellsPerAxis,
+      sparseActiveChunks: this.sparseChunks.size,
+      isSparseStreaming: this.isHighResStreaming,
     };
   }
 
@@ -762,10 +1188,66 @@ export class VoxelPlanet {
     return this.baseRadius;
   }
 
+  public sampleSparseDensity(wx: number, wy: number, wz: number): number | null {
+    if (!this.isHighResStreaming || this.sparseChunks.size === 0) return null;
+    const chunkSpan = CHUNK_CELLS * this.nativeVoxelSize;
+    const cx = Math.floor(wx / chunkSpan);
+    const cy = Math.floor(wy / chunkSpan);
+    const cz = Math.floor(wz / chunkSpan);
+    const chunk = this.sparseChunks.get(`1:${cx},${cy},${cz}`);
+    if (!chunk) return null;
+
+    const step = chunk.stepSize;
+    const gx = (wx - chunk.originX) / step + SPARSE_PAD;
+    const gy = (wy - chunk.originY) / step + SPARSE_PAD;
+    const gz = (wz - chunk.originZ) / step + SPARSE_PAD;
+    if (
+      gx < 0 ||
+      gy < 0 ||
+      gz < 0 ||
+      gx >= SPARSE_N - 1 ||
+      gy >= SPARSE_N - 1 ||
+      gz >= SPARSE_N - 1
+    ) {
+      return null;
+    }
+
+    const ix = Math.floor(gx);
+    const iy = Math.floor(gy);
+    const iz = Math.floor(gz);
+    const fx = gx - ix;
+    const fy = gy - iy;
+    const fz = gz - iz;
+    const base = ix + iy * SPARSE_NY + iz * SPARSE_NZ;
+    const d = chunk.density;
+
+    const c000 = d[base];
+    const c100 = d[base + 1];
+    const c010 = d[base + SPARSE_NY];
+    const c110 = d[base + SPARSE_NY + 1];
+    const c001 = d[base + SPARSE_NZ];
+    const c101 = d[base + SPARSE_NZ + 1];
+    const c011 = d[base + SPARSE_NZ + SPARSE_NY];
+    const c111 = d[base + SPARSE_NZ + SPARSE_NY + 1];
+
+    const x00 = c000 + (c100 - c000) * fx;
+    const x10 = c010 + (c110 - c010) * fx;
+    const x01 = c001 + (c101 - c001) * fx;
+    const x11 = c011 + (c111 - c011) * fx;
+    const y0 = x00 + (x10 - x00) * fy;
+    const y1 = x01 + (x11 - x01) * fy;
+    return y0 + (y1 - y0) * fz;
+  }
+
   /**
    * Fast trilinear interpolation of voxel scalar density at world position (x,y,z).
    */
   public sampleDensity(wx: number, wy: number, wz: number): number {
+    if (this.isHighResStreaming && this.sparseChunks.size > 0) {
+      const sparseD = this.sampleSparseDensity(wx, wy, wz);
+      if (sparseD !== null) return sparseD;
+    }
+
     const gx = this.worldToGrid(wx);
     const gy = this.worldToGrid(wy);
     const gz = this.worldToGrid(wz);
@@ -822,7 +1304,9 @@ export class VoxelPlanet {
     outNormal: [number, number, number],
   ): number {
     const val = this.sampleDensity(wx, wy, wz);
-    const eps = this.voxelSize * 0.65;
+    const eps = this.isHighResStreaming
+      ? Math.max(this.nativeVoxelSize * 0.65, this.voxelSize * 0.08)
+      : this.voxelSize * 0.65;
     const dx =
       this.sampleDensity(wx - eps, wy, wz) -
       this.sampleDensity(wx + eps, wy, wz);
@@ -848,6 +1332,32 @@ export class VoxelPlanet {
   }
 
   public sampleNearestMaterial(wx: number, wy: number, wz: number): MaterialId {
+    if (this.isHighResStreaming && this.sparseChunks.size > 0) {
+      const chunkSpan = CHUNK_CELLS * this.nativeVoxelSize;
+      const cx = Math.floor(wx / chunkSpan);
+      const cy = Math.floor(wy / chunkSpan);
+      const cz = Math.floor(wz / chunkSpan);
+      const chunk = this.sparseChunks.get(`1:${cx},${cy},${cz}`);
+      if (chunk) {
+        const ix = clamp(
+          Math.round((wx - chunk.originX) / chunk.stepSize) + SPARSE_PAD,
+          0,
+          SPARSE_N - 1,
+        );
+        const iy = clamp(
+          Math.round((wy - chunk.originY) / chunk.stepSize) + SPARSE_PAD,
+          0,
+          SPARSE_N - 1,
+        );
+        const iz = clamp(
+          Math.round((wz - chunk.originZ) / chunk.stepSize) + SPARSE_PAD,
+          0,
+          SPARSE_N - 1,
+        );
+        return chunk.material[ix + iy * SPARSE_NY + iz * SPARSE_NZ] as MaterialId;
+      }
+    }
+
     const ix = clamp(Math.round(this.worldToGrid(wx)), 0, CELLS_PER_AXIS);
     const iy = clamp(Math.round(this.worldToGrid(wy)), 0, CELLS_PER_AXIS);
     const iz = clamp(Math.round(this.worldToGrid(wz)), 0, CELLS_PER_AXIS);
@@ -866,7 +1376,12 @@ export class VoxelPlanet {
     dz: number,
     maxDist = this.worldHalf * 4.5,
   ): RaycastHit {
-    const step = this.voxelSize * 0.35;
+    const camR = Math.hypot(ox, oy, oz);
+    const nearSurface = Math.abs(camR - this.baseRadius) < this.voxelSize * 3.0;
+    const step =
+      this.isHighResStreaming && nearSurface
+        ? Math.max(this.nativeVoxelSize * 0.45, Math.min(this.voxelSize * 0.25, Math.abs(camR - this.baseRadius) * 0.08 + this.nativeVoxelSize * 0.5))
+        : this.voxelSize * 0.35;
     let prevT = 0;
     let prevD = this.sampleDensity(ox, oy, oz);
 
@@ -880,7 +1395,7 @@ export class VoxelPlanet {
         // Binary search exact isosurface crossing
         let lo = prevT;
         let hi = t;
-        for (let iter = 0; iter < 6; iter++) {
+        for (let iter = 0; iter < 8; iter++) {
           const mid = 0.5 * (lo + hi);
           const md = this.sampleDensity(ox + dx * mid, oy + dy * mid, oz + dz * mid);
           if (md >= 0) hi = mid;
@@ -911,7 +1426,7 @@ export class VoxelPlanet {
   }
 
   /**
-   * Sculpt, build, smooth, or spherically flatten the planetary voxel field.
+   * Sculpt, build, smooth, or spherically flatten the planetary voxel field (and active high-res sparse chunks).
    */
   public applyBrush(
     cx: number,
@@ -922,7 +1437,10 @@ export class VoxelPlanet {
     strength: number,
     materialId: MaterialId,
   ): BrushResult {
-    const safeRad = Math.max(this.voxelSize * 0.5, radius);
+    const minUnit = this.isHighResStreaming
+      ? Math.min(this.voxelSize, this.nativeVoxelSize)
+      : this.voxelSize;
+    const safeRad = Math.max(minUnit * 0.5, radius);
     const rScale = this.baseRadius / 13.0;
     const pad = safeRad + this.voxelSize * 1.5;
     const minX = clamp(Math.floor(this.worldToGrid(cx - pad)), 1, CELLS_PER_AXIS - 1);
@@ -935,6 +1453,9 @@ export class VoxelPlanet {
     const targetShellRadius = Math.hypot(cx, cy, cz);
     let deltaVolume = 0;
 
+    // 1. Update macro grid (attenuate slightly when brush is much smaller than a macro voxel)
+    const macroRad = Math.max(safeRad, this.voxelSize * 0.65);
+    const macroWeight = clamp(safeRad / (this.voxelSize * 0.65), 0.12, 1.0);
     let copySnapshot: Float32Array | null = null;
     if (mode === 'smooth') {
       copySnapshot = new Float32Array(this.density);
@@ -947,9 +1468,9 @@ export class VoxelPlanet {
         for (let ix = minX; ix <= maxX; ix++) {
           const wx = this.gridToWorld(ix);
           const dist = Math.hypot(wx - cx, wy - cy, wz - cz);
-          if (dist >= safeRad) continue;
+          if (dist >= macroRad) continue;
 
-          const falloff = 1 - smoothstep(0, safeRad, dist);
+          const falloff = (1 - smoothstep(0, macroRad, dist)) * macroWeight;
           const idx = this.gridIndex(ix, iy, iz);
           const prev = this.density[idx];
           let next = prev;
@@ -997,6 +1518,142 @@ export class VoxelPlanet {
 
           this.density[idx] = next;
           deltaVolume += next - prev;
+        }
+      }
+    }
+
+    // 2. Update sparse high-res chunks when high-res streaming is active
+    if (this.isHighResStreaming) {
+      const nativeSpan = CHUNK_CELLS * this.nativeVoxelSize;
+      const sparsePad = safeRad + this.nativeVoxelSize * 2.0;
+      const scMinX = Math.floor((cx - sparsePad) / nativeSpan);
+      const scMaxX = Math.floor((cx + sparsePad) / nativeSpan);
+      const scMinY = Math.floor((cy - sparsePad) / nativeSpan);
+      const scMaxY = Math.floor((cy + sparsePad) / nativeSpan);
+      const scMinZ = Math.floor((cz - sparsePad) / nativeSpan);
+      const scMaxZ = Math.floor((cz + sparsePad) / nativeSpan);
+
+      const totalTouched =
+        (scMaxX - scMinX + 1) * (scMaxY - scMinY + 1) * (scMaxZ - scMinZ + 1);
+
+      const applyBrushToChunk = (chunk: SparseVoxelChunk) => {
+        const step = chunk.stepSize;
+        const cMinWX = chunk.originX - SPARSE_PAD * step;
+        const cMaxWX = chunk.originX + (CHUNK_CELLS + SPARSE_PAD) * step;
+        const cMinWY = chunk.originY - SPARSE_PAD * step;
+        const cMaxWY = chunk.originY + (CHUNK_CELLS + SPARSE_PAD) * step;
+        const cMinWZ = chunk.originZ - SPARSE_PAD * step;
+        const cMaxWZ = chunk.originZ + (CHUNK_CELLS + SPARSE_PAD) * step;
+
+        if (
+          cx + safeRad < cMinWX ||
+          cx - safeRad > cMaxWX ||
+          cy + safeRad < cMinWY ||
+          cy - safeRad > cMaxWY ||
+          cz + safeRad < cMinWZ ||
+          cz - safeRad > cMaxWZ
+        ) {
+          return;
+        }
+
+        const localCopy =
+          mode === 'smooth' ? new Float32Array(chunk.density) : null;
+        let touched = false;
+        const strengthScale = Math.max(step * 2.2, Math.min(rScale, safeRad * 1.4));
+
+        for (let lz = 0; lz < SPARSE_N; lz++) {
+          const wz = chunk.originZ + (lz - SPARSE_PAD) * step;
+          for (let ly = 0; ly < SPARSE_N; ly++) {
+            const wy = chunk.originY + (ly - SPARSE_PAD) * step;
+            for (let lx = 0; lx < SPARSE_N; lx++) {
+              const wx = chunk.originX + (lx - SPARSE_PAD) * step;
+              const dist = Math.hypot(wx - cx, wy - cy, wz - cz);
+              if (dist >= safeRad) continue;
+
+              const falloff = 1 - smoothstep(0, safeRad, dist);
+              const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
+              const prev = chunk.density[idx];
+              let next = prev;
+
+              if (mode === 'carve') {
+                next = Math.max(
+                  -4.5 * rScale,
+                  prev - strength * strengthScale * falloff,
+                );
+                if (next <= 0) chunk.material[idx] = MaterialId.Air;
+              } else if (mode === 'build') {
+                next = Math.min(
+                  4.5 * rScale,
+                  prev + strength * strengthScale * falloff,
+                );
+                if (next > -0.25 * step && materialId !== MaterialId.Air) {
+                  chunk.material[idx] = materialId;
+                }
+              } else if (mode === 'flatten') {
+                const vr = Math.hypot(wx, wy, wz);
+                const desired = targetShellRadius - vr;
+                const blend = clamp(falloff * strength * 0.65, 0, 1);
+                next = prev + (desired - prev) * blend;
+                if (next > 0 && chunk.material[idx] === MaterialId.Air) {
+                  chunk.material[idx] = materialId;
+                } else if (next <= 0) {
+                  chunk.material[idx] = MaterialId.Air;
+                }
+              } else if (mode === 'smooth' && localCopy) {
+                if (
+                  lx > 0 &&
+                  lx < SPARSE_N - 1 &&
+                  ly > 0 &&
+                  ly < SPARSE_N - 1 &&
+                  lz > 0 &&
+                  lz < SPARSE_N - 1
+                ) {
+                  const avg =
+                    (localCopy[idx] * 2 +
+                      localCopy[idx - 1] +
+                      localCopy[idx + 1] +
+                      localCopy[idx - SPARSE_NY] +
+                      localCopy[idx + SPARSE_NY] +
+                      localCopy[idx - SPARSE_NZ] +
+                      localCopy[idx + SPARSE_NZ]) /
+                    8;
+                  const blend = clamp(falloff * strength * 0.55, 0, 1);
+                  next = prev + (avg - prev) * blend;
+                  if (next > 0 && chunk.material[idx] === MaterialId.Air) {
+                    chunk.material[idx] = MaterialId.Stone;
+                  } else if (next <= 0) {
+                    chunk.material[idx] = MaterialId.Air;
+                  }
+                }
+              }
+
+              if (next !== prev) {
+                chunk.density[idx] = next;
+                deltaVolume += next - prev;
+                touched = true;
+              }
+            }
+          }
+        }
+
+        if (touched) {
+          chunk.edited = true;
+          chunk.dirty = true;
+        }
+      };
+
+      if (totalTouched <= 125) {
+        for (let scz = scMinZ; scz <= scMaxZ; scz++) {
+          for (let scy = scMinY; scy <= scMaxY; scy++) {
+            for (let scx = scMinX; scx <= scMaxX; scx++) {
+              const chunk = this.getOrCreateSparseChunk(scx, scy, scz, 1);
+              applyBrushToChunk(chunk);
+            }
+          }
+        }
+      } else {
+        for (const chunk of this.sparseChunks.values()) {
+          applyBrushToChunk(chunk);
         }
       }
     }
@@ -1515,6 +2172,749 @@ export class VoxelPlanet {
       matProps: this.scratchMat.slice(0, vCount * 3),
       uvs: this.scratchUv.slice(0, vCount * 2),
       vertexCount: vCount,
+    };
+  }
+
+  public getOrCreateSparseChunk(
+    cx: number,
+    cy: number,
+    cz: number,
+    scaleMult: number,
+  ): SparseVoxelChunk {
+    const key = `${scaleMult}:${cx},${cy},${cz}`;
+    const existing = this.sparseChunks.get(key);
+    if (existing) {
+      existing.lastUsedFrame = this.streamFrame;
+      return existing;
+    }
+
+    const stepSize = this.nativeVoxelSize * scaleMult;
+    const chunkSpan = CHUNK_CELLS * stepSize;
+    const originX = cx * chunkSpan;
+    const originY = cy * chunkSpan;
+    const originZ = cz * chunkSpan;
+
+    const total = SPARSE_N * SPARSE_N * SPARSE_N;
+    const density = new Float32Array(total);
+    const material = new Uint8Array(total);
+
+    for (let lz = 0; lz < SPARSE_N; lz++) {
+      const wz = originZ + (lz - SPARSE_PAD) * stepSize;
+      for (let ly = 0; ly < SPARSE_N; ly++) {
+        const wy = originY + (ly - SPARSE_PAD) * stepSize;
+        for (let lx = 0; lx < SPARSE_N; lx++) {
+          const wx = originX + (lx - SPARSE_PAD) * stepSize;
+          const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
+          const res = this.evalAnalyticalAt(wx, wy, wz, true);
+          density[idx] = res.density;
+          material[idx] = res.material;
+        }
+      }
+    }
+
+    const chunk: SparseVoxelChunk = {
+      key,
+      cx,
+      cy,
+      cz,
+      scaleMult,
+      stepSize,
+      originX,
+      originY,
+      originZ,
+      density,
+      material,
+      edited: false,
+      dirty: true,
+      lastUsedFrame: this.streamFrame,
+    };
+    this.sparseChunks.set(key, chunk);
+    return chunk;
+  }
+
+  private evictUnusedSparseChunks(maxUnedited = 280): void {
+    let uneditedCount = 0;
+    for (const c of this.sparseChunks.values()) {
+      if (!c.edited) uneditedCount++;
+    }
+    if (uneditedCount <= maxUnedited) return;
+
+    const evictable: SparseVoxelChunk[] = [];
+    for (const c of this.sparseChunks.values()) {
+      if (!c.edited) evictable.push(c);
+    }
+    evictable.sort((a, b) => a.lastUsedFrame - b.lastUsedFrame);
+    const toRemove = evictable.length - maxUnedited;
+    for (let i = 0; i < toRemove; i++) {
+      this.sparseChunks.delete(evictable[i].key);
+    }
+  }
+
+  public extractSparseChunkMesh(
+    chunk: SparseVoxelChunk,
+    blocky: boolean,
+  ): ChunkMeshData {
+    const dArr = chunk.density;
+    const mArr = chunk.material;
+    const len = dArr.length;
+
+    // Fast pure-air / pure-interior skip
+    let hasSolid = false;
+    let hasAir = false;
+    for (let i = 0; i < len; i++) {
+      if (dArr[i] > 0) hasSolid = true;
+      else hasAir = true;
+      if (hasSolid && hasAir) break;
+    }
+    if (!hasSolid || !hasAir) {
+      return {
+        cx: chunk.cx,
+        cy: chunk.cy,
+        cz: chunk.cz,
+        lod: 0,
+        positions: new Float32Array(0),
+        normals: new Float32Array(0),
+        colors: new Float32Array(0),
+        matProps: new Float32Array(0),
+        uvs: new Float32Array(0),
+        vertexCount: 0,
+      };
+    }
+
+    const stepSize = chunk.stepSize;
+    const rScale = this.baseRadius / 13.0;
+    let vCount = 0;
+    const maxVerts = this.scratchPos.length / 3;
+
+    if (blocky) {
+      const isBlockSolid = (px: number, py: number, pz: number): boolean => {
+        const base = px + py * SPARSE_NY + pz * SPARSE_NZ;
+        const avg =
+          dArr[base] +
+          dArr[base + 1] +
+          dArr[base + SPARSE_NY] +
+          dArr[base + SPARSE_NY + 1] +
+          dArr[base + SPARSE_NZ] +
+          dArr[base + SPARSE_NZ + 1] +
+          dArr[base + SPARSE_NZ + SPARSE_NY] +
+          dArr[base + SPARSE_NZ + SPARSE_NY + 1];
+        return avg > 0;
+      };
+
+      const pickBlockMaterial = (px: number, py: number, pz: number): MaterialId => {
+        const base = px + py * SPARSE_NY + pz * SPARSE_NZ;
+        const m0 = mArr[base] as MaterialId;
+        if (m0 !== MaterialId.Air) return m0;
+        for (let dz = 0; dz <= 1; dz++) {
+          for (let dy = 0; dy <= 1; dy++) {
+            for (let dx = 0; dx <= 1; dx++) {
+              const m = mArr[base + dx + dy * SPARSE_NY + dz * SPARSE_NZ] as MaterialId;
+              if (m !== MaterialId.Air) return m;
+            }
+          }
+        }
+        return MaterialId.Stone;
+      };
+
+      const FACES: ReadonlyArray<{
+        n: [number, number, number];
+        uDir: [number, number, number];
+        vDir: [number, number, number];
+        verts: readonly [
+          [number, number, number, number, number],
+          [number, number, number, number, number],
+          [number, number, number, number, number],
+          [number, number, number, number, number],
+        ];
+        shade: number;
+      }> = [
+        {
+          n: [1, 0, 0],
+          uDir: [0, 0, -1],
+          vDir: [0, 1, 0],
+          verts: [[1, 0, 1, 0, 0], [1, 0, 0, 1, 0], [1, 1, 0, 1, 1], [1, 1, 1, 0, 1]],
+          shade: 0.92,
+        },
+        {
+          n: [-1, 0, 0],
+          uDir: [0, 0, 1],
+          vDir: [0, 1, 0],
+          verts: [[0, 0, 0, 0, 0], [0, 0, 1, 1, 0], [0, 1, 1, 1, 1], [0, 1, 0, 0, 1]],
+          shade: 0.84,
+        },
+        {
+          n: [0, 1, 0],
+          uDir: [1, 0, 0],
+          vDir: [0, 0, -1],
+          verts: [[0, 1, 1, 0, 0], [1, 1, 1, 1, 0], [1, 1, 0, 1, 1], [0, 1, 0, 0, 1]],
+          shade: 1.0,
+        },
+        {
+          n: [0, -1, 0],
+          uDir: [1, 0, 0],
+          vDir: [0, 0, 1],
+          verts: [[0, 0, 0, 0, 0], [1, 0, 0, 1, 0], [1, 0, 1, 1, 1], [0, 0, 1, 0, 1]],
+          shade: 0.72,
+        },
+        {
+          n: [0, 0, 1],
+          uDir: [1, 0, 0],
+          vDir: [0, 1, 0],
+          verts: [[0, 0, 1, 0, 0], [1, 0, 1, 1, 0], [1, 1, 1, 1, 1], [0, 1, 1, 0, 1]],
+          shade: 0.96,
+        },
+        {
+          n: [0, 0, -1],
+          uDir: [-1, 0, 0],
+          vDir: [0, 1, 0],
+          verts: [[1, 0, 0, 0, 0], [0, 0, 0, 1, 0], [0, 1, 0, 1, 1], [1, 1, 0, 0, 1]],
+          shade: 0.86,
+        },
+      ];
+
+      for (let lz = 0; lz < CHUNK_CELLS; lz++) {
+        const pz = lz + SPARSE_PAD;
+        const wz0 = chunk.originZ + lz * stepSize;
+        for (let ly = 0; ly < CHUNK_CELLS; ly++) {
+          const py = ly + SPARSE_PAD;
+          const wy0 = chunk.originY + ly * stepSize;
+          for (let lx = 0; lx < CHUNK_CELLS; lx++) {
+            const px = lx + SPARSE_PAD;
+            if (!isBlockSolid(px, py, pz)) continue;
+
+            const wx0 = chunk.originX + lx * stepSize;
+            const matId = pickBlockMaterial(px, py, pz);
+            const pal = MATERIAL_PALETTE[matId] ?? MATERIAL_PALETTE[MaterialId.Stone];
+            const r = Math.hypot(
+              wx0 + stepSize * 0.5,
+              wy0 + stepSize * 0.5,
+              wz0 + stepSize * 0.5,
+            );
+            const depthShade =
+              smoothstep(this.baseRadius * 0.35, this.baseRadius * 0.85, r) * 0.25 + 0.75;
+
+            for (let f = 0; f < 6; f++) {
+              const face = FACES[f];
+              const [nx, ny, nz] = face.n;
+              if (isBlockSolid(px + nx, py + ny, pz + nz)) continue;
+              if (vCount + 6 > maxVerts) break;
+
+              const aoVals = [1, 1, 1, 1];
+              for (let c = 0; c < 4; c++) {
+                const [, , , u, v] = face.verts[c];
+                const su = u === 0 ? -1 : 1;
+                const sv = v === 0 ? -1 : 1;
+                const s1 = isBlockSolid(
+                  px + nx + face.uDir[0] * su,
+                  py + ny + face.uDir[1] * su,
+                  pz + nz + face.uDir[2] * su,
+                )
+                  ? 1
+                  : 0;
+                const s2 = isBlockSolid(
+                  px + nx + face.vDir[0] * sv,
+                  py + ny + face.vDir[1] * sv,
+                  pz + nz + face.vDir[2] * sv,
+                )
+                  ? 1
+                  : 0;
+                const sc = isBlockSolid(
+                  px + nx + face.uDir[0] * su + face.vDir[0] * sv,
+                  py + ny + face.uDir[1] * su + face.vDir[1] * sv,
+                  pz + nz + face.uDir[2] * su + face.vDir[2] * sv,
+                )
+                  ? 1
+                  : 0;
+                const occ = s1 && s2 ? 3 : s1 + s2 + sc;
+                aoVals[c] = 1.0 - occ * 0.13;
+              }
+
+              const triOrder = [0, 1, 2, 0, 2, 3];
+              for (let t = 0; t < 6; t++) {
+                const vi = triOrder[t];
+                const [vx, vy, vz, u, v] = face.verts[vi];
+                const p3 = vCount * 3;
+                const u2 = vCount * 2;
+                const shade = face.shade * depthShade * aoVals[vi];
+
+                this.scratchPos[p3] = wx0 + vx * stepSize;
+                this.scratchPos[p3 + 1] = wy0 + vy * stepSize;
+                this.scratchPos[p3 + 2] = wz0 + vz * stepSize;
+
+                this.scratchNorm[p3] = nx;
+                this.scratchNorm[p3 + 1] = ny;
+                this.scratchNorm[p3 + 2] = nz;
+
+                this.scratchCol[p3] = clamp(pal.rgb[0] * shade, 0, 1);
+                this.scratchCol[p3 + 1] = clamp(pal.rgb[1] * shade, 0, 1);
+                this.scratchCol[p3 + 2] = clamp(pal.rgb[2] * shade, 0, 1);
+
+                this.scratchMat[p3] = pal.rough;
+                this.scratchMat[p3 + 1] = pal.metal;
+                this.scratchMat[p3 + 2] = pal.glow;
+
+                this.scratchUv[u2] = u;
+                this.scratchUv[u2 + 1] = v;
+                vCount++;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      const sampleLocalGrad = (
+        gx: number,
+        gy: number,
+        gz: number,
+        out: [number, number, number],
+      ) => {
+        const ix = clamp(Math.floor(gx), 1, SPARSE_N - 3);
+        const iy = clamp(Math.floor(gy), 1, SPARSE_N - 3);
+        const iz = clamp(Math.floor(gz), 1, SPARSE_N - 3);
+        const base = ix + iy * SPARSE_NY + iz * SPARSE_NZ;
+        const dx = dArr[base - 1] - dArr[base + 1];
+        const dy = dArr[base - SPARSE_NY] - dArr[base + SPARSE_NY];
+        const dz = dArr[base - SPARSE_NZ] - dArr[base + SPARSE_NZ];
+        const len = Math.hypot(dx, dy, dz);
+        if (len > 1e-6) {
+          out[0] = dx / len;
+          out[1] = dy / len;
+          out[2] = dz / len;
+        } else {
+          out[0] = 0;
+          out[1] = 1;
+          out[2] = 0;
+        }
+      };
+
+      for (let lz = 0; lz < CHUNK_CELLS; lz++) {
+        const pz = lz + SPARSE_PAD;
+        const wz0 = chunk.originZ + lz * stepSize;
+        for (let ly = 0; ly < CHUNK_CELLS; ly++) {
+          const py = ly + SPARSE_PAD;
+          const wy0 = chunk.originY + ly * stepSize;
+          for (let lx = 0; lx < CHUNK_CELLS; lx++) {
+            const px = lx + SPARSE_PAD;
+            const wx0 = chunk.originX + lx * stepSize;
+
+            let cubeIndex = 0;
+            for (let c = 0; c < 8; c++) {
+              const off = CORNER_OFFSETS[c];
+              const d =
+                dArr[
+                  px +
+                    off[0] +
+                    (py + off[1]) * SPARSE_NY +
+                    (pz + off[2]) * SPARSE_NZ
+                ];
+              this.cornerDensity[c] = d;
+              this.cornerPos[c * 3] = wx0 + off[0] * stepSize;
+              this.cornerPos[c * 3 + 1] = wy0 + off[1] * stepSize;
+              this.cornerPos[c * 3 + 2] = wz0 + off[2] * stepSize;
+              if (d > 0) cubeIndex |= 1 << c;
+            }
+
+            const edgeMask = EDGE_TABLE[cubeIndex];
+            if (edgeMask === 0) continue;
+
+            this.edgeComputed.fill(0);
+            for (let e = 0; e < 12; e++) {
+              if ((edgeMask & (1 << e)) === 0) continue;
+              const [cA, cB] = EDGE_VERTEX_PAIRS[e];
+              const dA = this.cornerDensity[cA];
+              const dB = this.cornerDensity[cB];
+              const denom = dB - dA;
+              const t = Math.abs(denom) > 1e-6 ? clamp(-dA / denom, 0, 1) : 0.5;
+              this.edgeVerts[e * 3] =
+                this.cornerPos[cA * 3] +
+                (this.cornerPos[cB * 3] - this.cornerPos[cA * 3]) * t;
+              this.edgeVerts[e * 3 + 1] =
+                this.cornerPos[cA * 3 + 1] +
+                (this.cornerPos[cB * 3 + 1] - this.cornerPos[cA * 3 + 1]) * t;
+              this.edgeVerts[e * 3 + 2] =
+                this.cornerPos[cA * 3 + 2] +
+                (this.cornerPos[cB * 3 + 2] - this.cornerPos[cA * 3 + 2]) * t;
+            }
+
+            const tris = TRI_TABLE[cubeIndex];
+            for (let t = 0; tris[t] !== -1; t += 3) {
+              const edges = [tris[t], tris[t + 2], tris[t + 1]];
+              for (let k = 0; k < 3; k++) {
+                const eIdx = edges[k];
+                const e3 = eIdx * 3;
+                if (this.edgeComputed[eIdx] === 0) {
+                  this.edgeComputed[eIdx] = 1;
+                  const vx = this.edgeVerts[e3];
+                  const vy = this.edgeVerts[e3 + 1];
+                  const vz = this.edgeVerts[e3 + 2];
+
+                  const gx = clamp((vx - chunk.originX) / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
+                  const gy = clamp((vy - chunk.originY) / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
+                  const gz = clamp((vz - chunk.originZ) / stepSize + SPARSE_PAD, 1, SPARSE_N - 2.001);
+                  sampleLocalGrad(gx, gy, gz, this.tempGrad);
+                  const nx = this.tempGrad[0];
+                  const ny = this.tempGrad[1];
+                  const nz = this.tempGrad[2];
+                  this.edgeNorms[e3] = nx;
+                  this.edgeNorms[e3 + 1] = ny;
+                  this.edgeNorms[e3 + 2] = nz;
+
+                  const bix = Math.floor(gx);
+                  const biy = Math.floor(gy);
+                  const biz = Math.floor(gz);
+                  const fx = gx - bix;
+                  const fy = gy - biy;
+                  const fz = gz - biz;
+
+                  let wSum = 0;
+                  let cr = 0;
+                  let cg = 0;
+                  let cb = 0;
+                  let rough = 0;
+                  let metal = 0;
+                  let glow = 0;
+
+                  for (let dz = 0; dz <= 1; dz++) {
+                    const wz = dz === 0 ? 1 - fz : fz;
+                    for (let dy = 0; dy <= 1; dy++) {
+                      const wy = dy === 0 ? 1 - fy : fy;
+                      for (let dx = 0; dx <= 1; dx++) {
+                        const wx = dx === 0 ? 1 - fx : fx;
+                        const cIdx =
+                          bix + dx + (biy + dy) * SPARSE_NY + (biz + dz) * SPARSE_NZ;
+                        const m = mArr[cIdx] as MaterialId;
+                        if (m === MaterialId.Air) continue;
+                        const w = wx * wy * wz;
+                        if (w <= 1e-5) continue;
+                        const info = MATERIAL_PALETTE[m];
+                        cr += info.rgb[0] * w;
+                        cg += info.rgb[1] * w;
+                        cb += info.rgb[2] * w;
+                        rough += info.rough * w;
+                        metal += info.metal * w;
+                        glow += info.glow * w;
+                        wSum += w;
+                      }
+                    }
+                  }
+
+                  if (wSum > 1e-5) {
+                    cr /= wSum;
+                    cg /= wSum;
+                    cb /= wSum;
+                    rough /= wSum;
+                    metal /= wSum;
+                    glow /= wSum;
+                  } else {
+                    const sInfo = MATERIAL_PALETTE[MaterialId.Stone];
+                    cr = sInfo.rgb[0];
+                    cg = sInfo.rgb[1];
+                    cb = sInfo.rgb[2];
+                    rough = sInfo.rough;
+                    metal = sInfo.metal;
+                    glow = sInfo.glow;
+                  }
+
+                  const r = Math.hypot(vx, vy, vz) || 1;
+                  const slopeDot = (vx * nx + vy * ny + vz * nz) / r;
+                  const cliffBlend = (1 - smoothstep(0.58, 0.86, slopeDot)) * (1 - glow);
+                  const stoneCol = MATERIAL_PALETTE[MaterialId.Stone].rgb;
+                  cr = cr * (1 - cliffBlend * 0.72) + stoneCol[0] * cliffBlend * 0.72;
+                  cg = cg * (1 - cliffBlend * 0.72) + stoneCol[1] * cliffBlend * 0.72;
+                  cb = cb * (1 - cliffBlend * 0.72) + stoneCol[2] * cliffBlend * 0.72;
+
+                  const depthShade =
+                    smoothstep(this.baseRadius * 0.35, this.baseRadius * 0.85, r) * 0.35 +
+                    0.65;
+                  this.edgeCols[e3] = clamp(cr * depthShade, 0, 1);
+                  this.edgeCols[e3 + 1] = clamp(cg * depthShade, 0, 1);
+                  this.edgeCols[e3 + 2] = clamp(cb * depthShade, 0, 1);
+                  this.edgeMats[e3] = rough;
+                  this.edgeMats[e3 + 1] = metal;
+                  this.edgeMats[e3 + 2] = glow;
+                }
+
+                if (vCount >= maxVerts) break;
+                const p3 = vCount * 3;
+                this.scratchPos[p3] = this.edgeVerts[e3];
+                this.scratchPos[p3 + 1] = this.edgeVerts[e3 + 1];
+                this.scratchPos[p3 + 2] = this.edgeVerts[e3 + 2];
+                this.scratchNorm[p3] = this.edgeNorms[e3];
+                this.scratchNorm[p3 + 1] = this.edgeNorms[e3 + 1];
+                this.scratchNorm[p3 + 2] = this.edgeNorms[e3 + 2];
+                this.scratchCol[p3] = this.edgeCols[e3];
+                this.scratchCol[p3 + 1] = this.edgeCols[e3 + 1];
+                this.scratchCol[p3 + 2] = this.edgeCols[e3 + 2];
+                this.scratchMat[p3] = this.edgeMats[e3];
+                this.scratchMat[p3 + 1] = this.edgeMats[e3 + 1];
+                this.scratchMat[p3 + 2] = this.edgeMats[e3 + 2];
+                const u2 = vCount * 2;
+                this.scratchUv[u2] = 0.5;
+                this.scratchUv[u2 + 1] = 0.5;
+                vCount++;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      cx: chunk.cx,
+      cy: chunk.cy,
+      cz: chunk.cz,
+      lod: 0,
+      positions: this.scratchPos.slice(0, vCount * 3),
+      normals: this.scratchNorm.slice(0, vCount * 3),
+      colors: this.scratchCol.slice(0, vCount * 3),
+      matProps: this.scratchMat.slice(0, vCount * 3),
+      uvs: this.scratchUv.slice(0, vCount * 2),
+      vertexCount: vCount,
+    };
+  }
+
+  /**
+   * Streams multi-scale sparse voxel chunks around a surface focal point (fx, fy, fz).
+   * Enables planets with tens-of-thousands-of-blocks radius in constant memory.
+   */
+  public streamHighResAround(
+    fx: number,
+    fy: number,
+    fz: number,
+    renderMode: TerrainRenderMode,
+    maxBuildPerFrame = 28,
+  ): HighResStreamBatch {
+    this.streamFrame++;
+    const desiredKeys = new Set<string>();
+    const rebuiltMeshes: HighResStreamBatch['rebuiltMeshes'] = [];
+
+    if (!this.isHighResStreaming) {
+      return {
+        active: false,
+        hideMacro: false,
+        nativeCenter: [fx, fy, fz],
+        nativeDiscardRadius: 0,
+        midDiscardRadius: 0,
+        desiredKeys,
+        rebuiltMeshes,
+      };
+    }
+
+    const blocky = renderMode === 'blocky';
+    const nativeSpan = CHUNK_CELLS * this.nativeVoxelSize;
+    const fLen = Math.hypot(fx, fy, fz);
+    // Project focal point near surface if far out in deep space
+    const surfF =
+      fLen > 1e-4 && fLen > this.baseRadius * 1.35
+        ? [
+            (fx / fLen) * this.baseRadius,
+            (fy / fLen) * this.baseRadius,
+            (fz / fLen) * this.baseRadius,
+          ]
+        : [fx, fy, fz];
+
+    const wantQueue: Array<{
+      cx: number;
+      cy: number;
+      cz: number;
+      scaleMult: number;
+      tier: 'native' | 'mid';
+      prio: number;
+    }> = [];
+
+    // Small custom-resolution planet (voxelRadius < 18, e.g., 6..17 blocks): replace entire macro planet
+    if (this.voxelRadius < 18) {
+      const cBound = Math.ceil(this.worldHalf / nativeSpan);
+      let pending = 0;
+      for (let cz = -cBound; cz < cBound; cz++) {
+        for (let cy = -cBound; cy < cBound; cy++) {
+          for (let cx = -cBound; cx < cBound; cx++) {
+            const cwx = (cx + 0.5) * nativeSpan;
+            const cwy = (cy + 0.5) * nativeSpan;
+            const cwz = (cz + 0.5) * nativeSpan;
+            const cr = Math.hypot(cwx, cwy, cwz);
+            if (cr > this.worldHalf + nativeSpan) continue;
+            const key = `1:${cx},${cy},${cz}`;
+            desiredKeys.add(key);
+            const existing = this.sparseChunks.get(key);
+            if (!existing || existing.dirty) {
+              pending++;
+              const dSq =
+                (cwx - surfF[0]) * (cwx - surfF[0]) +
+                (cwy - surfF[1]) * (cwy - surfF[1]) +
+                (cwz - surfF[2]) * (cwz - surfF[2]);
+              wantQueue.push({
+                cx,
+                cy,
+                cz,
+                scaleMult: 1,
+                tier: 'native',
+                prio: (existing?.edited ? 0 : 1e4) + dSq,
+              });
+            } else {
+              existing.lastUsedFrame = this.streamFrame;
+            }
+          }
+        }
+      }
+
+      if (wantQueue.length > 0) {
+        wantQueue.sort((a, b) => a.prio - b.prio);
+        const lim = Math.min(maxBuildPerFrame, wantQueue.length);
+        for (let i = 0; i < lim; i++) {
+          const w = wantQueue[i];
+          const ch = this.getOrCreateSparseChunk(w.cx, w.cy, w.cz, 1);
+          ch.dirty = false;
+          rebuiltMeshes.push({
+            key: ch.key,
+            tier: 'native',
+            mesh: this.extractSparseChunkMesh(ch, blocky),
+          });
+          pending--;
+        }
+      }
+      this.evictUnusedSparseChunks(340);
+      return {
+        active: true,
+        hideMacro: pending === 0,
+        nativeCenter: [surfF[0], surfF[1], surfF[2]],
+        nativeDiscardRadius: pending === 0 ? this.worldHalf * 2.0 : 0,
+        midDiscardRadius: 0,
+        desiredKeys,
+        rebuiltMeshes,
+      };
+    }
+
+    // Large high-res planet (voxelRadius > 18, e.g. 64, 500, 20000, 50000):
+    // Stream a 5x5x5 native patch (1x) + optional geometric-mean mid-LOD ring around surfF
+    const centerCx = Math.floor(surfF[0] / nativeSpan);
+    const centerCy = Math.floor(surfF[1] / nativeSpan);
+    const centerCz = Math.floor(surfF[2] / nativeSpan);
+    const nCenterX = (centerCx + 0.5) * nativeSpan;
+    const nCenterY = (centerCy + 0.5) * nativeSpan;
+    const nCenterZ = (centerCz + 0.5) * nativeSpan;
+
+    let pendingNative = 0;
+    for (let dz = -2; dz <= 2; dz++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const cx = centerCx + dx;
+          const cy = centerCy + dy;
+          const cz = centerCz + dz;
+          const key = `1:${cx},${cy},${cz}`;
+          desiredKeys.add(key);
+          const existing = this.sparseChunks.get(key);
+          if (!existing || existing.dirty) {
+            pendingNative++;
+            const cwx = (cx + 0.5) * nativeSpan;
+            const cwy = (cy + 0.5) * nativeSpan;
+            const cwz = (cz + 0.5) * nativeSpan;
+            const dSq =
+              (cwx - surfF[0]) * (cwx - surfF[0]) +
+              (cwy - surfF[1]) * (cwy - surfF[1]) +
+              (cwz - surfF[2]) * (cwz - surfF[2]);
+            wantQueue.push({
+              cx,
+              cy,
+              cz,
+              scaleMult: 1,
+              tier: 'native',
+              prio: (existing?.edited ? 0 : 1e3) + dSq,
+            });
+          } else {
+            existing.lastUsedFrame = this.streamFrame;
+          }
+        }
+      }
+    }
+
+    let pendingMid = 0;
+    let midSpan = 0;
+    let midCenterX = nCenterX;
+    let midCenterY = nCenterY;
+    let midCenterZ = nCenterZ;
+    const ratio = this.voxelSize / this.nativeVoxelSize;
+    const useMidTier = ratio > 5.0;
+
+    if (useMidTier) {
+      const midScaleMult = 1 << Math.max(1, Math.floor(Math.log2(Math.sqrt(ratio))));
+      midSpan = CHUNK_CELLS * this.nativeVoxelSize * midScaleMult;
+      const mCx = Math.floor(nCenterX / midSpan);
+      const mCy = Math.floor(nCenterY / midSpan);
+      const mCz = Math.floor(nCenterZ / midSpan);
+      midCenterX = (mCx + 0.5) * midSpan;
+      midCenterY = (mCy + 0.5) * midSpan;
+      midCenterZ = (mCz + 0.5) * midSpan;
+
+      for (let dz = -2; dz <= 2; dz++) {
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const cx = mCx + dx;
+            const cy = mCy + dy;
+            const cz = mCz + dz;
+            const key = `${midScaleMult}:${cx},${cy},${cz}`;
+            desiredKeys.add(key);
+            const existing = this.sparseChunks.get(key);
+            if (!existing || existing.dirty) {
+              pendingMid++;
+              const cwx = (cx + 0.5) * midSpan;
+              const cwy = (cy + 0.5) * midSpan;
+              const cwz = (cz + 0.5) * midSpan;
+              const dSq =
+                (cwx - surfF[0]) * (cwx - surfF[0]) +
+                (cwy - surfF[1]) * (cwy - surfF[1]) +
+                (cwz - surfF[2]) * (cwz - surfF[2]);
+              wantQueue.push({
+                cx,
+                cy,
+                cz,
+                scaleMult: midScaleMult,
+                tier: 'mid',
+                prio: 1e6 + dSq,
+              });
+            } else {
+              existing.lastUsedFrame = this.streamFrame;
+            }
+          }
+        }
+      }
+    }
+
+    if (wantQueue.length > 0) {
+      wantQueue.sort((a, b) => a.prio - b.prio);
+      const lim = Math.min(maxBuildPerFrame, wantQueue.length);
+      for (let i = 0; i < lim; i++) {
+        const w = wantQueue[i];
+        const ch = this.getOrCreateSparseChunk(w.cx, w.cy, w.cz, w.scaleMult);
+        ch.dirty = false;
+        rebuiltMeshes.push({
+          key: ch.key,
+          tier: w.tier,
+          mesh: this.extractSparseChunkMesh(ch, blocky),
+        });
+        if (w.tier === 'native') pendingNative--;
+        else pendingMid--;
+      }
+    }
+
+    this.evictUnusedSparseChunks(320);
+
+    const nativeDiscardRadius = pendingNative === 0 ? nativeSpan * 1.82 : 0;
+    const midDiscardRadius = useMidTier && pendingMid === 0 ? midSpan * 1.82 : 0;
+    // Note: mid tier discard uses its own center ≈ surfF; keep macro discard using whichever covers
+    const effectiveMacroDiscard =
+      useMidTier && midDiscardRadius > 0
+        ? Math.max(0, midDiscardRadius - Math.hypot(midCenterX - nCenterX, midCenterY - nCenterY, midCenterZ - nCenterZ))
+        : nativeDiscardRadius;
+
+    return {
+      active: true,
+      hideMacro: false,
+      nativeCenter: [nCenterX, nCenterY, nCenterZ],
+      nativeDiscardRadius,
+      midDiscardRadius: effectiveMacroDiscard,
+      desiredKeys,
+      rebuiltMeshes,
     };
   }
 }

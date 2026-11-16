@@ -204,6 +204,109 @@ export class FluidSim {
     }
   }
 
+  /**
+   * Non-blocking time-sliced version of seedInitialLakes for responsive progress bars.
+   */
+  public async seedInitialLakesAsync(
+    planet: VoxelPlanet,
+    onProgress?: (fraction: number, detail: string) => void,
+    shouldAbort?: () => boolean,
+  ): Promise<boolean> {
+    this.clear();
+    const fill = planet.seedConfig.waterFill;
+    if (fill <= 0.02) {
+      onProgress?.(1, '无水体生成');
+      return true;
+    }
+
+    const basins = planet.lakeBasinCenters;
+    if (basins.length === 0) {
+      onProgress?.(1, '未检测到洼地');
+      return true;
+    }
+
+    const targets = [240, 170, 150];
+    let seed = (planet.seedConfig.seed ^ 918273) >>> 0;
+    const rand = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+
+    const radScale = planet.baseRadius / 13.0;
+
+    for (let b = 0; b < basins.length; b++) {
+      const [bx, by, bz] = basins[b];
+      const bLen = Math.hypot(bx, by, bz) || 1;
+      const nx = bx / bLen;
+      const ny = by / bLen;
+      const nz = bz / bLen;
+
+      const ax = Math.abs(ny) < 0.9 ? 0 : 1;
+      const ay = Math.abs(ny) < 0.9 ? 1 : 0;
+      let tx = ay * nz;
+      let ty = -ax * nz;
+      let tz = ax * ny - ay * nx;
+      const tLen = Math.hypot(tx, ty, tz) || 1;
+      tx /= tLen; ty /= tLen; tz /= tLen;
+      const ux = ny * tz - nz * ty;
+      const uy = nz * tx - nx * tz;
+      const uz = nx * ty - ny * tx;
+
+      const count = Math.round((targets[b] ?? 150) * fill);
+      for (let k = 0; k < count; k++) {
+        const ang = rand() * Math.PI * 2;
+        const rad = Math.sqrt(rand()) * 2.1 * radScale;
+        const dx = nx + (tx * Math.cos(ang) + ux * Math.sin(ang)) * (rad / planet.baseRadius);
+        const dy = ny + (ty * Math.cos(ang) + uy * Math.sin(ang)) * (rad / planet.baseRadius);
+        const dz = nz + (tz * Math.cos(ang) + uz * Math.sin(ang)) * (rad / planet.baseRadius);
+        const dLen = Math.hypot(dx, dy, dz) || 1;
+        const rSurf = planet.findSurfaceRadiusAlongRay(
+          dx / dLen,
+          dy / dLen,
+          dz / dLen,
+        );
+        const spawnR = rSurf + (0.12 + rand() * 0.18) * radScale;
+        this.spawnParticle(
+          (dx / dLen) * spawnR,
+          (dy / dLen) * spawnR,
+          (dz / dLen) * spawnR,
+          0,
+          0,
+          0,
+        );
+      }
+    }
+
+    const settleParams: PlanetaryGravityParams = {
+      referenceRadius: planet.baseRadius,
+      surfaceGravity: 9.81,
+    };
+    const totalSteps = 48;
+    let sliceStart = performance.now();
+
+    for (let s = 0; s < totalSteps; s++) {
+      if (shouldAbort?.()) return false;
+      this.step(1 / 60, planet, settleParams, 2);
+
+      if (performance.now() - sliceStart >= 8 || s === totalSteps - 1) {
+        onProgress?.(
+          (s + 1) / totalSteps,
+          `SPH 流体静水压平衡 ${s + 1}/${totalSteps}`,
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (shouldAbort?.()) return false;
+        sliceStart = performance.now();
+      }
+    }
+
+    for (let i = 0; i < this.activeCount; i++) {
+      this.vx[i] *= 0.05;
+      this.vy[i] *= 0.05;
+      this.vz[i] *= 0.05;
+    }
+    return true;
+  }
+
   public exportState(): FluidSnapshot {
     const n3 = this.activeCount * 3;
     const positions = new Float32Array(n3);

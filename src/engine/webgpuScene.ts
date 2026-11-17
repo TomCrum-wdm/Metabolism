@@ -69,12 +69,25 @@ import {
   ThermalConfig,
 } from './thermal';
 import { dirToLonLat, lonLatToDir } from './cartography';
+import {
+  computeDetailCameraOptics,
+  computeSafeClipPlanes,
+  DetailCameraOptics,
+  evaluateLandingDescentPose,
+} from './cameraMath';
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-export type CameraMode = 'explorer' | 'orbit' | 'fps';
+export type CameraMode =
+  | 'explorer'
+  | 'orbit'
+  | 'detail'
+  | 'fps'
+  | 'landing'
+  | 'perspective';
+export type LandingCameraStage = 'selecting' | 'descending' | 'landed';
 export type GamePhase = 'title' | 'playing' | 'paused';
 export type LodMode = 'auto' | ChunkLodLevel;
 
@@ -120,6 +133,9 @@ export interface SandboxTelemetry {
   sunDir: [number, number, number];
   simTimeSec: number;
   voxelRevision: number;
+  landingStage: LandingCameraStage;
+  detailZoomMag: number;
+  perspectiveFov: number;
 }
 
 export interface SandboxConfig {
@@ -132,6 +148,7 @@ export interface SandboxConfig {
   sunAzimuthDeg: number;
   showGravityVectors: boolean;
   cameraMode: CameraMode;
+  perspectiveFov: number;
   muted: boolean;
   simPaused: boolean;
   lodMode: LodMode;
@@ -240,18 +257,6 @@ export class PlanetarySandboxEngine {
   private highResMidOuterMaterial!: THREE.MeshStandardNodeMaterial;
   private highResMidMaterial!: THREE.MeshStandardNodeMaterial;
   private highResNativeMaterial!: THREE.MeshStandardNodeMaterial;
-  private readonly hemiDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
-  private readonly midOuterDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
-  private readonly midDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
-  private readonly nativeDiscardCenterWorld = new THREE.Vector3(0, 0, 0);
-  private hemiDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
-  private hemiDiscardRadiusNode = uniform(0.0);
-  private midOuterDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
-  private midOuterDiscardRadiusNode = uniform(0.0);
-  private midDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
-  private midDiscardRadiusNode = uniform(0.0);
-  private nativeDiscardCenterViewNode = uniform(new THREE.Vector3(0, 0, 0));
-  private nativeDiscardRadiusNode = uniform(0.0);
   private highResGroup!: THREE.Group;
   private highResMeshes = new Map<string, THREE.Mesh>();
   private highResVertices = 0;
@@ -294,7 +299,7 @@ export class PlanetarySandboxEngine {
   private walkPhase = 0;
   private squashY = 1.0;
 
-  // Camera states (Explorer / Orbit / FPS Free-Fly)
+  // Camera states (Explorer / Orbit / Detail / FPS / Landing / Perspective)
   private camYaw = -0.35;
   private camPitch = 0.36;
   private camDistance = 9.0;
@@ -306,14 +311,58 @@ export class PlanetarySandboxEngine {
   private fpsPitch = -0.35;
   private fpsSpeed = 12.0;
 
+  // Detail Inspection Camera (cursor-ray voxel zoom without clipping)
+  private detailTarget = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
+  private detailNormal = new THREE.Vector3(0, 1, 0);
+  private detailYaw = 0.45;
+  private detailPitch = 0.58;
+  private detailViewDist = DEFAULT_PLANET_RADIUS * 1.1;
+  private detailOptics: DetailCameraOptics = {
+    physicalDist: DEFAULT_PLANET_RADIUS * 1.1,
+    effectiveStreamDist: DEFAULT_PLANET_RADIUS * 1.1,
+    fovDeg: 55,
+    magnification: 1,
+  };
+
+  // Landing Camera (select site -> smooth orbital descent -> planetary FPS walk)
+  private landingStage: LandingCameraStage = 'selecting';
+  private landingSite = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
+  private landingNormal = new THREE.Vector3(0, 1, 0);
+  private landingHoverPos = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
+  private landingHoverNormal = new THREE.Vector3(0, 1, 0);
+  private landingHasHover = false;
+  private landingDescentT = 0;
+  private landingDescentStartPos = new THREE.Vector3(0, 22, 24);
+  private landingDescentEndPos = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS + 1.65, 0);
+  private landingDescentEndLook = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS + 1.65, -8);
+  private landingOrbitYaw = 0.52;
+  private landingOrbitPitch = 0.48;
+  private landingOrbitDist = 30.5;
+  private landingPos = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS + 1.65, 0);
+  private landingVel = new THREE.Vector3();
+  private landingUp = new THREE.Vector3(0, 1, 0);
+  private landingFwd = new THREE.Vector3(0, 0, -1);
+  private landingPitch = -0.05;
+  private landingGrounded = false;
+  private landingJumpQueued = false;
+
+  // Perspective CAD Camera
+  private perspTarget = new THREE.Vector3(0, 0, 0);
+  private perspYaw = 0.62;
+  private perspPitch = 0.44;
+  private perspDist = 28.0;
+  private isPanningCamera = false;
+
   private camPosSmooth = new THREE.Vector3(0, 22, 24);
   private camLookSmooth = new THREE.Vector3(0, 6, 0);
   private titleAngle = 0.35;
 
-  // Brush preview & Debris particles
+  // Brush preview, Procedural Landing Beacon & Detail Reticle, Debris particles
   private brushPreview!: THREE.Mesh;
   private brushMat!: THREE.MeshBasicNodeMaterial;
   private brushColorNode = uniform(new THREE.Color(0xf97316));
+  private landingBeaconGroup!: THREE.Group;
+  private detailReticleRing!: THREE.Mesh;
   private debrisMesh!: THREE.InstancedMesh;
   private readonly MAX_DEBRIS = 96;
   private debrisPos = new Float32Array(96 * 3);
@@ -354,11 +403,12 @@ export class PlanetarySandboxEngine {
     sunAzimuthDeg: 28,
     showGravityVectors: false,
     cameraMode: 'explorer',
+    perspectiveFov: 55,
     muted: false,
     simPaused: false,
     lodMode: 'auto',
-    lod0Dist: 23.0,
-    lod1Dist: 34.0,
+    lod0Dist: 38.0,
+    lod1Dist: 56.0,
     wireframe: false,
     showChunkBounds: false,
     debugProbeEnabled: false,
@@ -382,6 +432,9 @@ export class PlanetarySandboxEngine {
   private readonly _v2 = new THREE.Vector3();
   private readonly _v3 = new THREE.Vector3();
   private readonly _v4 = new THREE.Vector3();
+  private readonly _tanE = new THREE.Vector3();
+  private readonly _tanN = new THREE.Vector3();
+  private readonly _v2Center = new THREE.Vector2(0, 0);
   private readonly _m4 = new THREE.Matrix4();
   private readonly _q1 = new THREE.Quaternion();
   private readonly _s1 = new THREE.Vector3();
@@ -509,6 +562,10 @@ export class PlanetarySandboxEngine {
     this.orbitDistance = 30.5 * scale;
     this.camDistance = 9.0 * scale;
     this.fpsSpeed = 12.0 * scale;
+    this.detailViewDist = 14.0 * scale;
+    this.landingOrbitDist = 30.5 * scale;
+    this.perspDist = 28.0 * scale;
+    this.perspTarget.set(0, 0, 0);
     this.syncEnvironmentUniforms();
     this.updateCloudPuffs(0);
     this.updateSunDirection();
@@ -837,23 +894,7 @@ export class PlanetarySandboxEngine {
     this.scene.add(this.cloudPuffsMesh);
   }
 
-  private syncDiscardViewUniforms(): void {
-    if (!this.camera) return;
-    this.camera.updateMatrixWorld();
-    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
-    const inv = this.camera.matrixWorldInverse;
-    this.hemiDiscardCenterViewNode.value.copy(this.hemiDiscardCenterWorld).applyMatrix4(inv);
-    this.midOuterDiscardCenterViewNode.value.copy(this.midOuterDiscardCenterWorld).applyMatrix4(inv);
-    this.midDiscardCenterViewNode.value.copy(this.midDiscardCenterWorld).applyMatrix4(inv);
-    this.nativeDiscardCenterViewNode.value.copy(this.nativeDiscardCenterWorld).applyMatrix4(inv);
-  }
-
-  private createTerrainMaterial(
-    discardSpheres: Array<{
-      centerView: PlanetarySandboxEngine['hemiDiscardCenterViewNode'];
-      radius: PlanetarySandboxEngine['hemiDiscardRadiusNode'];
-    }> = [],
-  ): THREE.MeshStandardNodeMaterial {
+  private createTerrainMaterial(): THREE.MeshStandardNodeMaterial {
     const mat = new THREE.MeshStandardNodeMaterial();
     mat.vertexColors = true;
     mat.wireframe = this.config.wireframe;
@@ -909,19 +950,6 @@ export class PlanetarySandboxEngine {
     });
 
     mat.colorNode = Fn(() => {
-      if (discardSpheres.length > 0) {
-        let shouldDiscard = length(positionView.sub(discardSpheres[0].centerView))
-          .lessThan(discardSpheres[0].radius)
-          .and(discardSpheres[0].radius.greaterThan(1e-12));
-        for (let i = 1; i < discardSpheres.length; i++) {
-          const cond = length(positionView.sub(discardSpheres[i].centerView))
-            .lessThan(discardSpheres[i].radius)
-            .and(discardSpheres[i].radius.greaterThan(1e-12));
-          shouldDiscard = shouldDiscard.or(cond);
-        }
-        Discard(shouldDiscard);
-      }
-
       const p = positionWorld;
       const radialDist = p.length();
       const strata = sin(radialDist.mul(5.2).add(sin(p.x.mul(1.8)).mul(0.7)))
@@ -987,31 +1015,12 @@ export class PlanetarySandboxEngine {
   }
 
   private setupMaterials(): void {
-    this.terrainMaterial = this.createTerrainMaterial([
-      { centerView: this.hemiDiscardCenterViewNode, radius: this.hemiDiscardRadiusNode },
-      { centerView: this.midOuterDiscardCenterViewNode, radius: this.midOuterDiscardRadiusNode },
-      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
-      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
-    ]);
-    this.highResGlobeMaterial = this.createTerrainMaterial([
-      { centerView: this.hemiDiscardCenterViewNode, radius: this.hemiDiscardRadiusNode },
-      { centerView: this.midOuterDiscardCenterViewNode, radius: this.midOuterDiscardRadiusNode },
-      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
-      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
-    ]);
-    this.highResHemiMaterial = this.createTerrainMaterial([
-      { centerView: this.midOuterDiscardCenterViewNode, radius: this.midOuterDiscardRadiusNode },
-      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
-      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
-    ]);
-    this.highResMidOuterMaterial = this.createTerrainMaterial([
-      { centerView: this.midDiscardCenterViewNode, radius: this.midDiscardRadiusNode },
-      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
-    ]);
-    this.highResMidMaterial = this.createTerrainMaterial([
-      { centerView: this.nativeDiscardCenterViewNode, radius: this.nativeDiscardRadiusNode },
-    ]);
-    this.highResNativeMaterial = this.createTerrainMaterial([]);
+    this.terrainMaterial = this.createTerrainMaterial();
+    this.highResGlobeMaterial = this.terrainMaterial;
+    this.highResHemiMaterial = this.terrainMaterial;
+    this.highResMidOuterMaterial = this.terrainMaterial;
+    this.highResMidMaterial = this.terrainMaterial;
+    this.highResNativeMaterial = this.terrainMaterial;
 
     this.waterMaterial = new THREE.MeshPhysicalNodeMaterial();
     this.waterMaterial.colorNode = Fn(() => {
@@ -1172,15 +1181,12 @@ export class PlanetarySandboxEngine {
     }
     this.highResVertices = 0;
     this.highResActiveCount = 0;
-    this.hemiDiscardRadiusNode.value = 0;
-    this.midOuterDiscardRadiusNode.value = 0;
-    this.midDiscardRadiusNode.value = 0;
-    this.nativeDiscardRadiusNode.value = 0;
     for (const m of this.chunkMeshes) {
       if (m) m.visible = true;
     }
     for (const c of this.planet.sparseChunks.values()) {
       c.dirty = true;
+      c.lastSeamMask = -1;
     }
   }
 
@@ -1196,11 +1202,12 @@ export class PlanetarySandboxEngine {
       return null;
     }
 
-    // Anchor streaming focus to the camera-facing / explorer-facing hemisphere surface
-    // (never jump the planet's visible high-res shell to follow cursor hover)
+    // Anchor streaming focus to the active camera target / surface region
     let fx = 0;
     let fy = 1;
     let fz = 0;
+    let useExplicitFocus = false;
+    let effectiveCamDistOverride: number | null = null;
     if (this.config.cameraMode === 'explorer' && (this.phase === 'playing' || this.isGenerating)) {
       const pLen = this.playerPos.length();
       if (pLen > 1e-4) {
@@ -1213,12 +1220,87 @@ export class PlanetarySandboxEngine {
       fx = cosP * Math.cos(this.orbitYaw);
       fy = Math.sin(this.orbitPitch);
       fz = cosP * Math.sin(this.orbitYaw);
+    } else if (this.config.cameraMode === 'detail' && (this.phase === 'playing' || this.isGenerating)) {
+      this.lastHighResFocus.copy(this.detailTarget);
+      useExplicitFocus = true;
+      effectiveCamDistOverride = this.detailOptics.effectiveStreamDist;
+    } else if (this.config.cameraMode === 'landing' && (this.phase === 'playing' || this.isGenerating)) {
+      if (this.landingStage === 'descending') {
+        this.lastHighResFocus.copy(this.landingSite);
+        useExplicitFocus = true;
+      } else if (this.landingStage === 'landed') {
+        if (this.camera) {
+          this.camera.getWorldDirection(this._v1);
+          const lHit = this.planet.raycastTerrain(
+            this.camera.position.x,
+            this.camera.position.y,
+            this.camera.position.z,
+            this._v1.x,
+            this._v1.y,
+            this._v1.z,
+            this.planet.worldHalf * 3.0,
+          );
+          if (lHit.hit) {
+            this.lastHighResFocus.set(lHit.x, lHit.y, lHit.z);
+            useExplicitFocus = true;
+          }
+        }
+        if (!useExplicitFocus) {
+          const lLen = this.landingPos.length();
+          if (lLen > 1e-4) {
+            fx = this.landingPos.x / lLen;
+            fy = this.landingPos.y / lLen;
+            fz = this.landingPos.z / lLen;
+          }
+        }
+      } else if (this.landingHasHover) {
+        this.lastHighResFocus.copy(this.landingHoverPos);
+        useExplicitFocus = true;
+      } else {
+        const cosP = Math.cos(this.landingOrbitPitch);
+        fx = cosP * Math.cos(this.landingOrbitYaw);
+        fy = Math.sin(this.landingOrbitPitch);
+        fz = cosP * Math.sin(this.landingOrbitYaw);
+      }
+    } else if (this.config.cameraMode === 'perspective' && (this.phase === 'playing' || this.isGenerating)) {
+      const tLen = this.perspTarget.length();
+      if (tLen > this.planet.baseRadius * 0.25) {
+        fx = this.perspTarget.x / tLen;
+        fy = this.perspTarget.y / tLen;
+        fz = this.perspTarget.z / tLen;
+      } else if (this.camera) {
+        this._v1.copy(this.camera.position).sub(this.perspTarget);
+        const dLen = this._v1.length();
+        if (dLen > 1e-4) {
+          fx = this._v1.x / dLen;
+          fy = this._v1.y / dLen;
+          fz = this._v1.z / dLen;
+        }
+      }
     } else if (this.config.cameraMode === 'fps' && (this.phase === 'playing' || this.isGenerating)) {
-      const fLen = this.fpsPos.length();
-      if (fLen > 1e-4) {
-        fx = this.fpsPos.x / fLen;
-        fy = this.fpsPos.y / fLen;
-        fz = this.fpsPos.z / fLen;
+      if (this.camera) {
+        this.camera.getWorldDirection(this._v1);
+        const fpsHit = this.planet.raycastTerrain(
+          this.fpsPos.x,
+          this.fpsPos.y,
+          this.fpsPos.z,
+          this._v1.x,
+          this._v1.y,
+          this._v1.z,
+          this.planet.worldHalf * 4.5,
+        );
+        if (fpsHit.hit) {
+          this.lastHighResFocus.set(fpsHit.x, fpsHit.y, fpsHit.z);
+          useExplicitFocus = true;
+        }
+      }
+      if (!useExplicitFocus) {
+        const fLen = this.fpsPos.length();
+        if (fLen > 1e-4) {
+          fx = this.fpsPos.x / fLen;
+          fy = this.fpsPos.y / fLen;
+          fz = this.fpsPos.z / fLen;
+        }
       }
     } else if (this.camera) {
       const cLen = this.camera.position.length();
@@ -1228,11 +1310,26 @@ export class PlanetarySandboxEngine {
         fz = this.camera.position.z / cLen;
       }
     }
-    const surfR = this.planet.findSurfaceRadiusAlongRay(fx, fy, fz);
-    this.lastHighResFocus.set(fx * surfR, fy * surfR, fz * surfR);
-    const camDistToFocus = this.camera
-      ? this.camera.position.distanceTo(this.lastHighResFocus)
-      : this.planet.baseRadius * 2.0;
+
+    if (!useExplicitFocus) {
+      const surfR = this.planet.findSurfaceRadiusAlongRay(fx, fy, fz);
+      this.lastHighResFocus.set(fx * surfR, fy * surfR, fz * surfR);
+    }
+
+    let camPosArr: [number, number, number] | undefined;
+    let camFwdArr: [number, number, number] | undefined;
+    if (this.camera) {
+      camPosArr = [this.camera.position.x, this.camera.position.y, this.camera.position.z];
+      this.camera.getWorldDirection(this._v1);
+      camFwdArr = [this._v1.x, this._v1.y, this._v1.z];
+    }
+
+    const camDistToFocus =
+      effectiveCamDistOverride !== null
+        ? effectiveCamDistOverride
+        : this.camera
+          ? this.camera.position.distanceTo(this.lastHighResFocus)
+          : this.planet.baseRadius * 2.0;
 
     const batch = this.planet.streamHighResAround(
       this.lastHighResFocus.x,
@@ -1241,6 +1338,9 @@ export class PlanetarySandboxEngine {
       this.config.terrainRenderMode,
       budget,
       camDistToFocus,
+      camPosArr,
+      camFwdArr,
+      { lodMode: this.config.lodMode, lod0Dist: this.config.lod0Dist },
     );
 
     if (!batch.active) {
@@ -1248,15 +1348,16 @@ export class PlanetarySandboxEngine {
       return batch;
     }
 
-    // Evict stale meshes outside active window
+    // Evict only GPU meshes outside retainKeys so standby parent/child meshes stay cached for instant atomic swaps
     for (const [key, mesh] of this.highResMeshes.entries()) {
-      if (!batch.desiredKeys.has(key)) {
+      if (!batch.retainKeys.has(key)) {
         this.highResGroup.remove(mesh);
         mesh.geometry.dispose();
         this.highResMeshes.delete(key);
       }
     }
 
+    const scale = this.getPlanetScale();
     for (const item of batch.rebuiltMeshes) {
       const existing = this.highResMeshes.get(item.key);
       if (item.mesh.vertexCount === 0) {
@@ -1290,16 +1391,20 @@ export class PlanetarySandboxEngine {
       const ox = item.mesh.origin ? item.mesh.origin[0] : 0;
       const oy = item.mesh.origin ? item.mesh.origin[1] : 0;
       const oz = item.mesh.origin ? item.mesh.origin[2] : 0;
+      const voxelSpan = this.planet.nativeVoxelSize * item.scaleMult;
+      const shouldCastShadow =
+        item.tier === 'globe' || item.tier === 'hemi' || voxelSpan >= 0.04 * scale;
 
       if (existing) {
         existing.geometry.dispose();
         existing.geometry = geo;
         existing.material = targetMat;
         existing.position.set(ox, oy, oz);
+        existing.castShadow = shouldCastShadow;
       } else {
         const mesh = new THREE.Mesh(geo, targetMat);
         mesh.position.set(ox, oy, oz);
-        mesh.castShadow = true;
+        mesh.castShadow = shouldCastShadow;
         mesh.receiveShadow = true;
         this.highResGroup.add(mesh);
         this.highResMeshes.set(item.key, mesh);
@@ -1311,42 +1416,32 @@ export class PlanetarySandboxEngine {
       if (m) m.visible = showMacro;
     }
 
-    this.hemiDiscardCenterWorld.set(
-      batch.hemiCenter[0],
-      batch.hemiCenter[1],
-      batch.hemiCenter[2],
-    );
-    this.hemiDiscardRadiusNode.value = batch.hemiDiscardRadius;
-
-    this.midOuterDiscardCenterWorld.set(
-      batch.midOuterCenter[0],
-      batch.midOuterCenter[1],
-      batch.midOuterCenter[2],
-    );
-    this.midOuterDiscardRadiusNode.value = batch.midOuterDiscardRadius;
-
-    this.midDiscardCenterWorld.set(
-      batch.midCenter[0],
-      batch.midCenter[1],
-      batch.midCenter[2],
-    );
-    this.midDiscardRadiusNode.value = batch.midDiscardRadius;
-
-    this.nativeDiscardCenterWorld.set(
-      batch.nativeCenter[0],
-      batch.nativeCenter[1],
-      batch.nativeCenter[2],
-    );
-    this.nativeDiscardRadiusNode.value = batch.nativeDiscardRadius;
-
-    this.syncDiscardViewUniforms();
-
     let verts = 0;
-    for (const mesh of this.highResMeshes.values()) {
-      verts += mesh.geometry.getAttribute('position').count;
+    let activeVis = 0;
+    let svoC0 = 0;
+    let svoC1 = 0;
+    let svoC2 = 0;
+    for (const [key, mesh] of this.highResMeshes.entries()) {
+      const vis = batch.desiredKeys.has(key);
+      mesh.visible = vis;
+      if (vis) {
+        verts += mesh.geometry.getAttribute('position').count;
+        activeVis++;
+        const ch = this.planet.sparseChunks.get(key);
+        const sm = ch ? ch.scaleMult : 1;
+        if (sm <= 1) svoC0++;
+        else if (sm <= 2) svoC1++;
+        else svoC2++;
+      }
     }
     this.highResVertices = verts;
-    this.highResActiveCount = this.highResMeshes.size;
+    this.highResActiveCount = activeVis;
+    this.lodCounts = [
+      svoC0,
+      svoC1,
+      svoC2,
+      Math.max(0, this.planet.sparseChunks.size - activeVis),
+    ];
     return batch;
   }
 
@@ -1366,6 +1461,8 @@ export class PlanetarySandboxEngine {
         if (m) m.visible = false;
       }
       if (this.brushPreview) this.brushPreview.visible = false;
+      if (this.landingBeaconGroup) this.landingBeaconGroup.visible = false;
+      if (this.detailReticleRing) this.detailReticleRing.visible = false;
     }
   }
 
@@ -1699,6 +1796,50 @@ export class PlanetarySandboxEngine {
     this.brushPreview.visible = false;
     this.scene.add(this.brushPreview);
 
+    // Procedural Landing Site Beacon (orbital ring + vertical guide beam)
+    this.landingBeaconGroup = new THREE.Group();
+    const ringGeo = new THREE.RingGeometry(0.68, 1.0, 36);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicNodeMaterial();
+    ringMat.colorNode = color(0x34d399).mul(1.6);
+    ringMat.opacityNode = float(0.82);
+    ringMat.transparent = true;
+    ringMat.side = THREE.DoubleSide;
+    ringMat.depthWrite = false;
+    this.landingBeaconGroup.add(new THREE.Mesh(ringGeo, ringMat));
+
+    const innerRingGeo = new THREE.RingGeometry(0.28, 0.42, 24);
+    innerRingGeo.rotateX(-Math.PI / 2);
+    const innerRingMesh = new THREE.Mesh(innerRingGeo, ringMat);
+    innerRingMesh.position.y = 0.04;
+    this.landingBeaconGroup.add(innerRingMesh);
+
+    const beamGeo = new THREE.CylinderGeometry(0.055, 0.09, 2.8, 12, 1, true);
+    const beamMat = new THREE.MeshBasicNodeMaterial();
+    beamMat.colorNode = color(0x38bdf8).mul(1.4);
+    beamMat.opacityNode = float(0.45);
+    beamMat.transparent = true;
+    beamMat.side = THREE.DoubleSide;
+    beamMat.depthWrite = false;
+    const beamMesh = new THREE.Mesh(beamGeo, beamMat);
+    beamMesh.position.y = 1.4;
+    this.landingBeaconGroup.add(beamMesh);
+    this.landingBeaconGroup.visible = false;
+    this.scene.add(this.landingBeaconGroup);
+
+    // Procedural Open-Center Detail Reticle Ring (never obscures target voxels)
+    const detGeo = new THREE.RingGeometry(0.86, 1.0, 40);
+    detGeo.rotateX(-Math.PI / 2);
+    const detMat = new THREE.MeshBasicNodeMaterial();
+    detMat.colorNode = color(0x38bdf8).mul(1.3);
+    detMat.opacityNode = float(0.42);
+    detMat.transparent = true;
+    detMat.side = THREE.DoubleSide;
+    detMat.depthWrite = false;
+    this.detailReticleRing = new THREE.Mesh(detGeo, detMat);
+    this.detailReticleRing.visible = false;
+    this.scene.add(this.detailReticleRing);
+
     const dGeo = new THREE.DodecahedronGeometry(0.18, 0);
     const dMat = new THREE.MeshStandardNodeMaterial();
     dMat.colorNode = color(0x94a3b8);
@@ -1827,6 +1968,171 @@ export class PlanetarySandboxEngine {
     }
   }
 
+  private buildTangentBasis(
+    upVec: THREE.Vector3,
+    outE: THREE.Vector3,
+    outN: THREE.Vector3,
+  ): void {
+    this._s1.set(1, 0, 0);
+    if (Math.abs(upVec.x) > 0.85) this._s1.set(0, 0, 1);
+    outE.crossVectors(upVec, this._s1).normalize();
+    outN.crossVectors(outE, upVec).normalize();
+  }
+
+  private raycastDetailAnchor(preferPointer: boolean): boolean {
+    if (!this.camera) return false;
+    let hit = preferPointer && this.pointerActive ? this.raycastFromPointer() : null;
+    if (!hit || !hit.hit) {
+      this.raycaster.setFromCamera(this._v2Center, this.camera);
+      const orig = this.raycaster.ray.origin;
+      const dir = this.raycaster.ray.direction;
+      hit = this.planet.raycastTerrain(
+        orig.x,
+        orig.y,
+        orig.z,
+        dir.x,
+        dir.y,
+        dir.z,
+        this.planet.worldHalf * 5.0,
+      );
+    }
+    if (hit.hit) {
+      this.detailTarget.set(hit.x, hit.y, hit.z);
+      this.detailNormal.set(hit.nx, hit.ny, hit.nz).normalize();
+      return true;
+    }
+    return false;
+  }
+
+  private initDetailCamera(preferPointer = false): void {
+    const scale = this.getPlanetScale();
+    if (!this.raycastDetailAnchor(preferPointer)) {
+      const refDir = this._v1.copy(this.camPosSmooth);
+      if (refDir.lengthSq() < 1e-4) refDir.set(0, 1, 0);
+      else refDir.normalize();
+      const surfR = this.planet.findSurfaceRadiusAlongRay(refDir.x, refDir.y, refDir.z);
+      this.detailTarget.copy(refDir).multiplyScalar(surfR);
+      this.detailNormal.copy(refDir);
+    }
+
+    const offset = this._v1.copy(this.camPosSmooth).sub(this.detailTarget);
+    const rawDist = offset.length();
+    this.detailViewDist = clamp(
+      rawDist > this.planet.nativeVoxelSize * 2 ? rawDist : 14 * scale,
+      Math.max(this.planet.nativeVoxelSize * 4, 0.25 * scale),
+      this.planet.baseRadius * 4.5,
+    );
+
+    this.buildTangentBasis(this.detailNormal, this._tanE, this._tanN);
+    if (rawDist > 1e-4) {
+      offset.divideScalar(rawDist);
+      const upProj = clamp(offset.dot(this.detailNormal), 0.12, 0.995);
+      this.detailPitch = clamp(Math.asin(upProj), 0.14, 1.44);
+      this.detailYaw = Math.atan2(offset.dot(this._tanE), offset.dot(this._tanN));
+    } else {
+      this.detailPitch = 0.58;
+      this.detailYaw = 0.45;
+    }
+  }
+
+  private initLandingCamera(): void {
+    const scale = this.getPlanetScale();
+    this.landingStage = 'selecting';
+    this.landingHasHover = false;
+    const refDir = this._v1.copy(this.camPosSmooth);
+    const dist = Math.max(refDir.length(), this.planet.baseRadius * 2.25);
+    if (refDir.lengthSq() > 1e-4) {
+      refDir.normalize();
+      this.landingOrbitYaw = Math.atan2(refDir.z, refDir.x);
+      this.landingOrbitPitch = clamp(Math.asin(clamp(refDir.y, -0.95, 0.95)), -1.35, 1.35);
+    } else {
+      this.landingOrbitYaw = this.orbitYaw;
+      this.landingOrbitPitch = this.orbitPitch;
+    }
+    this.landingOrbitDist = clamp(
+      Math.max(dist, this.planet.baseRadius * 2.15),
+      this.planet.baseRadius * 1.45,
+      80 * scale,
+    );
+  }
+
+  private initPerspectiveCamera(): void {
+    const scale = this.getPlanetScale();
+    const lookDir = this._v1.copy(this.camLookSmooth).sub(this.camPosSmooth);
+    if (lookDir.lengthSq() > 1e-4 && this.camera) {
+      const hit = this.planet.raycastTerrain(
+        this.camPosSmooth.x,
+        this.camPosSmooth.y,
+        this.camPosSmooth.z,
+        lookDir.normalize().x,
+        lookDir.y,
+        lookDir.z,
+        this.planet.worldHalf * 4.5,
+      );
+      if (hit.hit) {
+        this.perspTarget.set(hit.x, hit.y, hit.z);
+      } else {
+        this.perspTarget.set(0, 0, 0);
+      }
+    } else {
+      this.perspTarget.set(0, 0, 0);
+    }
+
+    const offset = this._v2.copy(this.camPosSmooth).sub(this.perspTarget);
+    const dist = offset.length();
+    this.perspDist = clamp(
+      dist > 0.2 * scale ? dist : 28 * scale,
+      Math.max(this.planet.nativeVoxelSize * 6, 0.05 * scale),
+      120 * scale,
+    );
+    if (dist > 1e-4) {
+      offset.divideScalar(dist);
+      this.perspYaw = Math.atan2(offset.z, offset.x);
+      this.perspPitch = clamp(Math.asin(clamp(offset.y, -0.99, 0.99)), -1.42, 1.42);
+    }
+  }
+
+  public reselectLandingSite(): void {
+    if (this.config.cameraMode !== 'landing') {
+      this.updateConfig({ cameraMode: 'landing' });
+      return;
+    }
+    const scale = this.getPlanetScale();
+    const wasLanded = this.landingStage === 'landed';
+    this.landingStage = 'selecting';
+    this.landingHasHover = false;
+    const refDir = this._v1.copy(wasLanded ? this.landingPos : this.camPosSmooth);
+    if (refDir.lengthSq() > 1e-4) {
+      refDir.normalize();
+      this.landingOrbitYaw = Math.atan2(refDir.z, refDir.x);
+      this.landingOrbitPitch = clamp(Math.asin(clamp(refDir.y, -0.95, 0.95)), -1.35, 1.35);
+    }
+    this.landingOrbitDist = Math.max(this.planet.baseRadius * 2.35, 30 * scale);
+  }
+
+  public focusCameraAtPointer(): void {
+    if (this.phase !== 'playing') return;
+    const hit = this.raycastFromPointer();
+    if (this.config.cameraMode === 'detail') {
+      if (hit.hit) {
+        this.detailTarget.set(hit.x, hit.y, hit.z);
+        this.detailNormal.set(hit.nx, hit.ny, hit.nz).normalize();
+      } else {
+        this.raycastDetailAnchor(false);
+      }
+    } else if (this.config.cameraMode === 'perspective') {
+      if (hit.hit) {
+        this.perspTarget.set(hit.x, hit.y, hit.z);
+        this.perspDist = Math.min(
+          this.perspDist,
+          Math.max(this.planet.baseRadius * 0.95, this.camera.position.distanceTo(this.perspTarget)),
+        );
+      } else {
+        this.perspTarget.set(0, 0, 0);
+      }
+    }
+  }
+
   public cancelGeneration(): void {
     this.generationToken++;
     this.isGenerating = false;
@@ -1837,17 +2143,19 @@ export class PlanetarySandboxEngine {
     shouldAbort: () => boolean,
   ): Promise<boolean> {
     if (!this.planet.isHighResStreaming) return true;
-    const maxPasses = 64;
+    this.updateCamera(1.0);
+    const maxPasses = 120;
     let sliceStart = performance.now();
     let initialPending = 0;
     for (let pass = 0; pass < maxPasses; pass++) {
       if (shouldAbort()) return false;
-      const batch = this.updateHighResStreaming(null, 42);
+      const batch = this.updateHighResStreaming(null, 48);
       if (!batch) break;
       if (pass === 0) {
         initialPending = Math.max(1, batch.pendingTotal + batch.rebuiltMeshes.length);
       }
       if (batch.pendingTotal === 0) break;
+      if (pass >= 60 && batch.globeBuiltComplete && batch.pendingTotal < 120) break;
       if (performance.now() - sliceStart >= 8 || pass === maxPasses - 1) {
         const done = Math.max(1, initialPending - batch.pendingTotal);
         const frac = clamp(done / initialPending, 0.05, 0.99);
@@ -2366,6 +2674,9 @@ export class PlanetarySandboxEngine {
     const prevLodMode = this.config.lodMode;
     const prevRenderMode = this.config.terrainRenderMode;
 
+    const prevLod0Dist = this.config.lod0Dist;
+    const prevLod1Dist = this.config.lod1Dist;
+
     this.config = {
       ...this.config,
       ...partial,
@@ -2378,8 +2689,29 @@ export class PlanetarySandboxEngine {
     };
     this.sound.setMuted(this.config.muted);
 
-    if (prevCamMode !== 'fps' && this.config.cameraMode === 'fps') {
-      this.syncFpsPoseFromActiveCamera();
+    if (prevCamMode !== this.config.cameraMode) {
+      if (this.config.cameraMode === 'fps') {
+        this.syncFpsPoseFromActiveCamera();
+      } else if (this.config.cameraMode === 'detail') {
+        this.initDetailCamera(this.pointerActive);
+      } else if (this.config.cameraMode === 'landing') {
+        this.initLandingCamera();
+      } else if (this.config.cameraMode === 'perspective') {
+        this.initPerspectiveCamera();
+      }
+      if (this.camera && this.config.cameraMode !== 'detail' && this.config.cameraMode !== 'perspective') {
+        this.camera.fov = 52;
+        this.camera.updateProjectionMatrix();
+      }
+    }
+
+    if (
+      this.camera &&
+      this.config.cameraMode === 'perspective' &&
+      partial.perspectiveFov !== undefined
+    ) {
+      this.camera.fov = clamp(this.config.perspectiveFov, 18, 115);
+      this.camera.updateProjectionMatrix();
     }
 
     if (
@@ -2424,8 +2756,19 @@ export class PlanetarySandboxEngine {
     if (this.config.terrainRenderMode !== prevRenderMode && this.scene) {
       this.rebuildAllChunks();
       this.rebuildWaterMesh();
-    } else if (this.config.lodMode !== prevLodMode && this.scene) {
+    } else if (
+      (this.config.lodMode !== prevLodMode ||
+        this.config.lod0Dist !== prevLod0Dist ||
+        this.config.lod1Dist !== prevLod1Dist) &&
+      this.scene
+    ) {
       this.updateChunksWithLod(this.planet.totalChunks);
+      if (this.planet.isHighResStreaming) {
+        for (let pass = 0; pass < 16; pass++) {
+          const b = this.updateHighResStreaming(null, 56);
+          if (!b || b.pendingTotal === 0) break;
+        }
+      }
     }
 
     const toolColorMap: Record<BrushMode, number> = {
@@ -2465,8 +2808,11 @@ export class PlanetarySandboxEngine {
   }
 
   public triggerVirtualJump(): void {
-    if (this.phase === 'playing' && this.config.cameraMode === 'explorer') {
+    if (this.phase !== 'playing') return;
+    if (this.config.cameraMode === 'explorer') {
       this.jumpQueued = true;
+    } else if (this.config.cameraMode === 'landing' && this.landingStage === 'landed') {
+      this.landingJumpQueued = true;
     }
   }
 
@@ -2521,8 +2867,12 @@ export class PlanetarySandboxEngine {
 
     const code = e.code;
     this.keys.add(code);
-    if (code === 'Space' && !e.repeat && this.config.cameraMode === 'explorer') {
-      this.jumpQueued = true;
+    if (code === 'Space' && !e.repeat) {
+      if (this.config.cameraMode === 'explorer') {
+        this.jumpQueued = true;
+      } else if (this.config.cameraMode === 'landing' && this.landingStage === 'landed') {
+        this.landingJumpQueued = true;
+      }
     }
   };
 
@@ -2534,6 +2884,7 @@ export class PlanetarySandboxEngine {
     this.keys.clear();
     this.isSculpting = false;
     this.isDraggingOrbit = false;
+    this.isPanningCamera = false;
   };
 
   private updatePointerNDC(clientX: number, clientY: number): void {
@@ -2558,7 +2909,13 @@ export class PlanetarySandboxEngine {
       const factor = Math.exp(delta * 0.1);
       this.camDistance = clamp(this.camDistance * factor, minDist, 45.0 * scale);
     } else if (this.config.cameraMode === 'orbit') {
-      const floorR = this.planet.baseRadius * 0.85;
+      const cosP = Math.cos(this.orbitPitch);
+      const surfR = this.planet.findSurfaceRadiusAlongRay(
+        cosP * Math.cos(this.orbitYaw),
+        Math.sin(this.orbitPitch),
+        cosP * Math.sin(this.orbitYaw),
+      );
+      const floorR = Math.max(this.planet.baseRadius * 0.85, surfR);
       const minClearance = Math.min(3.5 * scale, minBlockSpan);
       const curClearance = Math.max(minClearance, this.orbitDistance - floorR);
       const nextClearance = clamp(
@@ -2567,6 +2924,45 @@ export class PlanetarySandboxEngine {
         120.0 * scale,
       );
       this.orbitDistance = floorR + nextClearance;
+    } else if (this.config.cameraMode === 'detail') {
+      // Cursor-ray re-centering on zoom-in so user magnifies whichever voxel region the ray hits
+      if (delta < 0 && this.pointerActive) {
+        const hit = this.raycastFromPointer();
+        if (hit.hit) {
+          const blend = clamp(0.42 + Math.abs(delta) * 0.25, 0.35, 0.85);
+          this._v1.set(hit.x, hit.y, hit.z);
+          this.detailTarget.lerp(this._v1, blend);
+          this._v2.set(hit.nx, hit.ny, hit.nz).normalize();
+          this.detailNormal.lerp(this._v2, blend).normalize();
+        }
+      }
+      const minDetail = Math.max(this.planet.nativeVoxelSize * 0.45, 1e-8);
+      this.detailViewDist = clamp(
+        this.detailViewDist * Math.exp(delta * 0.13),
+        minDetail,
+        this.planet.baseRadius * 6.0,
+      );
+    } else if (this.config.cameraMode === 'landing') {
+      if (this.landingStage === 'selecting') {
+        this.landingOrbitDist = clamp(
+          this.landingOrbitDist * Math.exp(delta * 0.11),
+          this.planet.baseRadius * 1.32,
+          120.0 * scale,
+        );
+      } else if (this.landingStage === 'landed') {
+        this.fpsSpeed = clamp(
+          this.fpsSpeed * Math.exp(-delta * 0.08),
+          Math.max(1e-7 * scale, this.planet.nativeVoxelSize * 6),
+          40.0 * scale,
+        );
+      }
+    } else if (this.config.cameraMode === 'perspective') {
+      const minPersp = Math.max(this.planet.nativeVoxelSize * 6, 1e-7 * scale);
+      this.perspDist = clamp(
+        this.perspDist * Math.exp(delta * 0.12),
+        minPersp,
+        130.0 * scale,
+      );
     } else {
       const minFps = Math.min(
         0.1 * scale,
@@ -2580,6 +2976,41 @@ export class PlanetarySandboxEngine {
     }
   }
 
+  private confirmLandingSite(hit: ReturnType<VoxelPlanet['raycastTerrain']>): void {
+    if (!hit.hit) return;
+    const scale = this.getPlanetScale();
+    this.landingSite.set(hit.x, hit.y, hit.z);
+    this.landingNormal.set(hit.nx, hit.ny, hit.nz).normalize();
+    if (this.landingNormal.lengthSq() < 1e-4) {
+      this.landingNormal.copy(this.landingSite).normalize();
+    }
+
+    const eyeHeight = Math.max(1.65 * scale, this.planet.nativeVoxelSize * 4);
+    this.landingDescentStartPos.copy(this.camera.position);
+    this.landingDescentEndPos
+      .copy(this.landingSite)
+      .addScaledVector(this.landingNormal, eyeHeight);
+
+    // Derive horizontal forward vector aligned with orbital view toward landing site
+    this._v1.copy(this.landingSite).sub(this.landingDescentStartPos);
+    const dotN = this._v1.dot(this.landingNormal);
+    this._v1.addScaledVector(this.landingNormal, -dotN);
+    if (this._v1.lengthSq() < 1e-4) {
+      this._v1.set(0, 0, -1);
+      const d = this._v1.dot(this.landingNormal);
+      this._v1.addScaledVector(this.landingNormal, -d);
+    }
+    this.landingFwd.copy(this._v1.normalize());
+    this.landingUp.copy(this.landingNormal);
+    this.landingDescentEndLook
+      .copy(this.landingDescentEndPos)
+      .addScaledVector(this.landingFwd, Math.max(8 * scale, this.planet.baseRadius * 0.4));
+    this.landingDescentT = 0;
+    this.landingStage = 'descending';
+    this.isSculpting = false;
+    this.isDraggingOrbit = false;
+  }
+
   private handlePointerDown = (e: PointerEvent): void => {
     if (this.phase !== 'playing') return;
     this.updatePointerNDC(e.clientX, e.clientY);
@@ -2591,7 +3022,17 @@ export class PlanetarySandboxEngine {
       if (this.activeTouches.size >= 2) {
         this.isSculpting = false;
         this.isDraggingOrbit = false;
+        this.isPanningCamera = false;
         this.prevPinchDist = this.getPinchDistance();
+        return;
+      }
+      if (this.config.cameraMode === 'landing' && this.landingStage === 'selecting') {
+        const hit = this.raycastFromPointer();
+        if (hit.hit) {
+          this.confirmLandingSite(hit);
+        } else {
+          this.isDraggingOrbit = true;
+        }
         return;
       }
       if (this.touchEnabled && this.touchActionMode === 'look') {
@@ -2609,6 +3050,14 @@ export class PlanetarySandboxEngine {
       return;
     }
 
+    if (
+      this.config.cameraMode === 'perspective' &&
+      (e.button === 1 || (e.button === 0 && e.shiftKey))
+    ) {
+      this.isPanningCamera = true;
+      return;
+    }
+
     if (e.button === 2 || e.altKey) {
       this.isDraggingOrbit = true;
       return;
@@ -2616,6 +3065,19 @@ export class PlanetarySandboxEngine {
 
     if (e.button === 0) {
       const hit = this.raycastFromPointer();
+      if (this.config.cameraMode === 'landing' && this.landingStage === 'selecting') {
+        if (hit.hit) {
+          this.confirmLandingSite(hit);
+        } else {
+          this.isDraggingOrbit = true;
+        }
+        return;
+      }
+      if (this.config.cameraMode === 'detail' && e.shiftKey && hit.hit) {
+        this.detailTarget.set(hit.x, hit.y, hit.z);
+        this.detailNormal.set(hit.nx, hit.ny, hit.nz).normalize();
+        return;
+      }
       if (hit.hit) {
         this.isSculpting = true;
         this.brushCooldown = 0;
@@ -2649,6 +3111,16 @@ export class PlanetarySandboxEngine {
 
     this.updatePointerNDC(e.clientX, e.clientY);
 
+    if (this.isPanningCamera && this.config.cameraMode === 'perspective' && this.camera) {
+      const panSpeed = this.perspDist * 0.0018;
+      this.camera.getWorldDirection(this._v1);
+      this._v2.crossVectors(this._v1, this.camera.up).normalize(); // right
+      this._v3.crossVectors(this._v2, this._v1).normalize(); // cam up
+      this.perspTarget.addScaledVector(this._v2, -dx * panSpeed);
+      this.perspTarget.addScaledVector(this._v3, dy * panSpeed);
+      return;
+    }
+
     if (this.isDraggingOrbit) {
       if (this.config.cameraMode === 'explorer') {
         this.camYaw -= dx * 0.0055;
@@ -2656,6 +3128,20 @@ export class PlanetarySandboxEngine {
       } else if (this.config.cameraMode === 'orbit') {
         this.orbitYaw -= dx * 0.0055;
         this.orbitPitch = clamp(this.orbitPitch + dy * 0.005, -1.35, 1.35);
+      } else if (this.config.cameraMode === 'detail') {
+        this.detailYaw -= dx * 0.0052;
+        this.detailPitch = clamp(this.detailPitch + dy * 0.0048, 0.1, 1.46);
+      } else if (this.config.cameraMode === 'perspective') {
+        this.perspYaw += dx * 0.0055;
+        this.perspPitch = clamp(this.perspPitch + dy * 0.005, -1.42, 1.42);
+      } else if (this.config.cameraMode === 'landing') {
+        if (this.landingStage === 'selecting') {
+          this.landingOrbitYaw -= dx * 0.0055;
+          this.landingOrbitPitch = clamp(this.landingOrbitPitch + dy * 0.005, -1.35, 1.35);
+        } else if (this.landingStage === 'landed') {
+          this.landingFwd.applyAxisAngle(this.landingUp, -dx * 0.0042).normalize();
+          this.landingPitch = clamp(this.landingPitch - dy * 0.0042, -1.36, 1.36);
+        }
       } else if (this.config.cameraMode === 'fps') {
         this.fpsYaw -= dx * 0.0045;
         this.fpsPitch = clamp(this.fpsPitch - dy * 0.0045, -1.48, 1.48);
@@ -2672,6 +3158,7 @@ export class PlanetarySandboxEngine {
     }
     this.isSculpting = false;
     this.isDraggingOrbit = false;
+    this.isPanningCamera = false;
   };
 
   private handleWheel = (e: WheelEvent): void => {
@@ -2952,6 +3439,353 @@ export class PlanetarySandboxEngine {
     this.camera.lookAt(this.camLookSmooth);
   }
 
+  private updateDetailCamera(dt: number): void {
+    const scale = this.getPlanetScale();
+
+    // Allow panning focus point across surface tangent plane with WASD / Arrows
+    let moveF = this.virtualMoveY;
+    let moveR = this.virtualMoveX;
+    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) moveF += 1;
+    if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) moveF -= 1;
+    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) moveR += 1;
+    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) moveR -= 1;
+
+    this.buildTangentBasis(this.detailNormal, this._tanE, this._tanN);
+
+    if (Math.abs(moveF) > 0.02 || Math.abs(moveR) > 0.02) {
+      const panSpeed = Math.max(this.detailViewDist * 0.65, this.planet.nativeVoxelSize * 8);
+      const fwdDir = this._v3
+        .set(
+          -Math.sin(this.detailYaw) * this._tanE.x - Math.cos(this.detailYaw) * this._tanN.x,
+          -Math.sin(this.detailYaw) * this._tanE.y - Math.cos(this.detailYaw) * this._tanN.y,
+          -Math.sin(this.detailYaw) * this._tanE.z - Math.cos(this.detailYaw) * this._tanN.z,
+        )
+        .normalize();
+      const rightDir = this._v4.crossVectors(fwdDir, this.detailNormal).normalize();
+      this.detailTarget
+        .addScaledVector(fwdDir, moveF * panSpeed * dt)
+        .addScaledVector(rightDir, moveR * panSpeed * dt);
+      // Re-project target smoothly onto planet surface along radial direction
+      const rLen = this.detailTarget.length();
+      if (rLen > 1e-4) {
+        const rx = this.detailTarget.x / rLen;
+        const ry = this.detailTarget.y / rLen;
+        const rz = this.detailTarget.z / rLen;
+        const surfR = this.planet.findSurfaceRadiusAlongRay(rx, ry, rz);
+        this.detailTarget.set(rx * surfR, ry * surfR, rz * surfR);
+        this.detailNormal.set(rx, ry, rz);
+      }
+      this.buildTangentBasis(this.detailNormal, this._tanE, this._tanN);
+    }
+
+    if (this.keys.has('KeyQ')) this.detailYaw += 1.6 * dt;
+    if (this.keys.has('KeyE')) this.detailYaw -= 1.6 * dt;
+
+    this.detailOptics = computeDetailCameraOptics(
+      this.detailViewDist,
+      this.planet.baseRadius,
+      this.planet.nativeVoxelSize,
+      55,
+    );
+
+    const cosP = Math.cos(this.detailPitch);
+    const dirToCam = this._v1
+      .set(0, 0, 0)
+      .addScaledVector(this.detailNormal, Math.sin(this.detailPitch))
+      .addScaledVector(this._tanN, Math.cos(this.detailYaw) * cosP)
+      .addScaledVector(this._tanE, Math.sin(this.detailYaw) * cosP)
+      .normalize();
+
+    let safeDist = this.detailOptics.physicalDist;
+    // Raycast from detail target outward toward camera to prevent cliff/wall penetration
+    const rayStartOffset = Math.max(this.planet.nativeVoxelSize * 2.5, 0.04 * scale);
+    const occHit = this.planet.raycastTerrain(
+      this.detailTarget.x + this.detailNormal.x * rayStartOffset,
+      this.detailTarget.y + this.detailNormal.y * rayStartOffset,
+      this.detailTarget.z + this.detailNormal.z * rayStartOffset,
+      dirToCam.x,
+      dirToCam.y,
+      dirToCam.z,
+      safeDist,
+    );
+    if (occHit.hit && occHit.distance < safeDist) {
+      safeDist = Math.max(this.planet.nativeVoxelSize * 4.5, occHit.distance * 0.82);
+    }
+
+    const desiredPos = this._v2
+      .copy(this.detailTarget)
+      .addScaledVector(dirToCam, safeDist);
+
+    // Final signed-distance voxel clearance pushout so camera never embeds into solid geometry
+    const minSurfaceClear = Math.max(this.planet.nativeVoxelSize * 3.0, 0.06 * scale);
+    const dCam = this.planet.sampleDensityAndNormal(
+      desiredPos.x,
+      desiredPos.y,
+      desiredPos.z,
+      this._normalArr,
+    );
+    if (dCam > -minSurfaceClear) {
+      const push = dCam + minSurfaceClear;
+      desiredPos.x += this._normalArr[0] * push;
+      desiredPos.y += this._normalArr[1] * push;
+      desiredPos.z += this._normalArr[2] * push;
+    }
+
+    const damp = 1 - Math.exp(-15 * dt);
+    this.camPosSmooth.lerp(desiredPos, damp);
+    this.camLookSmooth.lerp(this.detailTarget, damp);
+
+    if (Math.abs(this.camera.fov - this.detailOptics.fovDeg) > 0.05) {
+      this.camera.fov = this.detailOptics.fovDeg;
+      this.camera.updateProjectionMatrix();
+    }
+
+    this.camera.position.copy(this.camPosSmooth);
+    this.camera.up.lerp(this.detailNormal, 1 - Math.exp(-10 * dt)).normalize();
+    this.camera.lookAt(this.camLookSmooth);
+  }
+
+  private updateLandingCamera(dt: number): void {
+    const scale = this.getPlanetScale();
+
+    if (this.landingStage === 'selecting') {
+      let yawDelta = this.virtualMoveX;
+      let pitchDelta = this.virtualMoveY;
+      if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) yawDelta -= 1;
+      if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) yawDelta += 1;
+      if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) pitchDelta += 1;
+      if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) pitchDelta -= 1;
+      this.landingOrbitYaw += yawDelta * 1.4 * dt;
+      this.landingOrbitPitch = clamp(this.landingOrbitPitch + pitchDelta * 1.1 * dt, -1.35, 1.35);
+
+      const cosP = Math.cos(this.landingOrbitPitch);
+      const rx = cosP * Math.cos(this.landingOrbitYaw);
+      const ry = Math.sin(this.landingOrbitPitch);
+      const rz = cosP * Math.sin(this.landingOrbitYaw);
+      const desired = this._v1.set(
+        this.landingOrbitDist * rx,
+        this.landingOrbitDist * ry,
+        this.landingOrbitDist * rz,
+      );
+      const damp = 1 - Math.exp(-10 * dt);
+      this.camPosSmooth.lerp(desired, damp);
+      this.camLookSmooth.lerp(this._v2.set(0, 0, 0), damp);
+      this.camera.position.copy(this.camPosSmooth);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(this.camLookSmooth);
+      return;
+    }
+
+    if (this.landingStage === 'descending') {
+      this.landingDescentT = Math.min(1, this.landingDescentT + dt / 0.95);
+      const pose = evaluateLandingDescentPose(
+        this.landingDescentT,
+        [
+          this.landingDescentStartPos.x,
+          this.landingDescentStartPos.y,
+          this.landingDescentStartPos.z,
+        ],
+        [
+          this.landingDescentEndPos.x,
+          this.landingDescentEndPos.y,
+          this.landingDescentEndPos.z,
+        ],
+        [this.landingSite.x, this.landingSite.y, this.landingSite.z],
+        [
+          this.landingDescentEndLook.x,
+          this.landingDescentEndLook.y,
+          this.landingDescentEndLook.z,
+        ],
+      );
+      this.camPosSmooth.set(pose.pos[0], pose.pos[1], pose.pos[2]);
+      this.camLookSmooth.set(pose.look[0], pose.look[1], pose.look[2]);
+      this.camera.position.copy(this.camPosSmooth);
+      this.camera.up.lerp(this.landingNormal, 1 - Math.exp(-7 * dt)).normalize();
+      this.camera.lookAt(this.camLookSmooth);
+
+      if (pose.done) {
+        this.landingStage = 'landed';
+        this.landingPos.copy(this.landingDescentEndPos);
+        this.landingVel.set(0, 0, 0);
+        this.landingUp.copy(this.landingNormal);
+        this.landingPitch = -0.04;
+        this.landingGrounded = false;
+      }
+      return;
+    }
+
+    // Stage 3: 'landed' -> Planetary gravity-aligned surface FPS walk
+    this._fwdLike.x = this.landingFwd.x;
+    this._fwdLike.y = this.landingFwd.y;
+    this._fwdLike.z = this.landingFwd.z;
+    parallelTransportTangentFrame(
+      this.landingPos.x,
+      this.landingPos.y,
+      this.landingPos.z,
+      this._fwdLike,
+      this._upLike,
+      this._fwdLike,
+      this._rightLike,
+    );
+    this.landingUp.set(this._upLike.x, this._upLike.y, this._upLike.z);
+    this.landingFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
+    const rightVec = this._v4.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
+
+    if (this.keys.has('KeyQ')) {
+      this.landingFwd.applyAxisAngle(this.landingUp, 1.8 * dt).normalize();
+    }
+    if (this.keys.has('KeyE')) {
+      this.landingFwd.applyAxisAngle(this.landingUp, -1.8 * dt).normalize();
+    }
+
+    let mf = this.virtualMoveY;
+    let mr = this.virtualMoveX;
+    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) mf += 1;
+    if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) mf -= 1;
+    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) mr += 1;
+    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) mr -= 1;
+    mf = clamp(mf, -1, 1);
+    mr = clamp(mr, -1, 1);
+
+    const wish = this._v3
+      .set(0, 0, 0)
+      .addScaledVector(this.landingFwd, mf)
+      .addScaledVector(rightVec, mr);
+    if (wish.lengthSq() > 1) wish.normalize();
+
+    const sprint = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 1.85 : 1.0;
+    const walkSpd = Math.min(this.fpsSpeed, 14 * scale) * sprint;
+
+    const params = this.getGravityParams();
+    computeGravityVector(
+      this.landingPos.x,
+      this.landingPos.y,
+      this.landingPos.z,
+      params,
+      this._grav,
+    );
+    this.landingVel.x += this._grav.x * dt;
+    this.landingVel.y += this._grav.y * dt;
+    this.landingVel.z += this._grav.z * dt;
+
+    if (this.landingJumpQueued && this.landingGrounded) {
+      const jumpSpd = 6.8 * Math.sqrt(Math.max(0.08, this.config.gravityScale * scale));
+      this.landingVel.addScaledVector(this.landingUp, jumpSpd);
+      this.landingGrounded = false;
+      this.sound.playJump();
+    }
+    this.landingJumpQueued = false;
+
+    const radialV = this.landingVel.dot(this.landingUp);
+    this._v1.copy(this.landingVel).addScaledVector(this.landingUp, -radialV);
+    this._v1.lerp(
+      this._v2.copy(wish).multiplyScalar(walkSpd),
+      1 - Math.exp(-(this.landingGrounded ? 15 : 5) * dt),
+    );
+    this.landingVel.copy(this._v1).addScaledVector(this.landingUp, radialV);
+    this.landingPos.addScaledVector(this.landingVel, dt);
+
+    // Collide feet against voxel terrain keeping eye height clear above ground
+    const eyeHeight = Math.max(1.65 * scale, this.planet.nativeVoxelSize * 4);
+    const footClear = eyeHeight * 0.85;
+    const footCheckPos = this._v1
+      .copy(this.landingPos)
+      .addScaledVector(this.landingUp, -footClear);
+    const dGround = this.planet.sampleDensityAndNormal(
+      footCheckPos.x,
+      footCheckPos.y,
+      footCheckPos.z,
+      this._normalArr,
+    );
+    this.landingGrounded = false;
+    const stepRadius = Math.max(0.28 * scale, this.planet.nativeVoxelSize * 1.5);
+    if (dGround > -stepRadius) {
+      const pen = dGround + stepRadius;
+      const nx = this._normalArr[0];
+      const ny = this._normalArr[1];
+      const nz = this._normalArr[2];
+      this.landingPos.x += nx * pen;
+      this.landingPos.y += ny * pen;
+      this.landingPos.z += nz * pen;
+      this._v2.set(nx, ny, nz);
+      const vn = this.landingVel.dot(this._v2);
+      if (vn < 0) {
+        this.landingVel.addScaledVector(this._v2, -vn);
+      }
+      if (this._v2.dot(this.landingUp) > 0.3) {
+        this.landingGrounded = true;
+      }
+    }
+
+    const lookDir = this._v2
+      .copy(this.landingFwd)
+      .multiplyScalar(Math.cos(this.landingPitch))
+      .addScaledVector(this.landingUp, Math.sin(this.landingPitch))
+      .normalize();
+
+    const damp = 1 - Math.exp(-18 * dt);
+    this.camPosSmooth.lerp(this.landingPos, damp);
+    this._v1.copy(this.landingPos).add(lookDir);
+    this.camLookSmooth.lerp(this._v1, damp);
+
+    this.camera.position.copy(this.camPosSmooth);
+    this.camera.up.lerp(this.landingUp, 1 - Math.exp(-12 * dt)).normalize();
+    this.camera.lookAt(this.camLookSmooth);
+  }
+
+  private updatePerspectiveCamera(dt: number): void {
+    const scale = this.getPlanetScale();
+
+    // Free CAD target panning via WASD / Space / C
+    const cosP = Math.cos(this.perspPitch);
+    const offsetDir = this._v1
+      .set(cosP * Math.cos(this.perspYaw), Math.sin(this.perspPitch), cosP * Math.sin(this.perspYaw))
+      .normalize();
+
+    let mf = this.virtualMoveY;
+    let mr = this.virtualMoveX;
+    let mu = (this.virtualUp ? 1 : 0) - (this.virtualDown ? 1 : 0);
+    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) mf += 1;
+    if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) mf -= 1;
+    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) mr += 1;
+    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) mr -= 1;
+    if (this.keys.has('Space') || this.keys.has('KeyE')) mu += 1;
+    if (this.keys.has('KeyC') || this.keys.has('KeyQ')) mu -= 1;
+
+    if (Math.abs(mf) > 0.02 || Math.abs(mr) > 0.02 || Math.abs(mu) > 0.02) {
+      const fwdHoriz = this._v2.set(-offsetDir.x, 0, -offsetDir.z);
+      if (fwdHoriz.lengthSq() < 1e-4) fwdHoriz.set(0, 0, -1);
+      fwdHoriz.normalize();
+      const rightHoriz = this._v3.crossVectors(fwdHoriz, this.camera.up).normalize();
+      const panRate = Math.max(this.perspDist * 0.75, 2.0 * scale);
+      this.perspTarget
+        .addScaledVector(fwdHoriz, mf * panRate * dt)
+        .addScaledVector(rightHoriz, mr * panRate * dt);
+      this.perspTarget.y += mu * panRate * dt;
+      const maxTargetOff = 45 * scale;
+      if (this.perspTarget.length() > maxTargetOff) {
+        this.perspTarget.setLength(maxTargetOff);
+      }
+    }
+
+    const desiredPos = this._v4
+      .copy(this.perspTarget)
+      .addScaledVector(offsetDir, this.perspDist);
+    const damp = 1 - Math.exp(-12 * dt);
+    this.camPosSmooth.lerp(desiredPos, damp);
+    this.camLookSmooth.lerp(this.perspTarget, damp);
+
+    const targetFov = clamp(this.config.perspectiveFov, 18, 115);
+    if (Math.abs(this.camera.fov - targetFov) > 0.05) {
+      this.camera.fov = targetFov;
+      this.camera.updateProjectionMatrix();
+    }
+
+    this.camera.position.copy(this.camPosSmooth);
+    this.camera.up.set(0, 1, 0);
+    this.camera.lookAt(this.camLookSmooth);
+  }
+
   private updateCamera(dt: number): void {
     const scale = this.getPlanetScale();
     if (this.phase === 'title') {
@@ -2974,6 +3808,21 @@ export class PlanetarySandboxEngine {
       return;
     }
 
+    if (this.config.cameraMode === 'detail') {
+      this.updateDetailCamera(dt);
+      return;
+    }
+
+    if (this.config.cameraMode === 'landing') {
+      this.updateLandingCamera(dt);
+      return;
+    }
+
+    if (this.config.cameraMode === 'perspective') {
+      this.updatePerspectiveCamera(dt);
+      return;
+    }
+
     if (this.config.cameraMode === 'orbit') {
       let yawDelta = this.virtualMoveX;
       let pitchDelta = this.virtualMoveY;
@@ -2985,10 +3834,23 @@ export class PlanetarySandboxEngine {
       this.orbitPitch = clamp(this.orbitPitch + pitchDelta * 1.1 * dt, -1.35, 1.35);
 
       const cosP = Math.cos(this.orbitPitch);
+      const rx = cosP * Math.cos(this.orbitYaw);
+      const ry = Math.sin(this.orbitPitch);
+      const rz = cosP * Math.sin(this.orbitYaw);
+      const surfR = this.planet.findSurfaceRadiusAlongRay(rx, ry, rz);
+      const minOrbitR =
+        surfR +
+        Math.min(
+          1.5 * scale,
+          Math.max(1e-7 * scale, this.planet.nativeVoxelSize * 4),
+        );
+      if (this.orbitDistance < minOrbitR) {
+        this.orbitDistance = minOrbitR;
+      }
       this._v1.set(
-        this.orbitDistance * cosP * Math.cos(this.orbitYaw),
-        this.orbitDistance * Math.sin(this.orbitPitch),
-        this.orbitDistance * cosP * Math.sin(this.orbitYaw),
+        this.orbitDistance * rx,
+        this.orbitDistance * ry,
+        this.orbitDistance * rz,
       );
       const damp = 1 - Math.exp(-9 * dt);
       this.camPosSmooth.lerp(this._v1, damp);
@@ -3098,10 +3960,19 @@ export class PlanetarySandboxEngine {
         this.updateExplorerPhysics(dt);
       }
 
-      // Live brush hover preview, voxel probe & sculpting (works even when simulation is paused!)
+      // Live brush hover preview, voxel probe, landing site hover & sculpting
       if (this.pointerActive) {
         hoveredHit = this.raycastFromPointer();
-        if (hoveredHit.hit) {
+        if (this.config.cameraMode === 'landing' && this.landingStage === 'selecting') {
+          this.brushPreview.visible = false;
+          if (hoveredHit.hit) {
+            this.landingHasHover = true;
+            this.landingHoverPos.set(hoveredHit.x, hoveredHit.y, hoveredHit.z);
+            this.landingHoverNormal.set(hoveredHit.nx, hoveredHit.ny, hoveredHit.nz).normalize();
+          } else {
+            this.landingHasHover = false;
+          }
+        } else if (hoveredHit.hit) {
           this.brushPreview.visible = true;
           this.brushPreview.position.set(hoveredHit.x, hoveredHit.y, hoveredHit.z);
           this.brushPreview.scale.setScalar(this.config.brushRadius);
@@ -3145,9 +4016,55 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    // Update Camera & Dynamic Chunk LOD transitions + High-Res Sparse Streaming
+    // Update Camera & Procedural Visual Markers
     this.updateCamera(dt);
-    if (this.planet.isHighResStreaming) {
+
+    if (this.landingBeaconGroup) {
+      if (
+        this.phase === 'playing' &&
+        this.config.cameraMode === 'landing' &&
+        (this.landingStage === 'descending' ||
+          (this.landingStage === 'selecting' && this.landingHasHover))
+      ) {
+        const bPos =
+          this.landingStage === 'descending' ? this.landingSite : this.landingHoverPos;
+        const bNorm =
+          this.landingStage === 'descending' ? this.landingNormal : this.landingHoverNormal;
+        this.landingBeaconGroup.visible = true;
+        this.landingBeaconGroup.position.copy(bPos).addScaledVector(bNorm, 0.03 * scale);
+        this._q1.setFromUnitVectors(this._v1.set(0, 1, 0), bNorm);
+        this.landingBeaconGroup.quaternion.copy(this._q1);
+        const pulse = 1.0 + Math.sin(this.simTimeSec * 5.0) * 0.1;
+        const bScale = Math.max(
+          this.planet.nativeVoxelSize * 5,
+          this.camera.position.distanceTo(bPos) * 0.035,
+        );
+        this.landingBeaconGroup.scale.set(bScale * pulse, bScale, bScale * pulse);
+      } else {
+        this.landingBeaconGroup.visible = false;
+      }
+    }
+
+    if (this.detailReticleRing) {
+      if (this.phase === 'playing' && this.config.cameraMode === 'detail') {
+        this.detailReticleRing.visible = true;
+        this.detailReticleRing.position
+          .copy(this.detailTarget)
+          .addScaledVector(this.detailNormal, Math.max(this.planet.nativeVoxelSize * 0.35, 0.004 * scale));
+        this._q1.setFromUnitVectors(this._v1.set(0, 1, 0), this.detailNormal);
+        this.detailReticleRing.quaternion.copy(this._q1);
+        const rScale = clamp(
+          this.detailOptics.effectiveStreamDist * 0.055,
+          this.planet.nativeVoxelSize * 2.5,
+          2.6 * scale,
+        );
+        this.detailReticleRing.scale.setScalar(rScale);
+      } else {
+        this.detailReticleRing.visible = false;
+      }
+    }
+
+    if (this.planet.isHighResStreaming || this.config.cameraMode === 'detail') {
       const camR = this.camera.position.length();
       const surfDist = Math.max(
         this.planet.nativeVoxelSize * 0.25,
@@ -3157,19 +4074,34 @@ export class PlanetarySandboxEngine {
         this.planet.nativeVoxelSize * 0.5,
         this.camera.position.distanceTo(this.lastHighResFocus),
       );
-      const targetNear = clamp(
-        Math.min(0.15 * scale, surfDist * 0.12, focusDist * 0.08),
-        Math.max(1e-9 * scale, this.planet.nativeVoxelSize * 0.25),
-        0.15 * scale,
+      const safeClips = computeSafeClipPlanes(
+        surfDist,
+        focusDist,
+        this.planet.baseRadius,
+        this.camera.fov,
       );
-      if (Math.abs(this.camera.near - targetNear) / Math.max(this.camera.near, 1e-10) > 0.15) {
+      const targetNear = safeClips.near;
+      const targetFar = safeClips.far;
+
+      if (
+        Math.abs(this.camera.near - targetNear) / Math.max(this.camera.near, 1e-10) > 0.15 ||
+        Math.abs(this.camera.far - targetFar) / Math.max(this.camera.far, 1) > 0.15
+      ) {
         this.camera.near = targetNear;
+        this.camera.far = targetFar;
         this.camera.updateProjectionMatrix();
       }
     }
     this.updateChunksWithLod(this.isSoftware ? 8 : 14);
-    this.updateHighResStreaming(hoveredHit, this.isSoftware ? 16 : 28);
-    this.syncDiscardViewUniforms();
+    const streamBudget =
+      this.config.lodMode === 0
+        ? this.isSoftware
+          ? 24
+          : 56
+        : this.isSoftware
+          ? 16
+          : 28;
+    this.updateHighResStreaming(hoveredHit, streamBudget);
     if (this.config.showChunkBounds && this.chunkBoundsDirty) {
       this.refreshChunkBoundsOverlay();
     }
@@ -3181,7 +4113,15 @@ export class PlanetarySandboxEngine {
     if (this.telemetryTimer >= 0.12) {
       this.telemetryTimer = 0;
       const refPos =
-        this.config.cameraMode === 'fps' ? this.fpsPos : this.playerPos;
+        this.config.cameraMode === 'fps'
+          ? this.fpsPos
+          : this.config.cameraMode === 'landing' && this.landingStage === 'landed'
+            ? this.landingPos
+            : this.config.cameraMode === 'detail'
+              ? this.detailTarget
+              : this.config.cameraMode === 'perspective'
+                ? this.camera.position
+                : this.playerPos;
       const r = refPos.length();
       const params = this.getGravityParams();
       const isWebGPU = Boolean(
@@ -3234,7 +4174,10 @@ export class PlanetarySandboxEngine {
         waterParticles: this.fluid.activeCount,
         terrainVertices: this.totalTerrainVertices + this.highResVertices,
         backend: isWebGPU ? 'WebGPU' : 'WebGL2',
-        grounded: this.playerGrounded,
+        grounded:
+          this.config.cameraMode === 'landing'
+            ? this.landingGrounded
+            : this.playerGrounded,
         cameraMode: this.config.cameraMode,
         fps: Math.round(this.fpsSmooth),
         frameTimeMs: Number(this.frameTimeSmooth.toFixed(1)),
@@ -3259,6 +4202,9 @@ export class PlanetarySandboxEngine {
         sunDir: sunDirArr,
         simTimeSec: this.simTimeSec,
         voxelRevision: this.planet.voxelRevision,
+        landingStage: this.landingStage,
+        detailZoomMag: Number(this.detailOptics.magnification.toFixed(1)),
+        perspectiveFov: this.config.perspectiveFov,
       });
     }
 

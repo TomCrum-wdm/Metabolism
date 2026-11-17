@@ -140,7 +140,11 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                   分块 LOD 分布 (共 {voxelStats.totalChunks} 块)
                 </span>
                 <span className="font-mono-tabular text-slate-400">
-                  {config.lodMode === 'auto' ? '自适应' : `强制 LOD${config.lodMode}`}
+                  {config.lodMode === 'auto'
+                    ? '自适应'
+                    : config.lodMode === 0
+                      ? '强制 LOD0 · 全最小体素'
+                      : `强制 LOD${config.lodMode}`}
                 </span>
               </div>
               <div className="grid grid-cols-4 gap-1 font-mono-tabular text-center">
@@ -169,6 +173,13 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                     key={String(mode)}
                     type="button"
                     tabIndex={-1}
+                    title={
+                      mode === 0
+                        ? '关闭距离降级：当前视野/全星均匀显示最小体素'
+                        : mode === 'auto'
+                          ? '根据视角与距离自适应细节'
+                          : `强制限制在 LOD ${mode}`
+                    }
                     onClick={() => onUpdateConfig({ lodMode: mode })}
                     className={`py-1 rounded-xs border text-[11px] font-medium cursor-pointer transition-colors ${
                       config.lodMode === mode
@@ -176,7 +187,7 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                         : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    {mode === 'auto' ? 'Auto' : `LOD ${mode}`}
+                    {mode === 'auto' ? 'Auto' : mode === 0 ? 'LOD 0 全精' : `LOD ${mode}`}
                   </button>
                 ))}
               </div>

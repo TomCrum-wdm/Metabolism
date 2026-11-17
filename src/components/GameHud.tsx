@@ -1,16 +1,19 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Box,
   Camera,
   ChevronDown,
   ChevronUp,
   Cloud,
+  Crosshair,
   ExternalLink,
   Hand,
   Magnet,
   Map as MapIcon,
+  Navigation,
   Pause,
   Play,
+  RotateCcw,
   Sliders,
   Terminal,
   Thermometer,
@@ -50,6 +53,8 @@ interface GameHudProps {
   onToggleMaps: () => void;
   onToggleAtmosPanel: () => void;
   onToggleDebug: () => void;
+  onReselectLanding: () => void;
+  onFocusCamera: () => void;
   onPause: () => void;
 }
 
@@ -82,13 +87,32 @@ const MATERIAL_ITEMS: ReadonlyArray<{
 const CAMERA_LABEL: Record<CameraMode, string> = {
   explorer: '探索',
   orbit: '轨道',
+  detail: '细节放大',
   fps: 'FPS自由',
+  landing: '降落FPS',
+  perspective: '透视',
 };
+
+const CAMERA_MODES: ReadonlyArray<{
+  id: CameraMode;
+  label: string;
+  desc: string;
+}> = [
+  { id: 'explorer', label: '探索视角', desc: '地表第三人称角色跟随' },
+  { id: 'orbit', label: '轨道视角', desc: '环绕行星全局俯瞰' },
+  { id: 'detail', label: '细节摄像机', desc: '射线锁定体素区域安全放大' },
+  { id: 'fps', label: '自由 FPS 摄像机', desc: '无约束 6DoF 自由飞行' },
+  { id: 'landing', label: '降落摄像机', desc: '先选址着陆，再按地表 FPS 行走' },
+  { id: 'perspective', label: '透视摄像机', desc: '可调 FOV / Shift平移视点透视相机' },
+];
 
 const NEXT_CAMERA_MODE: Record<CameraMode, CameraMode> = {
   explorer: 'orbit',
-  orbit: 'fps',
-  fps: 'explorer',
+  orbit: 'detail',
+  detail: 'fps',
+  fps: 'landing',
+  landing: 'perspective',
+  perspective: 'explorer',
 };
 
 const OVERLAY_LABEL: Record<TerrainOverlayMode, string> = {
@@ -130,8 +154,11 @@ export const GameHud: React.FC<GameHudProps> = ({
   onToggleMaps,
   onToggleAtmosPanel,
   onToggleDebug,
+  onReselectLanding,
+  onFocusCamera,
   onPause,
 }) => {
+  const [camMenuOpen, setCamMenuOpen] = useState(false);
   const altStr = `${telemetry.altitude >= 0 ? '+' : ''}${telemetry.altitude.toFixed(1)}m`;
   const gravStr = `${telemetry.localGravity.toFixed(2)}m/s²`;
   const escStr = `${telemetry.escapeVelocity.toFixed(1)}m/s`;
@@ -217,12 +244,29 @@ export const GameHud: React.FC<GameHudProps> = ({
             <span className="text-emerald-300">{telemetry.fps} FPS</span>
           </div>
 
-          {config.cameraMode === 'fps' && (
+          {(config.cameraMode === 'fps' ||
+            (config.cameraMode === 'landing' && telemetry.landingStage === 'landed')) && (
             <div className="flex items-center gap-1">
               <span className="text-slate-500">SPD</span>
               <span className="text-amber-300">
                 {telemetry.fpsSpeed.toFixed(1)}m/s
               </span>
+            </div>
+          )}
+
+          {config.cameraMode === 'detail' && (
+            <div className="flex items-center gap-1">
+              <span className="text-slate-500">MAG</span>
+              <span className="text-cyan-300" data-testid="hud-detail-mag">
+                ×{telemetry.detailZoomMag.toFixed(1)}
+              </span>
+            </div>
+          )}
+
+          {config.cameraMode === 'perspective' && (
+            <div className="flex items-center gap-1">
+              <span className="text-slate-500">FOV</span>
+              <span className="text-indigo-300">{Math.round(config.perspectiveFov)}°</span>
             </div>
           )}
 
@@ -238,22 +282,79 @@ export const GameHud: React.FC<GameHudProps> = ({
           <OfflineIndicator />
           <PWAInstallButton compact />
 
-          <button
-            type="button"
-            tabIndex={-1}
-            data-testid="camera-mode-btn"
-            title="循环切换视角：探索 / 轨道 / FPS自由视角 (Tab)"
-            onClick={(e) => {
-              e.currentTarget.blur();
-              onUpdateConfig({
-                cameraMode: NEXT_CAMERA_MODE[config.cameraMode],
-              });
-            }}
-            className="h-7 px-2 rounded-xs border border-slate-700/80 bg-[#0d1322] hover:border-sky-400/80 text-[11px] font-medium text-slate-200 transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
-          >
-            <Camera className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-            <span>{CAMERA_LABEL[config.cameraMode]} [Tab]</span>
-          </button>
+          <div className="relative flex items-center">
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="camera-mode-btn"
+              title="切换摄像机模式 (Tab)"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onUpdateConfig({
+                  cameraMode: NEXT_CAMERA_MODE[config.cameraMode],
+                });
+              }}
+              className="h-7 px-2 rounded-l-xs border border-slate-700/80 bg-[#0d1322] hover:border-sky-400/80 text-[11px] font-medium text-slate-200 transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
+            >
+              <Camera className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+              <span>{CAMERA_LABEL[config.cameraMode]} [Tab]</span>
+            </button>
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="camera-menu-toggle-btn"
+              title="选择摄像机模式"
+              aria-expanded={camMenuOpen}
+              onClick={(e) => {
+                e.currentTarget.blur();
+                setCamMenuOpen((v) => !v);
+              }}
+              className="h-7 px-1 rounded-r-xs border border-l-0 border-slate-700/80 bg-[#0d1322] hover:border-sky-400/80 text-slate-300 hover:text-white transition-colors cursor-pointer flex items-center justify-center shrink-0"
+            >
+              <ChevronDown className="w-3 h-3" />
+            </button>
+
+            {camMenuOpen && (
+              <div
+                data-testid="camera-mode-menu"
+                className="absolute right-0 top-8 z-30 w-60 rounded-sm border border-slate-700 bg-[#090d18]/96 p-1 shadow-xl flex flex-col gap-0.5"
+              >
+                {CAMERA_MODES.map((m) => {
+                  const active = config.cameraMode === m.id;
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      tabIndex={-1}
+                      data-testid={`camera-option-${m.id}`}
+                      onClick={(e) => {
+                        e.currentTarget.blur();
+                        onUpdateConfig({ cameraMode: m.id });
+                        setCamMenuOpen(false);
+                      }}
+                      className={`w-full text-left px-2 py-1.5 rounded-xs border transition-colors cursor-pointer flex flex-col ${
+                        active
+                          ? 'border-sky-400/80 bg-sky-950/70 text-white'
+                          : 'border-transparent hover:bg-slate-800/80 text-slate-300'
+                      }`}
+                    >
+                      <span className="text-[11px] font-medium flex items-center justify-between">
+                        <span>{m.label}</span>
+                        {active && (
+                          <span className="text-[10px] text-sky-300 font-mono-tabular">
+                            当前
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        {m.desc}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
           <button
             type="button"
@@ -492,6 +593,114 @@ export const GameHud: React.FC<GameHudProps> = ({
           </button>
         </div>
       </header>
+
+      {/* Mode-Specific Compact Camera Strip */}
+      {(config.cameraMode === 'detail' ||
+        config.cameraMode === 'landing' ||
+        config.cameraMode === 'perspective') && (
+        <div className="pointer-events-none flex justify-center pt-1.5 px-2">
+          <div
+            data-testid="camera-mode-context-bar"
+            className="pointer-events-auto h-7 px-2.5 rounded-xs border border-slate-700/80 bg-[#090d18]/90 text-[11px] text-slate-200 flex items-center gap-2.5 shadow-md"
+          >
+            {config.cameraMode === 'detail' && (
+              <>
+                <span className="flex items-center gap-1 text-cyan-300 font-medium">
+                  <Crosshair className="w-3.5 h-3.5" />
+                  <span>细节放大 ×{telemetry.detailZoomMag.toFixed(1)}</span>
+                </span>
+                <span className="hidden sm:inline text-slate-400 text-[10px]">
+                  滚轮向指针体素拉近 · 右键俯仰 · WASD平移视点
+                </span>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  data-testid="detail-focus-btn"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    onFocusCamera();
+                  }}
+                  className="h-5 px-2 rounded-xs border border-cyan-500/60 bg-cyan-950/60 hover:bg-cyan-900/70 text-[10px] text-cyan-200 cursor-pointer"
+                >
+                  锁定视角中心 [F]
+                </button>
+              </>
+            )}
+
+            {config.cameraMode === 'landing' && (
+              <>
+                <span className="flex items-center gap-1 text-emerald-300 font-medium">
+                  <Navigation className="w-3.5 h-3.5" />
+                  <span>
+                    {telemetry.landingStage === 'selecting'
+                      ? '降落选址中 · 左键点击星球表面降落'
+                      : telemetry.landingStage === 'descending'
+                        ? '正在精准降落着陆...'
+                        : '已着陆 · WASD地表FPS · 空格跳跃 · Shift疾跑'}
+                  </span>
+                </span>
+                {telemetry.landingStage !== 'selecting' && (
+                  <button
+                    type="button"
+                    tabIndex={-1}
+                    data-testid="landing-reselect-btn"
+                    onClick={(e) => {
+                      e.currentTarget.blur();
+                      onReselectLanding();
+                    }}
+                    className="h-5 px-2 rounded-xs border border-emerald-500/60 bg-emerald-950/60 hover:bg-emerald-900/70 text-[10px] text-emerald-200 cursor-pointer flex items-center gap-1"
+                  >
+                    <RotateCcw className="w-2.5 h-2.5" />
+                    <span>重选降落点 [R]</span>
+                  </button>
+                )}
+              </>
+            )}
+
+            {config.cameraMode === 'perspective' && (
+              <>
+                <span className="text-indigo-300 font-medium">
+                  透视视角
+                </span>
+                <label className="flex items-center gap-1.5 text-[10px] text-slate-300">
+                  <span>FOV</span>
+                  <input
+                    type="range"
+                    min={18}
+                    max={115}
+                    step={1}
+                    value={config.perspectiveFov}
+                    onChange={(e) =>
+                      onUpdateConfig({
+                        perspectiveFov: Number(e.target.value),
+                      })
+                    }
+                    className="w-24 accent-indigo-400 cursor-pointer"
+                  />
+                  <span className="font-mono-tabular text-indigo-200 w-7 text-right">
+                    {Math.round(config.perspectiveFov)}°
+                  </span>
+                </label>
+                <span className="hidden md:inline text-slate-400 text-[10px]">
+                  Shift/中键拖拽平移 · [F]聚焦目标 · 滚轮推拉
+                </span>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  data-testid="persp-focus-btn"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    onFocusCamera();
+                  }}
+                  className="h-5 px-2 rounded-xs border border-indigo-500/60 bg-indigo-950/60 hover:bg-indigo-900/70 text-[10px] text-indigo-200 cursor-pointer"
+                >
+                  重置聚焦 [F]
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Center Reticle */}
       <div

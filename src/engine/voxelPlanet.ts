@@ -365,7 +365,21 @@ export interface SparseVoxelChunk {
   material: Uint8Array; // 11x11x11
   edited: boolean;
   dirty: boolean;
+  built: boolean;
+  isEmpty: boolean;
+  lastSeamMask: number;
   lastUsedFrame: number;
+}
+
+interface BrushOpRecord {
+  cx: number;
+  cy: number;
+  cz: number;
+  mode: 'carve' | 'build' | 'flatten';
+  radius: number;
+  strength: number;
+  materialId: MaterialId;
+  targetShellRadius: number;
 }
 
 interface AnalyticalContext {
@@ -402,9 +416,11 @@ export interface HighResStreamBatch {
   nativeDiscardRadius: number;
   pendingTotal: number;
   desiredKeys: Set<string>;
+  retainKeys: Set<string>;
   rebuiltMeshes: Array<{
     key: string;
     tier: 'globe' | 'hemi' | 'midOuter' | 'mid' | 'native';
+    scaleMult: number;
     mesh: ChunkMeshData;
   }>;
 }
@@ -453,6 +469,8 @@ export class VoxelPlanet {
   public nonUniformChunks: Uint8Array;
 
   public readonly sparseChunks = new Map<string, SparseVoxelChunk>();
+  private brushOps: BrushOpRecord[] = [];
+  private svRootBuilt = false;
   private streamFrame = 0;
   private genCtx!: AnalyticalContext;
 
@@ -791,6 +809,7 @@ export class VoxelPlanet {
     wy: number,
     wz: number,
     includeMicroDetail = true,
+    sampleScale = 0,
   ): { density: number; material: MaterialId } {
     const {
       cfg,
@@ -854,7 +873,8 @@ export class VoxelPlanet {
       const fineAmp = Math.min(0.24, detailLogScale * 0.032) * rScale;
       const fineWave = fbm3D(wxN * 1.85 + seedOffX, wyN * 1.85 + seedOffY, wzN * 1.85 + seedOffZ, 2) * fineAmp;
       targetRadius += fineWave;
-      if (detailLogScale > 2.2) {
+      // Only compute sub-voxel rock grain when sampling near native voxel scales (avoids coarse aliasing)
+      if (detailLogScale > 2.2 && (sampleScale === 0 || sampleScale <= this.nativeVoxelSize * 96)) {
         const blockWaveFreq = 1 / Math.max(this.nativeVoxelSize * 14, 1e-12);
         const bx = (((wx * blockWaveFreq) % 256) + 256) % 256;
         const by = (((wy * blockWaveFreq) % 256) + 256) % 256;
@@ -1081,6 +1101,8 @@ export class VoxelPlanet {
     this.seedConfig = cfg;
     this.updateBoundsForRadius(cfg.radius, cfg.voxelRadius);
     this.sparseChunks.clear();
+    this.brushOps = [];
+    this.svRootBuilt = false;
     this.genCtx = this.buildAnalyticalContext(cfg);
     this.lakeBasinCenters = this.genCtx.craters
       .slice(0, 3)
@@ -1162,6 +1184,8 @@ export class VoxelPlanet {
     this.seedConfig = cfg;
     this.updateBoundsForRadius(cfg.radius, cfg.voxelRadius);
     this.sparseChunks.clear();
+    this.brushOps = [];
+    this.svRootBuilt = false;
     this.genCtx = this.buildAnalyticalContext(cfg);
     this.lakeBasinCenters = this.genCtx.craters
       .slice(0, 3)
@@ -1289,6 +1313,8 @@ export class VoxelPlanet {
     this.voxelSize = (this.worldHalf * 2) / this.cellsPerAxis;
     this.genCtx = this.buildAnalyticalContext(this.seedConfig);
     this.sparseChunks.clear();
+    this.brushOps = [];
+    this.svRootBuilt = false;
     if (snapshot.editedChunks) {
       for (const sc of snapshot.editedChunks) {
         const stepSize = this.nativeVoxelSize * sc.scaleMult;
@@ -1307,6 +1333,9 @@ export class VoxelPlanet {
           material: new Uint8Array(sc.material),
           edited: true,
           dirty: true,
+          built: true,
+          isEmpty: false,
+          lastSeamMask: -1,
           lastUsedFrame: this.streamFrame,
         });
       }
@@ -1897,124 +1926,56 @@ export class VoxelPlanet {
         (scMaxX - scMinX + 1) * (scMaxY - scMinY + 1) * (scMaxZ - scMinZ + 1);
 
       const applyBrushToChunk = (chunk: SparseVoxelChunk) => {
-        const step = chunk.stepSize;
-        const cMinWX = chunk.originX - SPARSE_PAD * step;
-        const cMaxWX = chunk.originX + (CHUNK_CELLS + SPARSE_PAD) * step;
-        const cMinWY = chunk.originY - SPARSE_PAD * step;
-        const cMaxWY = chunk.originY + (CHUNK_CELLS + SPARSE_PAD) * step;
-        const cMinWZ = chunk.originZ - SPARSE_PAD * step;
-        const cMaxWZ = chunk.originZ + (CHUNK_CELLS + SPARSE_PAD) * step;
-
-        if (
-          cx + safeRad < cMinWX ||
-          cx - safeRad > cMaxWX ||
-          cy + safeRad < cMinWY ||
-          cy - safeRad > cMaxWY ||
-          cz + safeRad < cMinWZ ||
-          cz - safeRad > cMaxWZ
-        ) {
-          return;
-        }
-
-        const localCopy =
-          mode === 'smooth' ? new Float32Array(chunk.density) : null;
-        let touched = false;
-        const strengthScale = Math.max(step * 2.2, Math.min(rScale, safeRad * 1.4));
-
-        for (let lz = 0; lz < SPARSE_N; lz++) {
-          const wz = chunk.originZ + (lz - SPARSE_PAD) * step;
-          for (let ly = 0; ly < SPARSE_N; ly++) {
-            const wy = chunk.originY + (ly - SPARSE_PAD) * step;
-            for (let lx = 0; lx < SPARSE_N; lx++) {
-              const wx = chunk.originX + (lx - SPARSE_PAD) * step;
-              const dist = Math.hypot(wx - cx, wy - cy, wz - cz);
-              if (dist >= safeRad) continue;
-
-              const falloff = 1 - smoothstep(0, safeRad, dist);
-              const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
-              const prev = chunk.density[idx];
-              let next = prev;
-
-              if (mode === 'carve') {
-                next = Math.max(
-                  -4.5 * rScale,
-                  prev - strength * strengthScale * falloff,
-                );
-                if (next <= 0) chunk.material[idx] = MaterialId.Air;
-              } else if (mode === 'build') {
-                next = Math.min(
-                  4.5 * rScale,
-                  prev + strength * strengthScale * falloff,
-                );
-                if (next > -0.25 * step && materialId !== MaterialId.Air) {
-                  chunk.material[idx] = materialId;
-                }
-              } else if (mode === 'flatten') {
-                const vr = Math.hypot(wx, wy, wz);
-                const desired = targetShellRadius - vr;
-                const blend = clamp(falloff * strength * 0.65, 0, 1);
-                next = prev + (desired - prev) * blend;
-                if (next > 0 && chunk.material[idx] === MaterialId.Air) {
-                  chunk.material[idx] = materialId;
-                } else if (next <= 0) {
-                  chunk.material[idx] = MaterialId.Air;
-                }
-              } else if (mode === 'smooth' && localCopy) {
-                if (
-                  lx > 0 &&
-                  lx < SPARSE_N - 1 &&
-                  ly > 0 &&
-                  ly < SPARSE_N - 1 &&
-                  lz > 0 &&
-                  lz < SPARSE_N - 1
-                ) {
-                  const avg =
-                    (localCopy[idx] * 2 +
-                      localCopy[idx - 1] +
-                      localCopy[idx + 1] +
-                      localCopy[idx - SPARSE_NY] +
-                      localCopy[idx + SPARSE_NY] +
-                      localCopy[idx - SPARSE_NZ] +
-                      localCopy[idx + SPARSE_NZ]) /
-                    8;
-                  const blend = clamp(falloff * strength * 0.55, 0, 1);
-                  next = prev + (avg - prev) * blend;
-                  if (next > 0 && chunk.material[idx] === MaterialId.Air) {
-                    chunk.material[idx] = MaterialId.Stone;
-                  } else if (next <= 0) {
-                    chunk.material[idx] = MaterialId.Air;
-                  }
-                }
-              }
-
-              if (next !== prev) {
-                chunk.density[idx] = next;
-                deltaVolume += next - prev;
-                touched = true;
-              }
-            }
-          }
-        }
-
-        if (touched) {
+        const didEdit = this.applyBrushOpToSparseChunk(chunk, {
+          cx,
+          cy,
+          cz,
+          mode: mode === 'smooth' ? 'flatten' : mode,
+          radius: safeRad,
+          strength,
+          materialId,
+          targetShellRadius,
+        }, mode === 'smooth');
+        if (didEdit) {
+          deltaVolume += 0.001;
           chunk.edited = true;
           chunk.dirty = true;
+          chunk.built = true;
+          chunk.isEmpty = false;
         }
       };
+
+      // Update every already-resident chunk across all octree scales in place
+      for (const chunk of this.sparseChunks.values()) {
+        applyBrushToChunk(chunk);
+      }
 
       if (totalTouched <= 125) {
         for (let scz = scMinZ; scz <= scMaxZ; scz++) {
           for (let scy = scMinY; scy <= scMaxY; scy++) {
             for (let scx = scMinX; scx <= scMaxX; scx++) {
-              const chunk = this.getOrCreateSparseChunk(scx, scy, scz, 1);
-              applyBrushToChunk(chunk);
+              const key = `1:${scx},${scy},${scz}`;
+              if (!this.sparseChunks.has(key)) {
+                const chunk = this.getOrCreateSparseChunk(scx, scy, scz, 1);
+                applyBrushToChunk(chunk);
+              }
             }
           }
         }
-      } else {
-        for (const chunk of this.sparseChunks.values()) {
-          applyBrushToChunk(chunk);
+      } else if (mode !== 'smooth') {
+        if (this.brushOps.length >= 512) {
+          this.brushOps.shift();
         }
+        this.brushOps.push({
+          cx,
+          cy,
+          cz,
+          mode,
+          radius: safeRad,
+          strength,
+          materialId,
+          targetShellRadius,
+        });
       }
     }
 
@@ -2608,6 +2569,112 @@ export class VoxelPlanet {
     };
   }
 
+  private applyBrushOpToSparseChunk(
+    chunk: SparseVoxelChunk,
+    op: BrushOpRecord,
+    isSmooth = false,
+  ): boolean {
+    const step = chunk.stepSize;
+    const safeRad = Math.max(op.radius, step * 0.75);
+    const rScale = this.baseRadius / 13.0;
+    const cMinWX = chunk.originX - SPARSE_PAD * step;
+    const cMaxWX = chunk.originX + (CHUNK_CELLS + SPARSE_PAD) * step;
+    const cMinWY = chunk.originY - SPARSE_PAD * step;
+    const cMaxWY = chunk.originY + (CHUNK_CELLS + SPARSE_PAD) * step;
+    const cMinWZ = chunk.originZ - SPARSE_PAD * step;
+    const cMaxWZ = chunk.originZ + (CHUNK_CELLS + SPARSE_PAD) * step;
+
+    if (
+      op.cx + safeRad < cMinWX ||
+      op.cx - safeRad > cMaxWX ||
+      op.cy + safeRad < cMinWY ||
+      op.cy - safeRad > cMaxWY ||
+      op.cz + safeRad < cMinWZ ||
+      op.cz - safeRad > cMaxWZ
+    ) {
+      return false;
+    }
+
+    const localCopy = isSmooth ? new Float32Array(chunk.density) : null;
+    let touched = false;
+    const strengthScale = Math.max(step * 2.2, Math.min(rScale, safeRad * 1.4));
+
+    for (let lz = 0; lz < SPARSE_N; lz++) {
+      const wz = chunk.originZ + (lz - SPARSE_PAD) * step;
+      for (let ly = 0; ly < SPARSE_N; ly++) {
+        const wy = chunk.originY + (ly - SPARSE_PAD) * step;
+        for (let lx = 0; lx < SPARSE_N; lx++) {
+          const wx = chunk.originX + (lx - SPARSE_PAD) * step;
+          const dist = Math.hypot(wx - op.cx, wy - op.cy, wz - op.cz);
+          if (dist >= safeRad) continue;
+
+          const falloff = 1 - smoothstep(0, safeRad, dist);
+          const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
+          const prev = chunk.density[idx];
+          let next = prev;
+
+          if (isSmooth && localCopy) {
+            if (
+              lx > 0 &&
+              lx < SPARSE_N - 1 &&
+              ly > 0 &&
+              ly < SPARSE_N - 1 &&
+              lz > 0 &&
+              lz < SPARSE_N - 1
+            ) {
+              const avg =
+                (localCopy[idx] * 2 +
+                  localCopy[idx - 1] +
+                  localCopy[idx + 1] +
+                  localCopy[idx - SPARSE_NY] +
+                  localCopy[idx + SPARSE_NY] +
+                  localCopy[idx - SPARSE_NZ] +
+                  localCopy[idx + SPARSE_NZ]) /
+                8;
+              const blend = clamp(falloff * op.strength * 0.55, 0, 1);
+              next = prev + (avg - prev) * blend;
+              if (next > 0 && chunk.material[idx] === MaterialId.Air) {
+                chunk.material[idx] = MaterialId.Stone;
+              } else if (next <= 0) {
+                chunk.material[idx] = MaterialId.Air;
+              }
+            }
+          } else if (op.mode === 'carve') {
+            next = Math.max(
+              -4.5 * rScale,
+              prev - op.strength * strengthScale * falloff,
+            );
+            if (next <= 0) chunk.material[idx] = MaterialId.Air;
+          } else if (op.mode === 'build') {
+            next = Math.min(
+              4.5 * rScale,
+              prev + op.strength * strengthScale * falloff,
+            );
+            if (next > -0.25 * step && op.materialId !== MaterialId.Air) {
+              chunk.material[idx] = op.materialId;
+            }
+          } else if (op.mode === 'flatten') {
+            const vr = Math.hypot(wx, wy, wz);
+            const desired = op.targetShellRadius - vr;
+            const blend = clamp(falloff * op.strength * 0.65, 0, 1);
+            next = prev + (desired - prev) * blend;
+            if (next > 0 && chunk.material[idx] === MaterialId.Air) {
+              chunk.material[idx] = op.materialId;
+            } else if (next <= 0) {
+              chunk.material[idx] = MaterialId.Air;
+            }
+          }
+
+          if (next !== prev) {
+            chunk.density[idx] = next;
+            touched = true;
+          }
+        }
+      }
+    }
+    return touched;
+  }
+
   public getOrCreateSparseChunk(
     cx: number,
     cy: number,
@@ -2633,7 +2700,6 @@ export class VoxelPlanet {
 
     const { minEvalR, maxSurfR, rScale } = this.getRadialEvalBounds();
     const edgeClip = this.worldHalf * 0.94;
-    const minExtent = Math.min(originX, originY, originZ) - SPARSE_PAD * stepSize;
     const maxExtent = Math.max(originX, originY, originZ) + (CHUNK_CELLS + SPARSE_PAD) * stepSize;
     const centerR = Math.hypot(
       originX + chunkSpan * 0.5,
@@ -2700,7 +2766,7 @@ export class VoxelPlanet {
               material[idx] =
                 r < this.baseRadius * 0.49 ? MaterialId.Basalt : MaterialId.Stone;
             } else {
-              const res = this.evalAnalyticalAt(wx, wy, wz, true);
+              const res = this.evalAnalyticalAt(wx, wy, wz, true, stepSize);
               density[idx] = res.density;
               material[idx] = res.material;
             }
@@ -2708,7 +2774,6 @@ export class VoxelPlanet {
         }
       }
     }
-    void minExtent;
 
     const chunk: SparseVoxelChunk = {
       key,
@@ -2724,8 +2789,18 @@ export class VoxelPlanet {
       material,
       edited: false,
       dirty: true,
+      built: false,
+      isEmpty: false,
+      lastSeamMask: -1,
       lastUsedFrame: this.streamFrame,
     };
+
+    if (this.brushOps.length > 0) {
+      for (let i = 0; i < this.brushOps.length; i++) {
+        this.applyBrushOpToSparseChunk(chunk, this.brushOps[i], false);
+      }
+    }
+
     this.sparseChunks.set(key, chunk);
     return chunk;
   }
@@ -2754,6 +2829,7 @@ export class VoxelPlanet {
   public extractSparseChunkMesh(
     chunk: SparseVoxelChunk,
     blocky: boolean,
+    lodSeamMask = 0,
   ): ChunkMeshData {
     const dArr = chunk.density;
     const mArr = chunk.material;
@@ -2768,11 +2844,16 @@ export class VoxelPlanet {
       if (hasSolid && hasAir) break;
     }
     if (!hasSolid || !hasAir) {
+      chunk.isEmpty = true;
+      chunk.dirty = false;
+      chunk.built = true;
+      chunk.lastSeamMask = lodSeamMask;
       return {
         cx: chunk.cx,
         cy: chunk.cy,
         cz: chunk.cz,
         lod: 0,
+        origin: [chunk.originX, chunk.originY, chunk.originZ],
         positions: new Float32Array(0),
         normals: new Float32Array(0),
         colors: new Float32Array(0),
@@ -2900,7 +2981,22 @@ export class VoxelPlanet {
             for (let f = 0; f < 6; f++) {
               const face = FACES[f];
               const [nx, ny, nz] = face.n;
-              if (isBlockSolid(px + nx, py + ny, pz + nz)) continue;
+              if (isBlockSolid(px + nx, py + ny, pz + nz)) {
+                const isBoundaryFace =
+                  (f === 0 && lx === CHUNK_CELLS - 1) ||
+                  (f === 1 && lx === 0) ||
+                  (f === 2 && ly === CHUNK_CELLS - 1) ||
+                  (f === 3 && ly === 0) ||
+                  (f === 4 && lz === CHUNK_CELLS - 1) ||
+                  (f === 5 && lz === 0);
+                if (!((lodSeamMask & (1 << f)) !== 0 && isBoundaryFace)) {
+                  continue;
+                }
+                const baseIdx = px + py * SPARSE_NY + pz * SPARSE_NZ;
+                if (Math.abs(dArr[baseIdx]) > stepSize * 3.0) {
+                  continue;
+                }
+              }
               if (vCount + 6 > maxVerts) break;
 
               const aoVals = [1, 1, 1, 1];
@@ -3160,11 +3256,89 @@ export class VoxelPlanet {
                 this.scratchUv[u2 + 1] = 0.5;
                 vCount++;
               }
+
+              // Emit narrow inward T-junction skirts along chunk boundary edges bordering a different LOD
+              if (lodSeamMask !== 0 && vCount >= 3 && vCount + 6 <= maxVerts) {
+                const chunkSpan = CHUNK_CELLS * stepSize;
+                const eps = stepSize * 1e-4;
+                const triBase = (vCount - 3) * 3;
+                const skirtDepth = stepSize * 0.55;
+                for (let eIdxPair = 0; eIdxPair < 3; eIdxPair++) {
+                  if (vCount + 6 > maxVerts) break;
+                  const iA = triBase + eIdxPair * 3;
+                  const iB = triBase + ((eIdxPair + 1) % 3) * 3;
+                  const ax = this.scratchPos[iA];
+                  const ay = this.scratchPos[iA + 1];
+                  const az = this.scratchPos[iA + 2];
+                  const bx = this.scratchPos[iB];
+                  const by = this.scratchPos[iB + 1];
+                  const bz = this.scratchPos[iB + 2];
+                  const onSeamBoundary =
+                    ((lodSeamMask & 1) !== 0 && Math.abs(ax - chunkSpan) < eps && Math.abs(bx - chunkSpan) < eps) ||
+                    ((lodSeamMask & 2) !== 0 && Math.abs(ax) < eps && Math.abs(bx) < eps) ||
+                    ((lodSeamMask & 4) !== 0 && Math.abs(ay - chunkSpan) < eps && Math.abs(by - chunkSpan) < eps) ||
+                    ((lodSeamMask & 8) !== 0 && Math.abs(ay) < eps && Math.abs(by) < eps) ||
+                    ((lodSeamMask & 16) !== 0 && Math.abs(az - chunkSpan) < eps && Math.abs(bz - chunkSpan) < eps) ||
+                    ((lodSeamMask & 32) !== 0 && Math.abs(az) < eps && Math.abs(bz) < eps);
+                  if (!onSeamBoundary) continue;
+
+                  const nax = this.scratchNorm[iA];
+                  const nay = this.scratchNorm[iA + 1];
+                  const naz = this.scratchNorm[iA + 2];
+                  const nbx = this.scratchNorm[iB];
+                  const nby = this.scratchNorm[iB + 1];
+                  const nbz = this.scratchNorm[iB + 2];
+
+                  const axIn = ax - nax * skirtDepth;
+                  const ayIn = ay - nay * skirtDepth;
+                  const azIn = az - naz * skirtDepth;
+                  const bxIn = bx - nbx * skirtDepth;
+                  const byIn = by - nby * skirtDepth;
+                  const bzIn = bz - nbz * skirtDepth;
+
+                  const pushSkirtVert = (
+                    pxv: number,
+                    pyv: number,
+                    pzv: number,
+                    srcIdx: number,
+                  ) => {
+                    const p3 = vCount * 3;
+                    const u2 = vCount * 2;
+                    this.scratchPos[p3] = pxv;
+                    this.scratchPos[p3 + 1] = pyv;
+                    this.scratchPos[p3 + 2] = pzv;
+                    this.scratchNorm[p3] = this.scratchNorm[srcIdx];
+                    this.scratchNorm[p3 + 1] = this.scratchNorm[srcIdx + 1];
+                    this.scratchNorm[p3 + 2] = this.scratchNorm[srcIdx + 2];
+                    this.scratchCol[p3] = this.scratchCol[srcIdx];
+                    this.scratchCol[p3 + 1] = this.scratchCol[srcIdx + 1];
+                    this.scratchCol[p3 + 2] = this.scratchCol[srcIdx + 2];
+                    this.scratchMat[p3] = this.scratchMat[srcIdx];
+                    this.scratchMat[p3 + 1] = this.scratchMat[srcIdx + 1];
+                    this.scratchMat[p3 + 2] = this.scratchMat[srcIdx + 2];
+                    this.scratchUv[u2] = 0.5;
+                    this.scratchUv[u2 + 1] = 0.5;
+                    vCount++;
+                  };
+
+                  pushSkirtVert(ax, ay, az, iA);
+                  pushSkirtVert(bx, by, bz, iB);
+                  pushSkirtVert(bxIn, byIn, bzIn, iB);
+                  pushSkirtVert(ax, ay, az, iA);
+                  pushSkirtVert(bxIn, byIn, bzIn, iB);
+                  pushSkirtVert(axIn, ayIn, azIn, iA);
+                }
+              }
             }
           }
         }
       }
     }
+
+    chunk.isEmpty = vCount === 0;
+    chunk.dirty = false;
+    chunk.built = true;
+    chunk.lastSeamMask = lodSeamMask;
 
     return {
       cx: chunk.cx,
@@ -3182,92 +3356,9 @@ export class VoxelPlanet {
   }
 
   /**
-   * Sparse Voxel Octree (SVO) spatial query at chunk scale `span`, pruning uniform deep-core,
-   * outer-space, and out-of-cone octants in O(1) before emitting surface-intersecting leaf bricks.
-   */
-  private collectOctreeChunksAtScale(
-    span: number,
-    minEvalR: number,
-    maxSurfR: number,
-    focusDir: [number, number, number],
-    dotMin: number,
-    dotMax: number,
-    out: Array<{ cx: number; cy: number; cz: number; cwx: number; cwy: number; cwz: number; dot: number }>,
-  ): void {
-    const bound = Math.ceil((maxSurfR + span * 1.15) / span);
-    let treeSize = 2;
-    while (treeSize < bound * 2) treeSize <<= 1;
-    const halfTree = treeSize >> 1;
-    const minRBound = Math.max(0, minEvalR - span * 1.05);
-    const maxRBound = maxSurfR + span * 1.05;
-    const fx = focusDir[0];
-    const fy = focusDir[1];
-    const fz = focusDir[2];
-
-    const visit = (cx0: number, cy0: number, cz0: number, size: number) => {
-      const minX = cx0 * span;
-      const maxX = (cx0 + size) * span;
-      const minY = cy0 * span;
-      const maxY = (cy0 + size) * span;
-      const minZ = cz0 * span;
-      const maxZ = (cz0 + size) * span;
-
-      const clX = minX > 0 ? minX : maxX < 0 ? maxX : 0;
-      const clY = minY > 0 ? minY : maxY < 0 ? maxY : 0;
-      const clZ = minZ > 0 ? minZ : maxZ < 0 ? maxZ : 0;
-      if (clX * clX + clY * clY + clZ * clZ > maxRBound * maxRBound) return;
-
-      const farX = Math.max(Math.abs(minX), Math.abs(maxX));
-      const farY = Math.max(Math.abs(minY), Math.abs(maxY));
-      const farZ = Math.max(Math.abs(minZ), Math.abs(maxZ));
-      if (farX * farX + farY * farY + farZ * farZ < minRBound * minRBound) return;
-
-      const halfWorld = size * span * 0.5;
-      const cwx = minX + halfWorld;
-      const cwy = minY + halfWorld;
-      const cwz = minZ + halfWorld;
-      const ncR = Math.hypot(cwx, cwy, cwz);
-      const nodeHalfDiag = halfWorld * 1.7320508;
-
-      if (ncR > nodeHalfDiag + 1e-5) {
-        const centerDot = (cwx * fx + cwy * fy + cwz * fz) / ncR;
-        if (dotMin > -0.999 || dotMax < 0.999) {
-          const sinA = Math.min(1, nodeHalfDiag / ncR);
-          const cosA = Math.sqrt(Math.max(0, 1 - sinA * sinA));
-          const sinC = Math.sqrt(Math.max(0, 1 - centerDot * centerDot));
-          const boxMaxDot = centerDot > cosA ? 1.0 : centerDot * cosA + sinC * sinA;
-          const boxMinDot = centerDot < -cosA ? -1.0 : centerDot * cosA - sinC * sinA;
-          if (boxMaxDot < dotMin || boxMinDot > dotMax) return;
-        }
-        if (size === 1) {
-          out.push({ cx: cx0, cy: cy0, cz: cz0, cwx, cwy, cwz, dot: centerDot });
-          return;
-        }
-      } else if (size === 1) {
-        if (ncR < 1e-5) return;
-        const centerDot = (cwx * fx + cwy * fy + cwz * fz) / ncR;
-        if (centerDot >= dotMin && centerDot <= dotMax) {
-          out.push({ cx: cx0, cy: cy0, cz: cz0, cwx, cwy, cwz, dot: centerDot });
-        }
-        return;
-      }
-
-      const half = size >> 1;
-      for (let dz = 0; dz < 2; dz++) {
-        for (let dy = 0; dy < 2; dy++) {
-          for (let dx = 0; dx < 2; dx++) {
-            visit(cx0 + dx * half, cy0 + dy * half, cz0 + dz * half, half);
-          }
-        }
-      }
-    };
-
-    visit(-halfTree, -halfTree, -halfTree, treeSize);
-  }
-
-  /**
-   * Streams 360° full-sphere sparse voxel octree bricks (globe + horizon hemi +
-   * dual-cascade altitude-adaptive mid tiers + 1:1 native leaf blocks + edited chunks).
+   * Streams a gapless 360° dyadic power-of-2 Sparse Voxel Octree partition with atomic
+   * parent/child swap (eliminating LOD overlap, Z-fighting, and holes across 1:1 native
+   * up to >1,000,000,000³).
    */
   public streamHighResAround(
     fx: number,
@@ -3276,10 +3367,16 @@ export class VoxelPlanet {
     renderMode: TerrainRenderMode,
     maxBuildPerFrame = 28,
     camDistToFocus?: number,
+    camPosArg?: [number, number, number],
+    camFwdArg?: [number, number, number],
+    lodOptions?: { lodMode?: 'auto' | 0 | 1 | 2; lod0Dist?: number },
   ): HighResStreamBatch {
     this.streamFrame++;
     const desiredKeys = new Set<string>();
+    const retainKeys = new Set<string>();
     const rebuiltMeshes: HighResStreamBatch['rebuiltMeshes'] = [];
+    const lodMode = lodOptions?.lodMode ?? 'auto';
+    const lod0DistOpt = lodOptions?.lod0Dist;
 
     if (!this.isHighResStreaming) {
       return {
@@ -3296,6 +3393,7 @@ export class VoxelPlanet {
         nativeDiscardRadius: 0,
         pendingTotal: 0,
         desiredKeys,
+        retainKeys,
         rebuiltMeshes,
       };
     }
@@ -3314,37 +3412,18 @@ export class VoxelPlanet {
           ]
         : [fx, fy, fz];
 
-    const wantQueue: Array<{
-      cx: number;
-      cy: number;
-      cz: number;
-      scaleMult: number;
-      tier: 'globe' | 'hemi' | 'midOuter' | 'mid' | 'native';
-      prio: number;
-      inCore?: boolean;
-    }> = [];
-
-    // Always retain & rebuild all user-edited chunks regardless of camera position
-    for (const chunk of this.sparseChunks.values()) {
-      if (!chunk.edited) continue;
-      desiredKeys.add(chunk.key);
-      chunk.lastUsedFrame = this.streamFrame;
-      if (chunk.dirty) {
-        wantQueue.push({
-          cx: chunk.cx,
-          cy: chunk.cy,
-          cz: chunk.cz,
-          scaleMult: chunk.scaleMult,
-          tier: 'native',
-          prio: -100,
-        });
-      }
-    }
-
     // Small custom-resolution planet (voxelRadius < 18): replace entire macro planet at 1:1
     if (this.voxelRadius < 18) {
       const cBound = Math.ceil(this.worldHalf / nativeSpan);
+      const wantQueue: Array<{
+        cx: number;
+        cy: number;
+        cz: number;
+        prio: number;
+        chunk?: SparseVoxelChunk;
+      }> = [];
       let pending = 0;
+
       for (let cz = -cBound; cz < cBound; cz++) {
         for (let cy = -cBound; cy < cBound; cy++) {
           for (let cx = -cBound; cx < cBound; cx++) {
@@ -3355,8 +3434,9 @@ export class VoxelPlanet {
             if (cr > this.worldHalf + nativeSpan) continue;
             const key = `1:${cx},${cy},${cz}`;
             desiredKeys.add(key);
+            retainKeys.add(key);
             const existing = this.sparseChunks.get(key);
-            if (!existing || existing.dirty) {
+            if (!existing || !existing.built || existing.dirty || existing.lastSeamMask !== 0) {
               pending++;
               const dSq =
                 (cwx - surfF[0]) * (cwx - surfF[0]) +
@@ -3366,9 +3446,8 @@ export class VoxelPlanet {
                 cx,
                 cy,
                 cz,
-                scaleMult: 1,
-                tier: 'native',
                 prio: (existing?.edited ? 0 : 1e4) + dSq,
+                chunk: existing,
               });
             } else {
               existing.lastUsedFrame = this.streamFrame;
@@ -3382,21 +3461,25 @@ export class VoxelPlanet {
         const lim = Math.min(maxBuildPerFrame, wantQueue.length);
         for (let i = 0; i < lim; i++) {
           const w = wantQueue[i];
-          const ch = this.getOrCreateSparseChunk(w.cx, w.cy, w.cz, 1);
-          ch.dirty = false;
+          const ch = w.chunk ?? this.getOrCreateSparseChunk(w.cx, w.cy, w.cz, 1);
           rebuiltMeshes.push({
             key: ch.key,
             tier: 'native',
-            mesh: this.extractSparseChunkMesh(ch, blocky),
+            scaleMult: 1,
+            mesh: this.extractSparseChunkMesh(ch, blocky, 0),
           });
           pending = Math.max(0, pending - 1);
         }
       }
-      this.evictUnusedSparseChunks(340);
+
+      if (pending === 0) {
+        this.svRootBuilt = true;
+      }
+      this.evictUnusedSparseChunks(340, retainKeys);
       return {
         active: true,
-        hideMacro: pending === 0,
-        globeBuiltComplete: pending === 0,
+        hideMacro: this.svRootBuilt,
+        globeBuiltComplete: this.svRootBuilt,
         hemiCenter: [surfF[0], surfF[1], surfF[2]],
         hemiDiscardRadius: 0,
         midOuterCenter: [surfF[0], surfF[1], surfF[2]],
@@ -3404,372 +3487,722 @@ export class VoxelPlanet {
         midCenter: [surfF[0], surfF[1], surfF[2]],
         midDiscardRadius: 0,
         nativeCenter: [surfF[0], surfF[1], surfF[2]],
-        nativeDiscardRadius: pending === 0 ? this.worldHalf * 2.0 : 0,
+        nativeDiscardRadius: this.svRootBuilt ? this.worldHalf * 2.0 : 0,
         pendingTotal: pending,
         desiredKeys,
+        retainKeys,
         rebuiltMeshes,
       };
     }
 
-    // Large / Ultra-high-res 360° sparse octree planet (up to >1,000,000,000³+)
-    const estCamR =
-      camDistToFocus !== undefined
-        ? Math.max(this.baseRadius * 1.00001, this.baseRadius + camDistToFocus * 0.92)
-        : this.baseRadius * 2.35;
-    const horizonCos = clamp(this.baseRadius / estCamR, 0.12, 0.96);
-    const minHemiDot = Math.max(-0.06, horizonCos - 0.32);
-    const capFrac = clamp((1 - minHemiDot) * 0.5, 0.18, 0.54);
-    const targetHemiBlocks = clamp(
-      Math.round(CHUNK_CELLS * Math.sqrt(420 / (capFrac * 4 * Math.PI))),
-      68,
-      136,
+    // Dyadic SVO streaming for high-res & ultra-high-res (>1,000,000,000³+) planets
+    const { minEvalR, maxSurfR, rScale } = this.getRadialEvalBounds();
+    const effectiveCamDist = camDistToFocus ?? this.baseRadius * 2.0;
+    const camPosX = camPosArg ? camPosArg[0] : surfF[0] + focusDir[0] * effectiveCamDist;
+    const camPosY = camPosArg ? camPosArg[1] : surfF[1] + focusDir[1] * effectiveCamDist;
+    const camPosZ = camPosArg ? camPosArg[2] : surfF[2] + focusDir[2] * effectiveCamDist;
+
+    let fwdX = camFwdArg ? camFwdArg[0] : -focusDir[0];
+    let fwdY = camFwdArg ? camFwdArg[1] : -focusDir[1];
+    let fwdZ = camFwdArg ? camFwdArg[2] : -focusDir[2];
+    const fwdLen = Math.hypot(fwdX, fwdY, fwdZ);
+    if (fwdLen > 1e-6) {
+      fwdX /= fwdLen;
+      fwdY /= fwdLen;
+      fwdZ /= fwdLen;
+    } else {
+      fwdX = -focusDir[0];
+      fwdY = -focusDir[1];
+      fwdZ = -focusDir[2];
+    }
+
+    const kRoot = Math.max(0, Math.round(Math.log2(Math.max(1, this.voxelRadius / 34))));
+    let kTop = kRoot;
+    while (nativeSpan * Math.pow(2, kTop) < maxSurfR * 1.12) {
+      kTop++;
+    }
+
+    const levelScaleMult = new Array<number>(kTop + 1);
+    const levelSpan = new Array<number>(kTop + 1);
+    for (let k = 0; k <= kTop; k++) {
+      const sm = Math.pow(2, k);
+      levelScaleMult[k] = sm;
+      levelSpan[k] = nativeSpan * sm;
+    }
+
+    const tierForLevel = (
+      k: number,
+    ): 'globe' | 'hemi' | 'midOuter' | 'mid' | 'native' => {
+      if (k === 0) return 'native';
+      if (k >= kRoot) return 'globe';
+      if (k === kRoot - 1) return 'hemi';
+      if (kRoot - 1 > 3 && k >= Math.floor((kRoot - 1) * 0.55)) return 'midOuter';
+      return 'mid';
+    };
+
+    const { cfg } = this.genCtx;
+    const minTerrainR = Math.max(
+      0,
+      cfg.radius -
+        (Math.abs(cfg.continentAmp) * 0.85 +
+          Math.abs(cfg.ridgeAmp) * 0.45 +
+          Math.abs(cfg.craterDepth) +
+          0.9) *
+          rScale,
     );
-    const hemiScaleMult = Math.max(1, Math.round(this.voxelRadius / targetHemiBlocks));
-    const hemiStep = this.nativeVoxelSize * hemiScaleMult;
-    const hemiSpan = CHUNK_CELLS * hemiStep;
-    const hemiHalfDiag = hemiSpan * 0.8660254;
-    const hemiCenter: [number, number, number] = [
-      focusDir[0] * this.baseRadius,
-      focusDir[1] * this.baseRadius,
-      focusDir[2] * this.baseRadius,
+    const minCrustR = Math.max(minTerrainR, cfg.radius * 0.68);
+    const camR = Math.hypot(camPosX, camPosY, camPosZ);
+    const cameraUnderground = camR < minCrustR + nativeSpan * 2 || fLen < minCrustR;
+    const blockReliefTol =
+      this.genCtx.detailLogScale > 2.2 ? this.nativeVoxelSize * 3.2 : 0;
+
+    const editedWorldBoxes: Array<{ minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number }> = [];
+    for (let i = 0; i < this.brushOps.length; i++) {
+      const op = this.brushOps[i];
+      const r = op.radius + nativeSpan * 0.5;
+      editedWorldBoxes.push({
+        minX: op.cx - r,
+        maxX: op.cx + r,
+        minY: op.cy - r,
+        maxY: op.cy + r,
+        minZ: op.cz - r,
+        maxZ: op.cz + r,
+      });
+    }
+    for (const c of this.sparseChunks.values()) {
+      if (!c.edited || c.scaleMult > 1) continue;
+      const span = CHUNK_CELLS * c.stepSize;
+      editedWorldBoxes.push({
+        minX: c.originX - this.nativeVoxelSize * 2,
+        maxX: c.originX + span + this.nativeVoxelSize * 2,
+        minY: c.originY - this.nativeVoxelSize * 2,
+        maxY: c.originY + span + this.nativeVoxelSize * 2,
+        minZ: c.originZ - this.nativeVoxelSize * 2,
+        maxZ: c.originZ + span + this.nativeVoxelSize * 2,
+      });
+    }
+
+    const boxIntersectsEdits = (
+      minX: number,
+      maxX: number,
+      minY: number,
+      maxY: number,
+      minZ: number,
+      maxZ: number,
+    ): boolean => {
+      for (let i = 0; i < editedWorldBoxes.length; i++) {
+        const b = editedWorldBoxes[i];
+        if (
+          maxX >= b.minX &&
+          minX <= b.maxX &&
+          maxY >= b.minY &&
+          minY <= b.maxY &&
+          maxZ >= b.minZ &&
+          minZ <= b.maxZ
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const boxMightContainSurface = (
+      k: number,
+      minX: number,
+      maxX: number,
+      minY: number,
+      maxY: number,
+      minZ: number,
+      maxZ: number,
+    ): boolean => {
+      const span = levelSpan[k];
+      const stepSize = span / CHUNK_CELLS;
+      const pad = stepSize * SPARSE_PAD;
+
+      const clX = minX > 0 ? minX : maxX < 0 ? maxX : 0;
+      const clY = minY > 0 ? minY : maxY < 0 ? maxY : 0;
+      const clZ = minZ > 0 ? minZ : maxZ < 0 ? maxZ : 0;
+      const rMinSq = clX * clX + clY * clY + clZ * clZ;
+      const maxRBound = maxSurfR + pad;
+      const hasEdits =
+        editedWorldBoxes.length > 0 &&
+        boxIntersectsEdits(minX - pad, maxX + pad, minY - pad, maxY + pad, minZ - pad, maxZ + pad);
+
+      if (!hasEdits && rMinSq > maxRBound * maxRBound) return false;
+
+      const farX = Math.max(Math.abs(minX), Math.abs(maxX));
+      const farY = Math.max(Math.abs(minY), Math.abs(maxY));
+      const farZ = Math.max(Math.abs(minZ), Math.abs(maxZ));
+      const qCx0 = camPosX < minX ? minX : camPosX > maxX ? maxX : camPosX;
+      const qCy0 = camPosY < minY ? minY : camPosY > maxY ? maxY : camPosY;
+      const qCz0 = camPosZ < minZ ? minZ : camPosZ > maxZ ? maxZ : camPosZ;
+      const nearCamBox =
+        Math.hypot(camPosX - qCx0, camPosY - qCy0, camPosZ - qCz0) < span * 2.5;
+
+      const useDeepCaves = cameraUnderground || nearCamBox;
+      const effectiveMinR = useDeepCaves ? minEvalR : minCrustR;
+      const minRBound = Math.max(0, effectiveMinR - pad);
+      if (!hasEdits && farX * farX + farY * farY + farZ * farZ < minRBound * minRBound) {
+        return false;
+      }
+
+      if (hasEdits || k > kRoot) return true;
+
+      const half = span * 0.5;
+      const cwx = minX + half;
+      const cwy = minY + half;
+      const cwz = minZ + half;
+
+      const pSpan = span + pad * 2;
+      const pHalfDiag = pSpan * 0.8660254;
+      const sphereSag = (0.28 * pSpan * pSpan) / Math.max(2 * this.baseRadius, 1);
+      const grainTol =
+        stepSize <= this.nativeVoxelSize * 96 ? blockReliefTol : 0;
+      const curvTol =
+        sphereSag + Math.min(0.20 * rScale, pSpan * 0.085) + grainTol + stepSize * 0.35;
+
+      const dCenter = this.evalAnalyticalAt(cwx, cwy, cwz, true, stepSize).density;
+      if (Math.abs(dCenter) > pHalfDiag * 1.45 + curvTol) {
+        return false;
+      }
+
+      const sMinX = minX - pad;
+      const sMaxX = maxX + pad;
+      const sMinY = minY - pad;
+      const sMaxY = maxY + pad;
+      const sMinZ = minZ - pad;
+      const sMaxZ = maxZ + pad;
+
+      let minD = dCenter;
+      let maxD = dCenter;
+      for (let dz = 0; dz <= 1; dz++) {
+        const pz = dz === 0 ? sMinZ : sMaxZ;
+        for (let dy = 0; dy <= 1; dy++) {
+          const py = dy === 0 ? sMinY : sMaxY;
+          for (let dx = 0; dx <= 1; dx++) {
+            const px = dx === 0 ? sMinX : sMaxX;
+            const dc = this.evalAnalyticalAt(px, py, pz, true, stepSize).density;
+            if (dc < minD) minD = dc;
+            if (dc > maxD) maxD = dc;
+            if (minD <= curvTol && maxD >= -curvTol) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    };
+
+    const isOrbitalView = effectiveCamDist >= this.baseRadius * 0.5;
+    const isForcedLod0 = lodMode === 0;
+    const minLeafK =
+      lodMode === 1
+        ? Math.min(kRoot, 1)
+        : lodMode === 2
+          ? Math.min(kRoot, 2)
+          : 0;
+
+    // For forced LOD 0: render full uniform smallest voxels across the visible planet (if <=180)
+    // or across the entire visible screen frustum (down to 1:1 native whenever <=360 voxels wide).
+    const frustumSpan = Math.max(effectiveCamDist, nativeSpan * 2) * 1.45;
+    const fullPlanetLod0 = isForcedLod0 && this.voxelRadius <= 180;
+    let uniformLod0TargetK = 0;
+    if (isForcedLod0 && !fullPlanetLod0) {
+      const blocksAcrossNative = frustumSpan / Math.max(this.nativeVoxelSize, 1e-12);
+      if (blocksAcrossNative > 360) {
+        const minStepFor280 = frustumSpan / 280;
+        while (
+          uniformLod0TargetK < kRoot &&
+          this.nativeVoxelSize * levelScaleMult[uniformLod0TargetK] < minStepFor280
+        ) {
+          uniformLod0TargetK++;
+        }
+      }
+    }
+    const effectiveMinK = isForcedLod0 ? uniformLod0TargetK : minLeafK;
+
+    const hemiDotThresh = isForcedLod0
+      ? fullPlanetLod0
+        ? -0.25
+        : effectiveCamDist > this.baseRadius * 0.9
+          ? -0.05
+          : 0.15
+      : effectiveCamDist > this.baseRadius * 0.9
+        ? 0.05
+        : isOrbitalView
+          ? 0.24
+          : 0.58;
+    const minFunnelSpan = isForcedLod0 ? 0 : effectiveCamDist * 0.001;
+    const hemiBlocksPerR =
+      kRoot > 0 ? this.voxelRadius / levelScaleMult[kRoot - 1] : this.voxelRadius;
+    const lod0Boost = clamp(
+      (lod0DistOpt ?? this.baseRadius * 2.8) / Math.max(this.baseRadius * 2.8, 1e-4),
+      1.0,
+      3.0,
+    );
+
+    interface TravNode {
+      k: number;
+      cx: number;
+      cy: number;
+      cz: number;
+      scaleMult: number;
+      key: string;
+      wantsSubdivide: boolean;
+      chunk: SparseVoxelChunk | undefined;
+      children: TravNode[] | null;
+    }
+
+    const wantBuildQueue: Array<{
+      cx: number;
+      cy: number;
+      cz: number;
+      scaleMult: number;
+      k: number;
+      prio: number;
+      existing?: SparseVoxelChunk;
+    }> = [];
+    const queuedBuildKeys = new Set<string>();
+
+    const shouldSubdivideNode = (
+      k: number,
+      minX: number,
+      maxX: number,
+      minY: number,
+      maxY: number,
+      minZ: number,
+      maxZ: number,
+    ): boolean => {
+      if (k <= effectiveMinK) return false;
+      if (k > kRoot) return true;
+
+      const span = levelSpan[k];
+      const half = span * 0.5;
+      const cwx = minX + half;
+      const cwy = minY + half;
+      const cwz = minZ + half;
+
+      const qCx = camPosX < minX ? minX : camPosX > maxX ? maxX : camPosX;
+      const qCy = camPosY < minY ? minY : camPosY > maxY ? maxY : camPosY;
+      const qCz = camPosZ < minZ ? minZ : camPosZ > maxZ ? maxZ : camPosZ;
+      const dCam = Math.hypot(camPosX - qCx, camPosY - qCy, camPosZ - qCz);
+
+      const qFx = surfF[0] < minX ? minX : surfF[0] > maxX ? maxX : surfF[0];
+      const qFy = surfF[1] < minY ? minY : surfF[1] > maxY ? maxY : surfF[1];
+      const qFz = surfF[2] < minZ ? minZ : surfF[2] > maxZ ? maxZ : surfF[2];
+      const dFocus = Math.hypot(surfF[0] - qFx, surfF[1] - qFy, surfF[2] - qFz);
+
+      const ncR = Math.hypot(cwx, cwy, cwz);
+      const nodeHalfDiag = span * 0.8660254;
+      let boxMaxDot = 1.0;
+      if (ncR > nodeHalfDiag + 1e-5) {
+        const centerDot = (cwx * focusDir[0] + cwy * focusDir[1] + cwz * focusDir[2]) / ncR;
+        const sinA = Math.min(1, nodeHalfDiag / ncR);
+        const cosA = Math.sqrt(Math.max(0, 1 - sinA * sinA));
+        const sinC = Math.sqrt(Math.max(0, 1 - centerDot * centerDot));
+        boxMaxDot = centerDot > cosA ? 1.0 : centerDot * cosA + sinC * sinA;
+      }
+
+      const toCamX = cwx - camPosX;
+      const toCamY = cwy - camPosY;
+      const toCamZ = cwz - camPosZ;
+      const toCamLen = Math.hypot(toCamX, toCamY, toCamZ);
+      const viewDirDot =
+        toCamLen > 1e-7
+          ? (toCamX * fwdX + toCamY * fwdY + toCamZ * fwdZ) / toCamLen
+          : 1.0;
+      const angPad = Math.min(0.45, nodeHalfDiag / Math.max(toCamLen, 1e-5));
+
+      if (isForcedLod0) {
+        if (fullPlanetLod0) {
+          // Moderate high-res (<=180): subdivide visible & close planet uniformly all the way to 1:1 native
+          const maxWorldCap = Math.max(lod0DistOpt ?? this.baseRadius * 3.0, this.baseRadius * 2.2);
+          return boxMaxDot >= hemiDotThresh || dCam <= maxWorldCap || viewDirDot > 0.25 - angPad;
+        }
+        // Ultra-high-res LOD 0: fill the ENTIRE visible viewport uniformly down to uniformLod0TargetK (0 = 1:1 native)
+        if (dFocus < span * 0.6) return true;
+        if (dCam < span * 0.85) return true;
+        const inFrustum = viewDirDot > 0.25 - angPad;
+        if (
+          inFrustum &&
+          (dFocus <= frustumSpan * 0.9 || dCam <= effectiveCamDist * 1.55)
+        ) {
+          return true;
+        }
+        if (k === kRoot && boxMaxDot >= hemiDotThresh) return true;
+        return false;
+      }
+
+      if (k === kRoot) {
+        return dCam < span * 2.8 || dFocus < span * 1.3 || boxMaxDot >= hemiDotThresh;
+      }
+
+      if (span <= minFunnelSpan) {
+        return false;
+      }
+
+      const inViewCone = viewDirDot > 0.35 || dCam < span * 0.72;
+
+      if (dFocus < span * 0.52) return true;
+      if (dCam < span * 0.72 && inViewCone) return true;
+      // Widen crisp near-native patch in auto mode during close-up surface inspection
+      if (
+        !isOrbitalView &&
+        k <= 5 &&
+        effectiveCamDist > nativeSpan * 8 &&
+        span >= effectiveCamDist * 0.072 &&
+        inViewCone &&
+        dFocus < effectiveCamDist * 0.42 * lod0Boost
+      ) {
+        return true;
+      }
+      if (
+        isOrbitalView &&
+        k === kRoot - 1 &&
+        hemiBlocksPerR <= 72 &&
+        boxMaxDot >= 0.93
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    const buildTravTree = (
+      k: number,
+      cx: number,
+      cy: number,
+      cz: number,
+    ): TravNode | null => {
+      const span = levelSpan[k];
+      const minX = cx * span;
+      const maxX = minX + span;
+      const minY = cy * span;
+      const maxY = minY + span;
+      const minZ = cz * span;
+      const maxZ = minZ + span;
+
+      if (!boxMightContainSurface(k, minX, maxX, minY, maxY, minZ, maxZ)) {
+        return null;
+      }
+
+      const scaleMult = levelScaleMult[k];
+      const key = `${scaleMult}:${cx},${cy},${cz}`;
+      const existing = k <= kRoot ? this.sparseChunks.get(key) : undefined;
+      if (existing) {
+        existing.lastUsedFrame = this.streamFrame;
+      }
+
+      const wantsSubdivide = shouldSubdivideNode(k, minX, maxX, minY, maxY, minZ, maxZ);
+      const half = span * 0.5;
+      const cwx = minX + half;
+      const cwy = minY + half;
+      const cwz = minZ + half;
+
+      const queueThisNode = () => {
+        if (k > kRoot) return;
+        if (queuedBuildKeys.has(key)) return;
+        if (!existing || !existing.built) {
+          queuedBuildKeys.add(key);
+          const dSq =
+            (cwx - surfF[0]) * (cwx - surfF[0]) +
+            (cwy - surfF[1]) * (cwy - surfF[1]) +
+            (cwz - surfF[2]) * (cwz - surfF[2]);
+          const rootPenalty = !this.svRootBuilt && k === kRoot ? 0 : 1e8;
+          const levelRank = (kRoot - k) * 1e7;
+          wantBuildQueue.push({
+            cx,
+            cy,
+            cz,
+            scaleMult,
+            k,
+            prio: existing?.edited ? -1000 : rootPenalty + levelRank + dSq,
+            existing,
+          });
+        }
+      };
+
+      if (!wantsSubdivide || k === 0) {
+        queueThisNode();
+        return {
+          k,
+          cx,
+          cy,
+          cz,
+          scaleMult,
+          key,
+          wantsSubdivide: false,
+          chunk: existing,
+          children: null,
+        };
+      }
+
+      // When k <= kRoot and parent chunk isn't built yet, queue parent first for seamless top-down fallback
+      if (k <= kRoot && (!existing || !existing.built)) {
+        queueThisNode();
+      }
+
+      const children: TravNode[] = [];
+      const cx2 = cx * 2;
+      const cy2 = cy * 2;
+      const cz2 = cz * 2;
+      for (let dz = 0; dz < 2; dz++) {
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const child = buildTravTree(k - 1, cx2 + dx, cy2 + dy, cz2 + dz);
+            if (child) children.push(child);
+          }
+        }
+      }
+
+      if (children.length === 0 && k <= kRoot) {
+        return {
+          k,
+          cx,
+          cy,
+          cz,
+          scaleMult,
+          key,
+          wantsSubdivide: false,
+          chunk: existing,
+          children: null,
+        };
+      }
+
+      return {
+        k,
+        cx,
+        cy,
+        cz,
+        scaleMult,
+        key,
+        wantsSubdivide: true,
+        chunk: existing,
+        children,
+      };
+    };
+
+    const roots: TravNode[] = [];
+    for (let dz = -1; dz <= 0; dz++) {
+      for (let dy = -1; dy <= 0; dy++) {
+        for (let dx = -1; dx <= 0; dx++) {
+          const rNode = buildTravTree(kTop, dx, dy, dz);
+          if (rNode) roots.push(rNode);
+        }
+      }
+    }
+
+    const totalPendingBuilds = wantBuildQueue.length;
+    if (wantBuildQueue.length > 0) {
+      wantBuildQueue.sort((a, b) => a.prio - b.prio);
+      const lim = Math.min(maxBuildPerFrame, wantBuildQueue.length);
+      for (let i = 0; i < lim; i++) {
+        const w = wantBuildQueue[i];
+        const ch = w.existing ?? this.getOrCreateSparseChunk(w.cx, w.cy, w.cz, w.scaleMult);
+        let hasSolid = false;
+        let hasAir = false;
+        const dArr = ch.density;
+        for (let j = 0; j < dArr.length; j++) {
+          if (dArr[j] > 0) hasSolid = true;
+          else hasAir = true;
+          if (hasSolid && hasAir) break;
+        }
+        ch.isEmpty = !hasSolid || !hasAir;
+        ch.built = true;
+        ch.lastUsedFrame = this.streamFrame;
+      }
+    }
+
+    // Refresh TravNode.chunk pointers after building & resolve non-overlapping leaf cut
+    interface ResolvedLeaf {
+      node: TravNode;
+      chunk: SparseVoxelChunk;
+      tier: 'globe' | 'hemi' | 'midOuter' | 'mid' | 'native';
+    }
+    const resolvedLeaves: ResolvedLeaf[] = [];
+
+    const resolveNodeInto = (node: TravNode, out: ResolvedLeaf[]): boolean => {
+      if (node.k <= kRoot && !node.chunk) {
+        node.chunk = this.sparseChunks.get(node.key);
+      }
+
+      if (!node.wantsSubdivide || node.k === 0 || !node.children) {
+        const ch = node.chunk;
+        if (ch && ch.built) {
+          retainKeys.add(ch.key);
+          if (!ch.isEmpty) {
+            out.push({ node, chunk: ch, tier: tierForLevel(node.k) });
+          }
+          return true;
+        }
+        return false;
+      }
+
+      const childOut: ResolvedLeaf[] = [];
+      let allCovered = true;
+      for (let i = 0; i < node.children.length; i++) {
+        if (!resolveNodeInto(node.children[i], childOut)) {
+          allCovered = false;
+        }
+      }
+
+      if (allCovered) {
+        for (let i = 0; i < childOut.length; i++) {
+          out.push(childOut[i]);
+        }
+        return true;
+      }
+
+      if (node.k > kRoot) {
+        for (let i = 0; i < childOut.length; i++) {
+          out.push(childOut[i]);
+        }
+        return false;
+      }
+
+      // Atomic fallback: keep built parent while waiting for incomplete children (keep built child meshes in retainKeys)
+      for (let i = 0; i < childOut.length; i++) {
+        retainKeys.add(childOut[i].chunk.key);
+      }
+      const ch = node.chunk;
+      if (ch && ch.built) {
+        retainKeys.add(ch.key);
+        if (!ch.isEmpty) {
+          out.push({ node, chunk: ch, tier: tierForLevel(node.k) });
+        }
+        return true;
+      }
+
+      return false;
+    };
+
+    let allRootCovered = true;
+    for (let i = 0; i < roots.length; i++) {
+      if (!resolveNodeInto(roots[i], resolvedLeaves)) {
+        allRootCovered = false;
+      }
+    }
+    if (allRootCovered) {
+      this.svRootBuilt = true;
+    }
+
+    // Build lookup maps for O(octreeDepth) 6-neighbor LOD seam detection across all scales
+    const leafMap = new Map<string, ResolvedLeaf>();
+    const splitNodes = new Set<string>();
+    for (let i = 0; i < resolvedLeaves.length; i++) {
+      const lf = resolvedLeaves[i];
+      desiredKeys.add(lf.chunk.key);
+      retainKeys.add(lf.chunk.key);
+      leafMap.set(lf.chunk.key, lf);
+
+      let ax = lf.node.cx;
+      let ay = lf.node.cy;
+      let az = lf.node.cz;
+      for (let ak = lf.node.k + 1; ak <= kRoot; ak++) {
+        ax = Math.floor(ax / 2);
+        ay = Math.floor(ay / 2);
+        az = Math.floor(az / 2);
+        splitNodes.add(`${levelScaleMult[ak]}:${ax},${ay},${az}`);
+      }
+    }
+
+    const SEAM_DIRS: ReadonlyArray<readonly [number, number, number]> = [
+      [1, 0, 0],
+      [-1, 0, 0],
+      [0, 1, 0],
+      [0, -1, 0],
+      [0, 0, 1],
+      [0, 0, -1],
     ];
 
-    const { minEvalR, maxSurfR } = this.getRadialEvalBounds();
-    const coreDotThresh = clamp(minHemiDot + 0.12, 0.04, 0.92);
+    for (let i = 0; i < resolvedLeaves.length; i++) {
+      const lf = resolvedLeaves[i];
+      const ch = lf.chunk;
+      const k = lf.node.k;
+      const sm = lf.node.scaleMult;
+      let seamMask = 0;
 
-    // 1. hemiTier: High-density visible horizon cap via Octree query
-    const hemiLeaves: Array<{ cx: number; cy: number; cz: number; cwx: number; cwy: number; cwz: number; dot: number }> = [];
-    this.collectOctreeChunksAtScale(
-      hemiSpan,
-      minEvalR,
-      maxSurfR,
-      focusDir,
-      minHemiDot,
-      1.01,
-      hemiLeaves,
-    );
-
-    const microMargin =
-      Math.min(0.24, this.genCtx.detailLogScale * 0.032) * (this.baseRadius / 13.0) +
-      this.nativeVoxelSize * 3.0;
-
-    let pendingHemiCore = 0;
-    for (let i = 0; i < hemiLeaves.length; i++) {
-      const leaf = hemiLeaves[i];
-      const key = `${hemiScaleMult}:${leaf.cx},${leaf.cy},${leaf.cz}`;
-      const existing = this.sparseChunks.get(key);
-      if (!existing) {
-        const dApprox = this.evalAnalyticalAt(leaf.cwx, leaf.cwy, leaf.cwz, false).density;
-        if (Math.abs(dApprox) > hemiHalfDiag * 1.04 + microMargin) continue;
-      }
-      desiredKeys.add(key);
-      if (!existing || existing.dirty) {
-        const inCore = leaf.dot >= coreDotThresh;
-        if (inCore) pendingHemiCore++;
-        const dSq =
-          (leaf.cwx - surfF[0]) * (leaf.cwx - surfF[0]) +
-          (leaf.cwy - surfF[1]) * (leaf.cwy - surfF[1]) +
-          (leaf.cwz - surfF[2]) * (leaf.cwz - surfF[2]);
-        wantQueue.push({
-          cx: leaf.cx,
-          cy: leaf.cy,
-          cz: leaf.cz,
-          scaleMult: hemiScaleMult,
-          tier: 'hemi',
-          prio: 1e9 + dSq,
-          inCore,
-        });
-      } else {
-        existing.lastUsedFrame = this.streamFrame;
-      }
-    }
-
-    // 2. globeTier: Full 360° back-hemisphere & limb sparse octree complement (closes entire 360° sphere!)
-    const targetGlobeBlocks = 42;
-    const globeScaleMult = Math.max(hemiScaleMult, Math.round(this.voxelRadius / targetGlobeBlocks));
-    const globeSpan = CHUNK_CELLS * this.nativeVoxelSize * globeScaleMult;
-    const globeHalfDiag = globeSpan * 0.8660254;
-    const globeLeaves: Array<{ cx: number; cy: number; cz: number; cwx: number; cwy: number; cwz: number; dot: number }> = [];
-    this.collectOctreeChunksAtScale(
-      globeSpan,
-      minEvalR,
-      maxSurfR,
-      focusDir,
-      -1.01,
-      coreDotThresh + 0.08,
-      globeLeaves,
-    );
-
-    let pendingGlobe = 0;
-    for (let i = 0; i < globeLeaves.length; i++) {
-      const leaf = globeLeaves[i];
-      const key = `${globeScaleMult}:${leaf.cx},${leaf.cy},${leaf.cz}`;
-      if (desiredKeys.has(key)) continue;
-      const existing = this.sparseChunks.get(key);
-      if (!existing) {
-        const dApprox = this.evalAnalyticalAt(leaf.cwx, leaf.cwy, leaf.cwz, false).density;
-        if (Math.abs(dApprox) > globeHalfDiag * 1.04 + microMargin) continue;
-      }
-      desiredKeys.add(key);
-      if (!existing || existing.dirty) {
-        pendingGlobe++;
-        const dSq =
-          (leaf.cwx - surfF[0]) * (leaf.cwx - surfF[0]) +
-          (leaf.cwy - surfF[1]) * (leaf.cwy - surfF[1]) +
-          (leaf.cwz - surfF[2]) * (leaf.cwz - surfF[2]);
-        wantQueue.push({
-          cx: leaf.cx,
-          cy: leaf.cy,
-          cz: leaf.cz,
-          scaleMult: globeScaleMult,
-          tier: 'globe',
-          prio: 1e12 + dSq,
-        });
-      } else {
-        existing.lastUsedFrame = this.streamFrame;
-      }
-    }
-
-    // 3. midTier + optional midOuterTier cascade: continuous altitude-adaptive zoom down to 10^-9 R
-    const useMidTier = hemiScaleMult > 2;
-    let midScaleMult = 1;
-    let midSpan = 0;
-    let midCenterX = surfF[0];
-    let midCenterY = surfF[1];
-    let midCenterZ = surfF[2];
-    let pendingMid = 0;
-
-    let useMidOuter = false;
-    let midOuterScaleMult = 1;
-    let midOuterSpan = 0;
-    let midOuterCenterX = surfF[0];
-    let midOuterCenterY = surfF[1];
-    let midOuterCenterZ = surfF[2];
-    let pendingMidOuter = 0;
-
-    if (useMidTier) {
-      const targetMidStep =
-        camDistToFocus !== undefined
-          ? clamp(
-              Math.min(hemiStep * 0.25, camDistToFocus / 72),
-              this.nativeVoxelSize * 2,
-              hemiStep * 0.45,
-            )
-          : Math.min(hemiStep * 0.45, this.nativeVoxelSize * Math.sqrt(hemiScaleMult));
-      midScaleMult = clamp(
-        Math.round(targetMidStep / this.nativeVoxelSize),
-        2,
-        Math.max(2, Math.floor(hemiScaleMult * 0.5)),
-      );
-      if (midScaleMult === hemiScaleMult) {
-        midScaleMult = Math.max(2, hemiScaleMult - 1);
-      }
-
-      if (hemiScaleMult / midScaleMult >= 10) {
-        useMidOuter = true;
-        midOuterScaleMult = clamp(
-          Math.round(Math.sqrt(hemiScaleMult * midScaleMult)),
-          midScaleMult + 1,
-          Math.max(midScaleMult + 1, hemiScaleMult - 1),
-        );
-        midOuterSpan = CHUNK_CELLS * this.nativeVoxelSize * midOuterScaleMult;
-        const midOuterHalfDiag = midOuterSpan * 0.8660254;
-        const moCx = Math.floor(surfF[0] / midOuterSpan);
-        const moCy = Math.floor(surfF[1] / midOuterSpan);
-        const moCz = Math.floor(surfF[2] / midOuterSpan);
-        midOuterCenterX = (moCx + 0.5) * midOuterSpan;
-        midOuterCenterY = (moCy + 0.5) * midOuterSpan;
-        midOuterCenterZ = (moCz + 0.5) * midOuterSpan;
-
-        for (let dz = -3; dz <= 3; dz++) {
-          for (let dy = -3; dy <= 3; dy++) {
-            for (let dx = -3; dx <= 3; dx++) {
-              const cx = moCx + dx;
-              const cy = moCy + dy;
-              const cz = moCz + dz;
-              const cwx = (cx + 0.5) * midOuterSpan;
-              const cwy = (cy + 0.5) * midOuterSpan;
-              const cwz = (cz + 0.5) * midOuterSpan;
-              const key = `${midOuterScaleMult}:${cx},${cy},${cz}`;
-              const existing = this.sparseChunks.get(key);
-              if (!existing) {
-                const dApprox = this.evalAnalyticalAt(cwx, cwy, cwz, true).density;
-                if (Math.abs(dApprox) > midOuterHalfDiag * 1.45) continue;
-              }
-              desiredKeys.add(key);
-              if (!existing || existing.dirty) {
-                pendingMidOuter++;
-                const dSq =
-                  (cwx - surfF[0]) * (cwx - surfF[0]) +
-                  (cwy - surfF[1]) * (cwy - surfF[1]) +
-                  (cwz - surfF[2]) * (cwz - surfF[2]);
-                wantQueue.push({
-                  cx,
-                  cy,
-                  cz,
-                  scaleMult: midOuterScaleMult,
-                  tier: 'midOuter',
-                  prio: 1e7 + dSq,
-                });
-              } else {
-                existing.lastUsedFrame = this.streamFrame;
-              }
-            }
+      for (let f = 0; f < 6; f++) {
+        const dir = SEAM_DIRS[f];
+        const ncx = lf.node.cx + dir[0];
+        const ncy = lf.node.cy + dir[1];
+        const ncz = lf.node.cz + dir[2];
+        const nKey = `${sm}:${ncx},${ncy},${ncz}`;
+        if (leafMap.has(nKey)) continue;
+        if (splitNodes.has(nKey)) {
+          seamMask |= 1 << f;
+          continue;
+        }
+        let ax = ncx;
+        let ay = ncy;
+        let az = ncz;
+        for (let ak = k + 1; ak <= kRoot; ak++) {
+          ax = Math.floor(ax / 2);
+          ay = Math.floor(ay / 2);
+          az = Math.floor(az / 2);
+          if (leafMap.has(`${levelScaleMult[ak]}:${ax},${ay},${az}`)) {
+            seamMask |= 1 << f;
+            break;
           }
         }
       }
 
-      midSpan = CHUNK_CELLS * this.nativeVoxelSize * midScaleMult;
-      const midHalfDiag = midSpan * 0.8660254;
-      const mCx = Math.floor(surfF[0] / midSpan);
-      const mCy = Math.floor(surfF[1] / midSpan);
-      const mCz = Math.floor(surfF[2] / midSpan);
-      midCenterX = (mCx + 0.5) * midSpan;
-      midCenterY = (mCy + 0.5) * midSpan;
-      midCenterZ = (mCz + 0.5) * midSpan;
-
-      for (let dz = -4; dz <= 4; dz++) {
-        for (let dy = -4; dy <= 4; dy++) {
-          for (let dx = -4; dx <= 4; dx++) {
-            const cx = mCx + dx;
-            const cy = mCy + dy;
-            const cz = mCz + dz;
-            const cwx = (cx + 0.5) * midSpan;
-            const cwy = (cy + 0.5) * midSpan;
-            const cwz = (cz + 0.5) * midSpan;
-            const key = `${midScaleMult}:${cx},${cy},${cz}`;
-            const existing = this.sparseChunks.get(key);
-            if (!existing) {
-              const dApprox = this.evalAnalyticalAt(cwx, cwy, cwz, true).density;
-              if (Math.abs(dApprox) > midHalfDiag * 1.45) continue;
-            }
-            desiredKeys.add(key);
-            if (!existing || existing.dirty) {
-              pendingMid++;
-              const dSq =
-                (cwx - surfF[0]) * (cwx - surfF[0]) +
-                (cwy - surfF[1]) * (cwy - surfF[1]) +
-                (cwz - surfF[2]) * (cwz - surfF[2]);
-              wantQueue.push({
-                cx,
-                cy,
-                cz,
-                scaleMult: midScaleMult,
-                tier: 'mid',
-                prio: 1e5 + dSq,
-              });
-            } else {
-              existing.lastUsedFrame = this.streamFrame;
-            }
-          }
-        }
-      }
-    }
-
-    // 4. nativeTier: 1:1 native 5x5x5 leaf blocks at exact fullCellsPerAxis³ resolution
-    const useSeparateNative = hemiScaleMult > 1;
-    const centerCx = Math.floor(surfF[0] / nativeSpan);
-    const centerCy = Math.floor(surfF[1] / nativeSpan);
-    const centerCz = Math.floor(surfF[2] / nativeSpan);
-    const nCenterX = (centerCx + 0.5) * nativeSpan;
-    const nCenterY = (centerCy + 0.5) * nativeSpan;
-    const nCenterZ = (centerCz + 0.5) * nativeSpan;
-    let pendingNative = 0;
-
-    if (useSeparateNative) {
-      const nativeHalfDiag = nativeSpan * 0.8660254;
-      for (let dz = -2; dz <= 2; dz++) {
-        for (let dy = -2; dy <= 2; dy++) {
-          for (let dx = -2; dx <= 2; dx++) {
-            const cx = centerCx + dx;
-            const cy = centerCy + dy;
-            const cz = centerCz + dz;
-            const cwx = (cx + 0.5) * nativeSpan;
-            const cwy = (cy + 0.5) * nativeSpan;
-            const cwz = (cz + 0.5) * nativeSpan;
-            const key = `1:${cx},${cy},${cz}`;
-            const existing = this.sparseChunks.get(key);
-            if (!existing) {
-              const dApprox = this.evalAnalyticalAt(cwx, cwy, cwz, true).density;
-              if (Math.abs(dApprox) > nativeHalfDiag * 1.55) continue;
-            }
-            desiredKeys.add(key);
-            if (!existing || existing.dirty) {
-              pendingNative++;
-              const dSq =
-                (cwx - surfF[0]) * (cwx - surfF[0]) +
-                (cwy - surfF[1]) * (cwy - surfF[1]) +
-                (cwz - surfF[2]) * (cwz - surfF[2]);
-              wantQueue.push({
-                cx,
-                cy,
-                cz,
-                scaleMult: 1,
-                tier: 'native',
-                prio: (existing?.edited ? 0 : 1e3) + dSq,
-              });
-            } else {
-              existing.lastUsedFrame = this.streamFrame;
-            }
-          }
-        }
-      }
-    }
-
-    const totalPendingBefore = wantQueue.length;
-    if (wantQueue.length > 0) {
-      wantQueue.sort((a, b) => a.prio - b.prio);
-      const lim = Math.min(maxBuildPerFrame, wantQueue.length);
-      for (let i = 0; i < lim; i++) {
-        const w = wantQueue[i];
-        const ch = this.getOrCreateSparseChunk(w.cx, w.cy, w.cz, w.scaleMult);
-        ch.dirty = false;
+      if (ch.dirty || ch.lastSeamMask !== seamMask) {
         rebuiltMeshes.push({
           key: ch.key,
-          tier: w.tier,
-          mesh: this.extractSparseChunkMesh(ch, blocky),
+          tier: lf.tier,
+          scaleMult: ch.scaleMult,
+          mesh: this.extractSparseChunkMesh(ch, blocky, seamMask),
         });
-        if (w.tier === 'native') pendingNative = Math.max(0, pendingNative - 1);
-        else if (w.tier === 'mid') pendingMid = Math.max(0, pendingMid - 1);
-        else if (w.tier === 'midOuter') pendingMidOuter = Math.max(0, pendingMidOuter - 1);
-        else if (w.tier === 'globe') pendingGlobe = Math.max(0, pendingGlobe - 1);
-        else if (w.inCore) pendingHemiCore = Math.max(0, pendingHemiCore - 1);
       }
     }
 
-    this.evictUnusedSparseChunks(4800, desiredKeys);
+    // Retain already-built GPU meshes inside our sparse chunk cache so zoom transitions never allocate needlessly
+    for (const c of this.sparseChunks.values()) {
+      if (c.edited || c.built) {
+        retainKeys.add(c.key);
+      }
+    }
+    this.evictUnusedSparseChunks(isForcedLod0 ? 12000 : 4800, retainKeys);
 
-    const safeCapDot = clamp(minHemiDot + 0.1, -0.05, 0.92);
-    const safeEdgeDist =
-      safeCapDot > 0
-        ? this.baseRadius * Math.sqrt(Math.max(0.08, 2 * (1 - safeCapDot) * 0.82))
-        : this.baseRadius * 1.32;
-    const hemiDiscardRadius =
-      pendingHemiCore === 0
-        ? clamp(safeEdgeDist, this.baseRadius * 0.45, this.baseRadius * 1.32)
-        : 0;
-    const midOuterDiscardRadius =
-      useMidOuter && pendingMidOuter === 0 ? midOuterSpan * 2.45 : 0;
-    const midDiscardRadius =
-      useMidTier && pendingMid === 0 ? midSpan * 3.25 : 0;
-    const nativeDiscardRadius =
-      useSeparateNative && pendingNative === 0 ? nativeSpan * 1.82 : 0;
-    const globeBuiltComplete = pendingHemiCore === 0 && pendingGlobe === 0;
+    // Sync retainKeys to the surviving sparseChunks after eviction
+    for (const key of retainKeys) {
+      if (!this.sparseChunks.has(key)) {
+        retainKeys.delete(key);
+      }
+    }
+
+    const safeCapDot = clamp(hemiDotThresh + 0.1, -0.05, 0.92);
+    const hemiDiscardRadius = this.svRootBuilt
+      ? clamp(
+          safeCapDot > 0
+            ? this.baseRadius * Math.sqrt(Math.max(0.08, 2 * (1 - safeCapDot) * 0.82))
+            : this.baseRadius * 1.32,
+          this.baseRadius * 0.45,
+          this.baseRadius * 1.32,
+        )
+      : 0;
+    const midSpan = kRoot >= 2 ? levelSpan[Math.max(1, Math.floor((kRoot - 1) * 0.5))] : nativeSpan;
+    const pendingTotal = Math.max(0, totalPendingBuilds - Math.min(maxBuildPerFrame, totalPendingBuilds));
 
     return {
       active: true,
-      hideMacro: globeBuiltComplete,
-      globeBuiltComplete,
-      hemiCenter,
+      hideMacro: this.svRootBuilt,
+      globeBuiltComplete: this.svRootBuilt,
+      hemiCenter: [
+        focusDir[0] * this.baseRadius,
+        focusDir[1] * this.baseRadius,
+        focusDir[2] * this.baseRadius,
+      ],
       hemiDiscardRadius,
-      midOuterCenter: [midOuterCenterX, midOuterCenterY, midOuterCenterZ],
-      midOuterDiscardRadius,
-      midCenter: [midCenterX, midCenterY, midCenterZ],
-      midDiscardRadius,
-      nativeCenter: [nCenterX, nCenterY, nCenterZ],
-      nativeDiscardRadius,
-      pendingTotal: Math.max(0, totalPendingBefore - rebuiltMeshes.length),
+      midOuterCenter: [surfF[0], surfF[1], surfF[2]],
+      midOuterDiscardRadius: pendingTotal === 0 ? midSpan * 2.0 : 0,
+      midCenter: [surfF[0], surfF[1], surfF[2]],
+      midDiscardRadius: pendingTotal === 0 ? midSpan * 1.2 : 0,
+      nativeCenter: [surfF[0], surfF[1], surfF[2]],
+      nativeDiscardRadius: pendingTotal === 0 ? nativeSpan * 1.8 : 0,
+      pendingTotal,
       desiredKeys,
+      retainKeys,
       rebuiltMeshes,
     };
   }

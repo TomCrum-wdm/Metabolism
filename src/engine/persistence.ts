@@ -40,6 +40,7 @@ export interface StoredUserPrefs {
   lod0Dist?: number;
   lod1Dist?: number;
   touchEnabled?: boolean;
+  perspectiveFov?: number;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -160,6 +161,7 @@ export function loadStoredPrefs(): StoredUserPrefs {
       lod0Dist: parsed.lod0Dist,
       lod1Dist: parsed.lod1Dist,
       touchEnabled: parsed.touchEnabled,
+      perspectiveFov: parsed.perspectiveFov,
     };
   } catch {
     return { autoSaveEnabled: true };

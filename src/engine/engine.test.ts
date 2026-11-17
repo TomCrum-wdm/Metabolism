@@ -16,6 +16,11 @@ import {
   VoxelPlanet,
 } from './voxelPlanet';
 import { FluidSim } from './fluidSim';
+import {
+  computeDetailCameraOptics,
+  computeSafeClipPlanes,
+  evaluateLandingDescentPose,
+} from './cameraMath';
 
 const GRAVITY_PARAMS = {
   referenceRadius: DEFAULT_PLANET_RADIUS,
@@ -777,6 +782,213 @@ test('Full 360° SVO scales past 1,000,000,000³ (voxelRadius=500M -> 1.54B³), 
   assert.equal(restored.sampleNearestMaterial(bx, by, bz), MaterialId.Crystal);
 });
 
+test('Dyadic SVO partition is strictly non-overlapping, never flickers hideMacro on focus move, and emits seam sealing geometry', () => {
+  const planet = new VoxelPlanet({
+    ...DEFAULT_SEED_CONFIG,
+    seed: 774411,
+    radius: 13.0,
+    voxelRadius: 512,
+  });
 
+  const surfY = planet.findSurfaceRadiusAlongRay(0, 1, 0);
+  let lastBatch = planet.streamHighResAround(0, surfY, 0, 'smooth', 48, 22);
+  for (let pass = 0; pass < 60 && lastBatch.pendingTotal > 0; pass++) {
+    lastBatch = planet.streamHighResAround(0, surfY, 0, 'smooth', 48, 22);
+  }
+  assert.equal(lastBatch.globeBuiltComplete, true, 'SVO should converge completely at res=512');
+  assert.equal(lastBatch.hideMacro, true, 'hideMacro must be true after root globe completes');
 
+  // Verify strict non-overlapping dyadic partition invariant in desiredKeys
+  const verifyNonOverlapping = (keys: Set<string>) => {
+    const keySet = keys;
+    for (const kStr of keySet) {
+      const [smStr, coords] = kStr.split(':');
+      const sm = Number(smStr);
+      const [cx, cy, cz] = coords.split(',').map(Number);
+      let ax = cx;
+      let ay = cy;
+      let az = cz;
+      for (let asm = sm * 2; asm <= 1024; asm *= 2) {
+        ax = Math.floor(ax / 2);
+        ay = Math.floor(ay / 2);
+        az = Math.floor(az / 2);
+        const ancKey = `${asm}:${ax},${ay},${az}`;
+        assert.equal(
+          keySet.has(ancKey),
+          false,
+          `Overlapping SVO desiredKeys detected: ${kStr} and ancestor ${ancKey}`,
+        );
+      }
+    }
+  };
+
+  verifyNonOverlapping(lastBatch.desiredKeys);
+  assert.ok(lastBatch.desiredKeys.size > 100, 'Expected non-empty desiredKeys cut');
+
+  // Move focus & camera to another hemisphere/direction and verify hideMacro stays true permanently
+  const surfX = planet.findSurfaceRadiusAlongRay(1, 0, 0);
+  const movedBatch = planet.streamHighResAround(surfX, 0, 0, 'blocky', 48, 12);
+  assert.equal(movedBatch.globeBuiltComplete, true);
+  assert.equal(movedBatch.hideMacro, true);
+  verifyNonOverlapping(movedBatch.desiredKeys);
+
+  // Verify seam-sealing emits extra geometry in both blocky (boundary caps) and smooth (skirts) modes
+  let testChunk = null;
+  for (const ch of planet.sparseChunks.values()) {
+    if (!ch.isEmpty && ch.scaleMult <= 8) {
+      testChunk = ch;
+      break;
+    }
+  }
+  assert.ok(testChunk !== null, 'Expected a non-empty surface sparse chunk');
+
+  const smoothNoSeam = planet.extractSparseChunkMesh(testChunk!, false, 0);
+  const smoothAllSeam = planet.extractSparseChunkMesh(testChunk!, false, 0b111111);
+  assert.ok(
+    smoothAllSeam.vertexCount > smoothNoSeam.vertexCount,
+    `Expected smooth T-junction skirts to add vertices (${smoothAllSeam.vertexCount} > ${smoothNoSeam.vertexCount})`,
+  );
+
+  const blockyNoSeam = planet.extractSparseChunkMesh(testChunk!, true, 0);
+  const blockyAllSeam = planet.extractSparseChunkMesh(testChunk!, true, 0b111111);
+  assert.ok(
+    blockyAllSeam.vertexCount > blockyNoSeam.vertexCount,
+    `Expected blocky boundary caps to add vertices (${blockyAllSeam.vertexCount} > ${blockyNoSeam.vertexCount})`,
+  );
+});
+
+test('Forced LOD 0 disables concentric LOD degradation across viewport and scales LOD 1/2 limits cleanly', () => {
+  const planet = new VoxelPlanet({
+    ...DEFAULT_SEED_CONFIG,
+    seed: 512009,
+    radius: 13.0,
+    voxelRadius: 512,
+  });
+  const sy = planet.findSurfaceRadiusAlongRay(0, 1, 0);
+
+  // Forced LOD 0 at close-up view (camDist=1.8m -> ~102 blocks across view < 360) must render 100% 1:1 native in viewport
+  let batch;
+  for (let pass = 0; pass < 70; pass++) {
+    batch = planet.streamHighResAround(
+      0,
+      sy,
+      0,
+      'blocky',
+      64,
+      1.8,
+      [0, sy + 1.8, 0],
+      [0, -1, 0],
+      { lodMode: 0, lod0Dist: 38 },
+    );
+    if (batch.pendingTotal === 0) break;
+  }
+  assert.ok(batch && batch.desiredKeys.size > 200);
+
+  let nativeInView = 0;
+  let coarserInView = 0;
+  for (const key of batch!.desiredKeys) {
+    const ch = planet.sparseChunks.get(key);
+    if (!ch) continue;
+    const cx = ch.originX + 4 * ch.stepSize;
+    const cy = ch.originY + 4 * ch.stepSize;
+    const cz = ch.originZ + 4 * ch.stepSize;
+    if (Math.hypot(cx, cy - sy, cz) <= 1.8) {
+      if (ch.scaleMult === 1) nativeInView++;
+      else coarserInView++;
+    }
+  }
+  assert.ok(nativeInView > 150, `Expected dense 1:1 native chunks filling viewport, got ${nativeInView}`);
+  assert.equal(coarserInView, 0, `Expected zero coarser blocks inside LOD0 viewport, got ${coarserInView}`);
+
+  // Verify LOD 2 mode constrains leaf granularity to scaleMult >= 4
+  const planetLod2 = new VoxelPlanet({
+    ...DEFAULT_SEED_CONFIG,
+    seed: 512009,
+    radius: 13.0,
+    voxelRadius: 512,
+  });
+  let lod2Batch;
+  for (let pass = 0; pass < 35; pass++) {
+    lod2Batch = planetLod2.streamHighResAround(
+      0,
+      sy,
+      0,
+      'blocky',
+      64,
+      1.8,
+      [0, sy + 1.8, 0],
+      [0, -1, 0],
+      { lodMode: 2, lod0Dist: 38 },
+    );
+    if (lod2Batch.pendingTotal === 0) break;
+  }
+  let minScaleSeen = Infinity;
+  for (const key of lod2Batch!.desiredKeys) {
+    const ch = planetLod2.sparseChunks.get(key);
+    if (ch && ch.scaleMult < minScaleSeen) minScaleSeen = ch.scaleMult;
+  }
+  assert.ok(minScaleSeen >= 4, `Expected LOD 2 mode minimum scaleMult >= 4, got ${minScaleSeen}`);
+});
+
+test('Detail Camera optics prevent surface penetration, preserve depth precision, and Landing descent eases cleanly to touchdown', () => {
+  const baseRadius = 13.0;
+  const nativeVoxelSize = baseRadius / 500_000_000;
+
+  // Even when zoomed to micron voxel spacing, physicalDist never collapses inside voxels
+  const macroOpt = computeDetailCameraOptics(20.0, baseRadius, nativeVoxelSize, 55);
+  assert.ok(Math.abs(macroOpt.fovDeg - 55) < 0.01);
+  assert.ok(macroOpt.physicalDist >= macroOpt.effectiveStreamDist - 1e-9);
+
+  const microOpt = computeDetailCameraOptics(nativeVoxelSize * 2, baseRadius, nativeVoxelSize, 55);
+  assert.ok(
+    microOpt.physicalDist >= baseRadius * 0.0015 - 1e-9,
+    `Expected physical standoff >= surface safety floor, got ${microOpt.physicalDist}`,
+  );
+  assert.ok(
+    microOpt.fovDeg < 15,
+    `Expected telephoto FOV < 15° under extreme magnification, got ${microOpt.fovDeg}`,
+  );
+  assert.ok(
+    microOpt.magnification > macroOpt.magnification * 100,
+    `Expected substantial detail magnification, got ${microOpt.magnification}`,
+  );
+  assert.ok(
+    microOpt.effectiveStreamDist <= nativeVoxelSize * 2.1,
+    `Expected SVO stream distance to stay tied to zoom target, got ${microOpt.effectiveStreamDist}`,
+  );
+
+  // Depth-buffer clip planes must maintain safe far/near ratio (< 2.5e5) at telephoto micro standoff
+  const clips = computeSafeClipPlanes(
+    microOpt.physicalDist,
+    microOpt.physicalDist,
+    baseRadius,
+    microOpt.fovDeg,
+  );
+  assert.ok(clips.near > 0 && clips.far > clips.near);
+  assert.ok(
+    clips.far / clips.near <= 2.5e5,
+    `Expected safe 24-bit depth ratio far/near <= 2.5e5, got ${clips.far / clips.near}`,
+  );
+
+  // Landing descent eases monotonically from orbit pose down to eye height looking toward horizon
+  const startPos: [number, number, number] = [0, 32, 18];
+  const sitePos: [number, number, number] = [0, 13, 0];
+  const endPos: [number, number, number] = [0, 14.65, 0];
+  const endLook: [number, number, number] = [0, 14.65, -8];
+
+  const p0 = evaluateLandingDescentPose(0, startPos, endPos, sitePos, endLook);
+  assert.equal(p0.done, false);
+  assert.deepEqual(p0.pos, startPos);
+  assert.deepEqual(p0.look, sitePos);
+
+  const pMid = evaluateLandingDescentPose(0.5, startPos, endPos, sitePos, endLook);
+  assert.equal(pMid.done, false);
+  // Cubic ease-out at t=0.5 reaches 87.5% of trajectory while look begins sweeping toward horizon
+  assert.ok(pMid.pos[1] < 18 && pMid.pos[1] > 14.65);
+
+  const pEnd = evaluateLandingDescentPose(1.0, startPos, endPos, sitePos, endLook);
+  assert.equal(pEnd.done, true);
+  assert.deepEqual(pEnd.pos, endPos);
+  assert.deepEqual(pEnd.look, endLook);
+});
 

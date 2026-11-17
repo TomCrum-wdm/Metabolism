@@ -41,8 +41,11 @@ import { GenerationProgressOverlay } from './components/GenerationProgressOverla
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'orbit',
-  orbit: 'fps',
-  fps: 'explorer',
+  orbit: 'detail',
+  detail: 'fps',
+  fps: 'landing',
+  landing: 'perspective',
+  perspective: 'explorer',
 };
 
 interface InitialLaunchParams {
@@ -93,11 +96,12 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     sunAzimuthDeg: prefs.sunAzimuthDeg ?? 28,
     showGravityVectors: false,
     cameraMode: 'explorer',
+    perspectiveFov: prefs.perspectiveFov ?? 55,
     muted: false,
     simPaused: false,
     lodMode: prefs.lodMode ?? 'auto',
-    lod0Dist: Number(((prefs.lod0Dist ?? 23.0) * rScale).toPrecision(4)),
-    lod1Dist: Number(((prefs.lod1Dist ?? 34.0) * rScale).toPrecision(4)),
+    lod0Dist: Number(((prefs.lod0Dist ?? 38.0) * rScale).toPrecision(4)),
+    lod1Dist: Number(((prefs.lod1Dist ?? 56.0) * rScale).toPrecision(4)),
     wireframe: false,
     showChunkBounds: false,
     debugProbeEnabled: false,
@@ -152,6 +156,9 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   sunDir: [0.7, 0.5, 0.5],
   simTimeSec: 0,
   voxelRevision: 0,
+  landingStage: 'selecting',
+  detailZoomMag: 1,
+  perspectiveFov: 55,
 };
 
 export default function App() {
@@ -333,6 +340,7 @@ export default function App() {
       lod0Dist: config.lod0Dist,
       lod1Dist: config.lod1Dist,
       touchEnabled,
+      perspectiveFov: config.perspectiveFov,
     });
   }, [
     autoSaveEnabled,
@@ -343,6 +351,7 @@ export default function App() {
     config.lodMode,
     config.lod0Dist,
     config.lod1Dist,
+    config.perspectiveFov,
   ]);
 
   // Periodic IndexedDB autosave + tab-handoff snapshot refresh during active gameplay
@@ -610,6 +619,19 @@ export default function App() {
         handleUpdateConfig({
           cameraMode: NEXT_CAMERA[configRef.current.cameraMode],
         });
+      } else if (e.code === 'KeyF') {
+        if (
+          configRef.current.cameraMode === 'detail' ||
+          configRef.current.cameraMode === 'perspective'
+        ) {
+          e.preventDefault();
+          engineRef.current?.focusCameraAtPointer();
+        }
+      } else if (e.code === 'KeyR') {
+        if (configRef.current.cameraMode === 'landing') {
+          e.preventDefault();
+          engineRef.current?.reselectLandingSite();
+        }
       } else if (e.code === 'KeyG') {
         handleUpdateConfig({
           showGravityVectors: !configRef.current.showGravityVectors,
@@ -730,6 +752,8 @@ export default function App() {
           onToggleMaps={() => setMapsOpen((v) => !v)}
           onToggleAtmosPanel={() => setAtmosPanelOpen((v) => !v)}
           onToggleDebug={handleToggleDebug}
+          onReselectLanding={() => engineRef.current?.reselectLandingSite()}
+          onFocusCamera={() => engineRef.current?.focusCameraAtPointer()}
           onPause={() => setPhase('paused')}
         />
       )}

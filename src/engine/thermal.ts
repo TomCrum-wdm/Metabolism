@@ -20,6 +20,33 @@ export const DEFAULT_THERMAL_CONFIG: ThermalConfig = {
   lapseRateCPerScale: 24,
 };
 
+export interface ThermalHotspot {
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  deltaC: number;
+  decayPerSec: number;
+}
+
+export function computeHotspotDeltaC(
+  wx: number,
+  wy: number,
+  wz: number,
+  hotspots: ReadonlyArray<ThermalHotspot>,
+): number {
+  let sum = 0;
+  for (let i = 0; i < hotspots.length; i++) {
+    const h = hotspots[i];
+    const dist = Math.hypot(wx - h.x, wy - h.y, wz - h.z);
+    if (dist < h.radius) {
+      const f = 1 - smoothstep(0, h.radius, dist);
+      sum += h.deltaC * f;
+    }
+  }
+  return sum;
+}
+
 export interface ThermalSample {
   tempC: number;
   tempK: number;
@@ -51,6 +78,7 @@ export function sampleThermalField(
   simTimeSec = 0,
   material: MaterialId = MaterialId.Soil,
   nearWaterWeight = 0,
+  hotspotDeltaC = 0,
 ): ThermalSample {
   const r = Math.hypot(wx, wy, wz);
   const safeR0 = Math.max(planetRadius, 0.05);
@@ -151,6 +179,8 @@ export function sampleThermalField(
     const spaceFade = smoothstep(scaleH * 3.5, scaleH * 7.0, altRatio);
     tempC = tempC * (1 - spaceFade) + (-145 + 35 * dayFactor) * spaceFade;
   }
+
+  tempC += hotspotDeltaC;
 
   let regime: ThermalSample['regime'] = '温带';
   if (tempC >= 120) regime = '地热熔岩带';

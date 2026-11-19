@@ -20,7 +20,33 @@ import {
   computeDetailCameraOptics,
   computeSafeClipPlanes,
   evaluateLandingDescentPose,
+  resolveSphericalCoreUp,
+  stabilizeRadialAnchor,
+  transportCameraForwardOnSphere,
 } from './cameraMath';
+import {
+  BUILTIN_TOOLS,
+  createCustomToolTemplate,
+  resolveToolDefinition,
+  TOOL_BEHAVIOR_PRESETS,
+} from './toolRegistry';
+import {
+  computeRayPointDistanceSq,
+  computeTractorSpringForce,
+  evaluateStretchedAnchorPoint,
+  intersectCursorWithDragPlane,
+  summarizeEscapeStatus,
+} from './tractorBeam';
+import { computeHotspotDeltaC } from './thermal';
+import {
+  computePlanFrameCount,
+  createDefaultDirectorPlan,
+  DirectorSceneAnchor,
+  evaluateDirectorPose,
+  FPS_PRESETS,
+  RESOLUTION_PRESETS,
+} from './director';
+import { buildTarArchive, WebmMuxer } from './webmMuxer';
 
 const GRAVITY_PARAMS = {
   referenceRadius: DEFAULT_PLANET_RADIUS,
@@ -992,3 +1018,530 @@ test('Detail Camera optics prevent surface penetration, preserve depth precision
   assert.deepEqual(pEnd.look, endLook);
 });
 
+test('Spherical camera parallel transport, radial jitter stabilizer, and core up-guard remain jitter-free across axes and planet center', () => {
+  // Walk a great-circle trajectory passing directly across |up.x| = 0.85, (1,0,0), and poles (0,±1,0)
+  let fwd: [number, number, number] = [0, 0, -1];
+  const steps = 180;
+  for (let i = 0; i <= steps; i++) {
+    const theta = (i / steps) * Math.PI * 2;
+    // Tilted great circle hitting both X-axis (±1,0,0) and high Y/Z latitudes
+    const up: [number, number, number] = [
+      Math.cos(theta),
+      Math.sin(theta) * 0.72,
+      Math.sin(theta) * 0.694,
+    ];
+    const basis = transportCameraForwardOnSphere(up, fwd, 0.01);
+    const fLen = Math.hypot(basis.forward[0], basis.forward[1], basis.forward[2]);
+    const rLen = Math.hypot(basis.right[0], basis.right[1], basis.right[2]);
+    assert.ok(Math.abs(fLen - 1) < 1e-5, `forward not unit: ${fLen}`);
+    assert.ok(Math.abs(rLen - 1) < 1e-5, `right not unit: ${rLen}`);
+
+    const uLen = Math.hypot(up[0], up[1], up[2]);
+    const dotFU =
+      (basis.forward[0] * up[0] + basis.forward[1] * up[1] + basis.forward[2] * up[2]) / uLen;
+    assert.ok(Math.abs(dotFU) < 1e-5, `forward not tangent to sphere: ${dotFU}`);
+
+    // Continuity check: adjacent steps never snap or flip (dot > 0.96 even with small yaw + curve step)
+    const dotStep =
+      basis.forward[0] * fwd[0] + basis.forward[1] * fwd[1] + basis.forward[2] * fwd[2];
+    assert.ok(dotStep > 0.96, `Camera forward discontinuity detected at step ${i}: dot=${dotStep}`);
+    fwd = basis.forward;
+  }
+
+  // Radial stabilizer damps high-frequency vertical ground bumps while tracking horizontal movement closely
+  const prevAnchor: [number, number, number] = [0, 14.0, 0];
+  const bumpedTarget: [number, number, number] = [1.0, 14.5, 0];
+  const damped = stabilizeRadialAnchor(prevAnchor, bumpedTarget, [0, 1, 0], 0.2, 0.9);
+  assert.ok(Math.abs(damped[0] - 0.9) < 1e-6, `Expected fast tangent tracking ~0.9, got ${damped[0]}`);
+  assert.ok(Math.abs(damped[1] - 14.1) < 1e-6, `Expected damped radial tracking ~14.1, got ${damped[1]}`);
+
+  // Core up-guard freezes up vector inside tunnel core (r < guard) and recovers outside
+  const lockedCore = resolveSphericalCoreUp([0.05, -0.02, 0.01], [0, 1, 0], 0.85);
+  assert.deepEqual(lockedCore, [0, 1, 0]);
+  const outsideCore = resolveSphericalCoreUp([0, -5, 0], [0, 1, 0], 0.85);
+  assert.ok(outsideCore[1] < -0.99);
+});
+
+test('Through-planet laser/tunnel piercing punches clean tunnels through core on macro and >1B^3 SVO worlds, plus paint, extrude, and drain', () => {
+  // 1. Macro grid through-planet piercing
+  const macro = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 18, radius: 13 });
+  const R = macro.baseRadius;
+  const solidBefore = macro.sampleDensity(0, 0, 0);
+  assert.ok(solidBefore > 0, `Planet core should initially be solid, got ${solidBefore}`);
+
+  macro.applyBrush(0, R + 2, 0, 'laser', 2.4, 2.2, MaterialId.Air, {
+    ex: 0,
+    ey: -R - 2,
+    ez: 0,
+    shape: 'cylinder',
+  });
+
+  assert.ok(macro.sampleDensity(0, 0, 0) < 0, 'Core center should be carved hollow by through-planet laser');
+  assert.ok(macro.sampleDensity(0, R, 0) < 0, 'North entry should be carved');
+  assert.ok(macro.sampleDensity(0, -R, 0) < 0, 'South antipode exit should be carved');
+
+  const rayThrough = macro.raycastTerrain(0, R + 5, 0, 0, -1, 0, R * 3.5);
+  assert.equal(rayThrough.hit, false, 'Raycast straight down pierced bore axis should pass completely through planet');
+
+  // 2. Paint preserves density while changing surface material; extrude builds rock outward
+  const px = R;
+  const py = 0;
+  const pz = 0;
+  const surfaceHit = macro.raycastTerrain(R + 8, 0, 0, -1, 0, 0, 20);
+  assert.equal(surfaceHit.hit, true);
+  const densBeforePaint = macro.sampleDensity(surfaceHit.x, surfaceHit.y, surfaceHit.z);
+  macro.applyBrush(surfaceHit.x, surfaceHit.y, surfaceHit.z, 'paint', 2.0, 1.0, MaterialId.Crystal);
+  const densAfterPaint = macro.sampleDensity(surfaceHit.x, surfaceHit.y, surfaceHit.z);
+  assert.ok(Math.abs(densAfterPaint - densBeforePaint) < 1e-4, 'Paint tool must not deform terrain density');
+
+  // Sample slightly inside surface after paint to check crystal material
+  const innerMat = macro.sampleNearestMaterial(
+    surfaceHit.x - surfaceHit.nx * 0.4,
+    surfaceHit.y - surfaceHit.ny * 0.4,
+    surfaceHit.z - surfaceHit.nz * 0.4,
+  );
+  assert.equal(innerMat, MaterialId.Crystal, 'Paint tool should repaint subsurface material to Crystal');
+
+  // Extrude adds solid rock outside the previous surface
+  const outX = px + 6;
+  const probeOutX = surfaceHit.x + surfaceHit.nx * 1.1;
+  const probeOutY = surfaceHit.y + surfaceHit.ny * 1.1;
+  const probeOutZ = surfaceHit.z + surfaceHit.nz * 1.1;
+  assert.ok(macro.sampleDensity(probeOutX, probeOutY, probeOutZ) < 0);
+  macro.applyBrush(surfaceHit.x, surfaceHit.y, surfaceHit.z, 'extrude', 2.2, 2.0, MaterialId.Basalt, {
+    ex: surfaceHit.x + surfaceHit.nx * 2.5,
+    ey: surfaceHit.y + surfaceHit.ny * 2.5,
+    ez: surfaceHit.z + surfaceHit.nz * 2.5,
+    shape: 'cylinder',
+  });
+  assert.ok(
+    macro.sampleDensity(probeOutX, probeOutY, probeOutZ) > 0,
+    `Extrude cylinder should add solid rock beyond surface (probe=${outX})`,
+  );
+
+  // 3. FluidSim.drainWithinRadius removes only nearby fluid
+  const fluid = new FluidSim();
+  fluid.spawnParticle(0, R + 1, 0);
+  fluid.spawnParticle(0.5, R + 1, 0);
+  fluid.spawnParticle(0, -R - 1, 0);
+  const drained = fluid.drainWithinRadius(0, R + 1, 0, 2.0);
+  assert.equal(drained, 2);
+  assert.equal(fluid.activeCount, 1);
+
+  // 4. High-res (>1B^3) SVO tunnel core piercing & interior mesh generation
+  const svoPlanet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 512, radius: 13 });
+  svoPlanet.applyBrush(0, 15, 0, 'tunnel', 2.4, 2.4, MaterialId.Air, {
+    ex: 0,
+    ey: -15,
+    ez: 0,
+    shape: 'cylinder',
+  });
+  assert.ok(svoPlanet.sampleDensity(0, 0, 0) < 0, 'SVO planet core should be hollow inside tunnel');
+  assert.ok(svoPlanet.sampleDensity(2.6, 0, 0) > 0, 'SVO planet core outside tunnel wall stays solid');
+
+  // Stream SVO chunks directly around the core (0,0,0) and confirm tunnel walls emit triangles
+  let coreVerts = 0;
+  for (let pass = 0; pass < 12; pass++) {
+    const batch = svoPlanet.streamHighResAround(0, 0, 0, 'smooth', 64, 4.0, [0, 0, 0], [0, -1, 0], {
+      lodMode: 0,
+      lod0Dist: 38,
+    });
+    for (const m of batch.rebuiltMeshes) {
+      coreVerts += m.mesh.vertexCount;
+    }
+    if (batch.pendingTotal === 0) break;
+  }
+  assert.ok(coreVerts > 0, `Expected SVO core tunnel walls to generate mesh vertices near (0,0,0), got ${coreVerts}`);
+});
+
+test('Tool registry (30+ tools & custom creation), crater/volcano/quake/rimMaterial primitives, fluid impulses, and thermal hotspots', () => {
+  // 1. Built-in tool catalog completeness & custom tool creation / overrides
+  assert.ok(BUILTIN_TOOLS.length >= 30, `Expected at least 30 built-in tools, got ${BUILTIN_TOOLS.length}`);
+  const requiredIds = [
+    'megaLaser',
+    'continuousLaser',
+    'explosion',
+    'burn',
+    'magma',
+    'lightning',
+    'meteor',
+    'nuke',
+    'worm',
+  ];
+  for (const id of requiredIds) {
+    assert.ok(
+      BUILTIN_TOOLS.some((t) => t.id === id),
+      `Expected built-in tool '${id}' to exist in BUILTIN_TOOLS`,
+    );
+  }
+
+  const customTool = createCustomToolTemplate('nuke', { name: '自定义聚变核弹' });
+  assert.equal(customTool.isCustom, true);
+  assert.equal(customTool.group, 'custom');
+  assert.equal(customTool.name, '自定义聚变核弹');
+  assert.equal(customTool.attributes.behavior, 'nuke');
+
+  const resolvedOverridden = resolveToolDefinition(
+    'megaLaser',
+    [customTool],
+    { megaLaser: { radiusMult: 3.1, thermalDeltaC: 2400 } },
+  );
+  assert.equal(resolvedOverridden.attributes.radiusMult, 3.1);
+  assert.equal(resolvedOverridden.attributes.thermalDeltaC, 2400);
+
+  const resolvedCustom = resolveToolDefinition(customTool.id, [customTool], {});
+  assert.equal(resolvedCustom.id, customTool.id);
+  assert.equal(resolvedCustom.name, '自定义聚变核弹');
+
+  // 2. VoxelPlanet crater, volcano, quake & rimMaterial on macro grid
+  const R = 13;
+  const macro = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 32, radius: R });
+  const surfaceHit = macro.raycastTerrain(0, R + 8, 0, 0, -1, 0, 20);
+  assert.ok(surfaceHit.hit, 'Raycast should hit north pole surface');
+
+  // Crater: hollows pit center while depositing floor & rim basalt
+  macro.applyBrush(surfaceHit.x, surfaceHit.y, surfaceHit.z, 'crater', 3.2, 2.6, MaterialId.Basalt, {
+    rimMaterial: MaterialId.Basalt,
+    floorMaterial: MaterialId.Basalt,
+  });
+  const pitCheckY = surfaceHit.y + 0.1;
+  assert.ok(macro.sampleDensity(surfaceHit.x, pitCheckY, surfaceHit.z) < 0, 'Crater should excavate pit center');
+
+  // Laser with rimMaterial chars surrounding wall to Basalt
+  const laserHit = macro.raycastTerrain(0, -R - 8, 0, 0, 1, 0, 20);
+  assert.ok(laserHit.hit);
+  macro.applyBrush(laserHit.x, laserHit.y, laserHit.z, 'laser', 1.5, 2.0, MaterialId.Air, {
+    ex: laserHit.x,
+    ey: laserHit.y + 6,
+    ez: laserHit.z,
+    shape: 'cylinder',
+    rimMaterial: MaterialId.Basalt,
+  });
+  assert.ok(macro.sampleDensity(laserHit.x, laserHit.y + 2.0, laserHit.z) < 0, 'Laser channel should be hollowed');
+
+  // Volcano at equatorial east pole builds a positive cone above surface
+  const eastHit = macro.raycastTerrain(R + 8, 0, 0, -1, 0, 0, 20);
+  assert.ok(eastHit.hit);
+  const aboveVolcanoX = eastHit.x + 1.4;
+  macro.applyBrush(eastHit.x, eastHit.y, eastHit.z, 'volcano', 3.0, 2.8, MaterialId.Basalt, {
+    rimMaterial: MaterialId.Basalt,
+  });
+  assert.ok(
+    macro.sampleDensity(aboveVolcanoX, eastHit.y, eastHit.z) > 0,
+    'Volcano cone should raise solid terrain above original equator surface',
+  );
+
+  // Quake applies jagged displacement & preserves non-NaN density
+  macro.applyBrush(0, 0, -R, 'quake', 3.5, 1.5, MaterialId.Stone);
+  const quakeSample = macro.sampleDensity(0, 0, -R);
+  assert.ok(Number.isFinite(quakeSample));
+
+  // SVO (>1B^3) crater operation also records and hollows center
+  const svo = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 512, radius: R });
+  svo.applyBrush(0, R, 0, 'crater', 3.2, 2.8, MaterialId.Basalt, {
+    rimMaterial: MaterialId.Basalt,
+    floorMaterial: MaterialId.Basalt,
+  });
+  assert.ok(svo.sampleDensity(0, R + 0.2, 0) < 0, 'SVO crater pit center should be carved');
+
+  // 3. FluidSim radial explosion impulse & swirl vortex
+  const fluid = new FluidSim();
+  fluid.spawnParticle(1.0, R + 1, 0, 0, 0, 0);
+  const blasted = fluid.applyRadialImpulse(0, R + 1, 0, 4.0, 8.0, 3.0);
+  assert.equal(blasted, 1);
+  assert.ok(fluid.vx[0] > 0.5 && fluid.vy[0] > 0.5, 'Explosion impulse should accelerate fluid outward and upward');
+
+  const swirled = fluid.applySwirlVortex(0, R + 1, 0, 0, 1, 0, 5.0, 6.0, 2.0);
+  assert.equal(swirled, 1);
+  assert.ok(Math.abs(fluid.vz[0]) > 0.1, 'Vortex should impart tangential swirl velocity around Y axis');
+
+  // 4. Thermal hotspots heat the planetary field smoothly and decay
+  const hotspots = [{ x: 0, y: R, z: 0, radius: 5.0, deltaC: 900, decayPerSec: 120 }];
+  const deltaCenter = computeHotspotDeltaC(0, R, 0, hotspots);
+  const deltaFar = computeHotspotDeltaC(0, -R, 0, hotspots);
+  assert.ok(deltaCenter > 850);
+  assert.equal(deltaFar, 0);
+
+  const coolSample = sampleThermalField(0, R, 0, R, [0, 1, 0], DEFAULT_ATMOS_CONFIG, DEFAULT_THERMAL_CONFIG, 0, MaterialId.Soil, 0, 0);
+  const hotSample = sampleThermalField(0, R, 0, R, [0, 1, 0], DEFAULT_ATMOS_CONFIG, DEFAULT_THERMAL_CONFIG, 0, MaterialId.Soil, 0, deltaCenter);
+  assert.ok(hotSample.tempC > coolSample.tempC + 800);
+  assert.equal(hotSample.regime, '地热熔岩带');
+});
+
+test('Director choreography (6K/165fps presets, micro-to-planet zoom, 360 orbit, surface flyover, keyframe spline) & WebM/TAR muxing', () => {
+  // 1. Resolution (6K) & FPS (165) presets + frame count math
+  const p6k = RESOLUTION_PRESETS.find((r) => r.id === '6k');
+  const p6kDci = RESOLUTION_PRESETS.find((r) => r.id === '6k-dci');
+  assert.ok(p6k && p6k.width === 5760 && p6k.height === 3240);
+  assert.ok(p6kDci && p6kDci.width === 6144 && p6kDci.height === 3456);
+  assert.ok(FPS_PRESETS.includes(165) && FPS_PRESETS.includes(240));
+
+  const defaultPlan = createDefaultDirectorPlan();
+  assert.equal(defaultPlan.width, 5760);
+  assert.equal(defaultPlan.height, 3240);
+  assert.equal(defaultPlan.fps, 165);
+  assert.equal(computePlanFrameCount(defaultPlan), 6 * 165);
+
+  const R = 13.0;
+  const nativeVoxelSize = R / 500_000_000;
+  const anchor: DirectorSceneAnchor = {
+    baseRadius: R,
+    nativeVoxelSize,
+    targetPoint: [0, R, 0],
+    targetNormal: [0, 1, 0],
+    currentPos: [0, R * 2.5, 0],
+    currentLookAt: [0, 0, 0],
+    currentUp: [0, 1, 0],
+    currentFovDeg: 52,
+    sampleSurfaceRadius: (dx, dy, dz) => R + 0.4 * Math.sin(dx * 3 + dy * 2 - dz),
+  };
+
+  // 2. micro_to_planet: log-space streamDist strictly increases & transitions from telephoto micro to wide planet
+  const microStart = evaluateDirectorPose(defaultPlan, 0, anchor);
+  const microMid = evaluateDirectorPose(defaultPlan, 0.5, anchor);
+  const microEnd = evaluateDirectorPose(defaultPlan, 1, anchor);
+
+  assert.ok(
+    microStart.streamDist <= nativeVoxelSize * 2.5,
+    `Expected start streamDist near native voxel (~${nativeVoxelSize * 2}), got ${microStart.streamDist}`,
+  );
+  assert.ok(microMid.streamDist > microStart.streamDist * 100, 'Mid shot should pull far away from 1:1 voxel');
+  assert.ok(microEnd.streamDist > R * 2.0, `Expected macro end distance > 2R, got ${microEnd.streamDist}`);
+  assert.ok(microStart.fovDeg < 15, `Expected telephoto zoom at micro voxel end, got ${microStart.fovDeg}`);
+  assert.ok(Math.abs(microEnd.fovDeg - defaultPlan.baseFovDeg) < 1.0);
+  assert.ok(Math.abs(Math.hypot(...microMid.up) - 1) < 1e-4, 'Pose up vector must stay unit length');
+
+  // 3. orbit_360: completes full 360° revolution back to same horizontal azimuth & sweeps sunlight
+  const orbitPlan = { ...defaultPlan, action: 'orbit_360' as const, orbitSweepDeg: 360, sunSweepDeg: 90 };
+  const orb0 = evaluateDirectorPose(orbitPlan, 0, anchor);
+  const orbHalf = evaluateDirectorPose(orbitPlan, 0.5, anchor);
+  const orb1 = evaluateDirectorPose(orbitPlan, 1, anchor);
+  assert.ok(orb0.position[0] * orbHalf.position[0] + orb0.position[2] * orbHalf.position[2] < 0, 'Halfway through 360 orbit must be on opposite side');
+  assert.ok(Math.hypot(orb0.position[0] - orb1.position[0], orb0.position[1] - orb1.position[1], orb0.position[2] - orb1.position[2]) < 1e-3, '360 orbit should close loop seamlessly');
+  assert.equal(orb1.sunAzimuthDeltaDeg, 90);
+
+  // 4. surface_flyover: maintains altitude clearance above sampled terrain height
+  const flyPlan = { ...defaultPlan, action: 'surface_flyover' as const, planetEndDistMult: 1.35 };
+  const flyPose = evaluateDirectorPose(flyPlan, 0.4, anchor);
+  const dirLen = Math.hypot(...flyPose.position);
+  const nx = flyPose.position[0] / dirLen;
+  const ny = flyPose.position[1] / dirLen;
+  const nz = flyPose.position[2] / dirLen;
+  const groundR = anchor.sampleSurfaceRadius!(nx, ny, nz);
+  assert.ok(dirLen > groundR + 1.0, `Expected flyover clearance above terrain (${groundR}), got r=${dirLen}`);
+
+  // 5. keyframe_path: Catmull-Rom passes smoothly through captured keyframes
+  const kfPlan = {
+    ...defaultPlan,
+    action: 'keyframe_path' as const,
+    keyframes: [
+      { id: '1', label: 'KF1', position: [0, 20, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], up: [0, 1, 0] as [number, number, number], fovDeg: 40 },
+      { id: '2', label: 'KF2', position: [20, 10, 10] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], up: [0, 1, 0] as [number, number, number], fovDeg: 55 },
+      { id: '3', label: 'KF3', position: [0, 0, 25] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], up: [0, 1, 0] as [number, number, number], fovDeg: 65 },
+    ],
+  };
+  const kfStart = evaluateDirectorPose(kfPlan, 0, anchor);
+  const kfEnd = evaluateDirectorPose(kfPlan, 1, anchor);
+  assert.ok(Math.hypot(kfStart.position[0] - 0, kfStart.position[1] - 20, kfStart.position[2] - 0) < 1e-4);
+  assert.ok(Math.hypot(kfEnd.position[0] - 0, kfEnd.position[1] - 0, kfEnd.position[2] - 25) < 1e-4);
+
+  // 6. WebmMuxer produces valid EBML + WebM VP9 container at 5760x3240 @ 165fps
+  const muxer = new WebmMuxer({ width: 5760, height: 3240, fps: 165, codec: 'V_VP9' });
+  const frameStepUs = 1_000_000 / 165;
+  for (let i = 0; i < 6; i++) {
+    const dummyChunk = new Uint8Array(64).fill(0x2a + i);
+    muxer.addVideoChunk(dummyChunk, Math.round(i * frameStepUs), i % 3 === 0);
+  }
+  const webmBytes = muxer.finalize();
+  // Starts with EBML Header ID 0x1A 0x45 0xDF 0xA3
+  assert.deepEqual(Array.from(webmBytes.subarray(0, 4)), [0x1a, 0x45, 0xdf, 0xa3]);
+  const ascii = new TextDecoder('latin1').decode(webmBytes);
+  assert.ok(ascii.includes('webm'), 'WebM EBML DocType should be webm');
+  assert.ok(ascii.includes('V_VP9'), 'WebM Tracks should declare V_VP9');
+  assert.ok(webmBytes.length > 450, 'Muxed WebM output should contain header, tracks, and frame blocks');
+
+  // 7. buildTarArchive emits 512-byte ustar aligned archive with EOF padding
+  const tar = buildTarArchive([
+    { name: 'frame_00001.png', data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) },
+    { name: 'frame_00002.png', data: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]) },
+  ]);
+  assert.equal(tar.length % 512, 0);
+  const tarHeaderText = new TextDecoder('latin1').decode(tar.subarray(0, 265));
+  assert.ok(tarHeaderText.startsWith('frame_00001.png'));
+  assert.ok(tarHeaderText.includes('ustar'));
+});
+
+test('Tractor Beam tool registry, ray/drag-plane math, Newtonian gravity load & sag coupling, and SPH tidal fluid stretch', () => {
+  // 1. Tool registry & custom template support
+  const tractorDef = BUILTIN_TOOLS.find((t) => t.id === 'tractorBeam');
+  assert.ok(tractorDef, 'tractorBeam tool should be registered in BUILTIN_TOOLS');
+  assert.equal(tractorDef.iconName, 'magnet');
+  assert.equal(tractorDef.attributes.behavior, 'tractorBeam');
+  const tractorPreset = TOOL_BEHAVIOR_PRESETS.find((p) => p.behavior === 'tractorBeam');
+  assert.equal(tractorPreset?.defaultIcon, 'magnet');
+
+  const customTractor = createCustomToolTemplate('tractorBeam', { name: '重型潮汐牵引器' });
+  assert.equal(customTractor.attributes.behavior, 'tractorBeam');
+  assert.equal(customTractor.isCustom, true);
+
+  // 2. Ray-point proximity & camera drag plane intersection
+  const rayHit = computeRayPointDistanceSq(0, 25, 0, 0, -1, 0, 1.2, 14, 0);
+  assert.equal(rayHit.hit, true);
+  assert.ok(Math.abs(rayHit.t - 11) < 1e-6);
+  assert.ok(Math.abs(rayHit.distSq - 1.44) < 1e-6);
+
+  const dragPt = { x: 0, y: 0, z: 0 };
+  const planeOk = intersectCursorWithDragPlane(
+    0,
+    30,
+    0,
+    0.2,
+    -1,
+    0,
+    0,
+    15,
+    0,
+    0,
+    -1,
+    0,
+    2,
+    100,
+    13,
+    dragPt,
+  );
+  assert.equal(planeOk, true);
+  assert.ok(Math.abs(dragPt.y - 15) < 1e-4);
+  assert.ok(Math.abs(dragPt.x - 3.0) < 1e-4);
+
+  // 3. Newtonian inverse-square & Shell Theorem load + realistic gravitational sag
+  const R = DEFAULT_PLANET_RADIUS;
+  const g1Params = { referenceRadius: R, surfaceGravity: EARTH_SURFACE_GRAVITY };
+  const g0Params = { referenceRadius: R, surfaceGravity: 0 };
+  const g3Params = { referenceRadius: R, surfaceGravity: EARTH_SURFACE_GRAVITY * 3 };
+
+  const beamParams = {
+    planetRadius: R,
+    beamPower: 1.8,
+    gravityCompFactor: 0.44,
+    maxAccelG: 5.8,
+    massKg: 2.0,
+  };
+  const out0 = { fx: 0, fy: 0, fz: 0, beamForceN: 0, gravityWeightN: 0, localGravityMs2: 0, loadRatio: 0, saturated: false };
+  const out1 = { ...out0 };
+  const out3 = { ...out0 };
+
+  // At rest in equilibrium below target: 0g needs 0 force at target; 3g demands ~3x gravityWeightN than 1g
+  computeTractorSpringForce(0, R, 0, 0, 0, 0, 0, R, 0, 0, 0, 0, g0Params, beamParams, 1.0, out0);
+  assert.equal(out0.gravityWeightN, 0);
+  assert.ok(out0.beamForceN < 1e-6);
+
+  // Simulate steady hover integration under 0g vs 1g vs 3g toward target at (0, R + 3, 0)
+  const simulateHoverY = (gp: { referenceRadius: number; surfaceGravity: number }) => {
+    let py = R + 3;
+    let vy = 0;
+    const res = { ...out0 };
+    const gv = { x: 0, y: 0, z: 0 };
+    const dt = 0.015;
+    for (let s = 0; s < 160; s++) {
+      computeGravityVector(0, py, 0, gp, gv);
+      computeTractorSpringForce(0, py, 0, 0, vy, 0, 0, R + 3, 0, 0, 0, 0, gp, beamParams, 1.0, res);
+      vy += (gv.y + res.fy / beamParams.massKg) * dt;
+      py += vy * dt;
+    }
+    return { steadyY: py, res };
+  };
+
+  const sim0 = simulateHoverY(g0Params);
+  const sim1 = simulateHoverY(g1Params);
+  const sim3 = simulateHoverY(g3Params);
+  const sag0 = R + 3 - sim0.steadyY;
+  const sag1 = R + 3 - sim1.steadyY;
+  const sag3 = R + 3 - sim3.steadyY;
+  assert.ok(Math.abs(sag0) < 1e-4, `Expected zero gravitational sag in 0g, got ${sag0}`);
+  assert.ok(sag1 > 0.01, `Expected downward gravitational sag in 1g, got ${sag1}`);
+  assert.ok(sag3 > sag1 * 2.2, `Expected 3g sag (${sag3}) > 2.2x 1g sag (${sag1})`);
+
+  // Inverse-square weight attenuation at 2*R0 altitude vs surface R0, and Shell Theorem inside (0.5*R0)
+  computeTractorSpringForce(0, R, 0, 0, 0, 0, 0, R, 0, 0, 0, 0, g1Params, beamParams, 1.0, out1);
+  computeTractorSpringForce(0, R * 2, 0, 0, 0, 0, 0, R * 2, 0, 0, 0, 0, g1Params, beamParams, 1.0, out3);
+  assert.ok(Math.abs(out3.gravityWeightN - out1.gravityWeightN / 4) < 1e-3, 'Gravity weight at 2*R0 must drop by 1/4');
+
+  const outInner = { ...out0 };
+  computeTractorSpringForce(0, R * 0.5, 0, 0, 0, 0, 0, R * 0.5, 0, 0, 0, 0, g1Params, beamParams, 1.0, outInner);
+  assert.ok(Math.abs(outInner.gravityWeightN - out1.gravityWeightN * 0.5) < 1e-3, 'Shell theorem inside at 0.5*R0 halves weight');
+
+  const escNear = summarizeEscapeStatus(0, R + 2, 0, computeEscapeVelocity(R + 2, g1Params) * 0.9, g1Params);
+  assert.equal(escNear.nearEscape, true);
+
+  // 4. Stretch interpolation + FluidSim real-time upward lifting, tidal elongation & release drop
+  const stretchPt0 = evaluateStretchedAnchorPoint(0, 14, 0, 0, 22, 0, 0, 0.72, { x: 0, y: 0, z: 0 });
+  const stretchPt1 = evaluateStretchedAnchorPoint(0, 14, 0, 0, 22, 0, 1, 0.72, { x: 0, y: 0, z: 0 });
+  assert.ok(stretchPt1.y - stretchPt0.y > 5.0);
+
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, radius: R, voxelRadius: 18 });
+  const fluid = new FluidSim();
+  for (let k = 0; k < 28; k++) {
+    fluid.spawnParticle(
+      (k % 5 - 2) * 0.25,
+      R + 0.8 + Math.floor(k / 5) * 0.22,
+      ((k % 3) - 1) * 0.25,
+    );
+  }
+  const captured = fluid.captureParticlesForTractor(0, R + 1.2, 0, 3.0, 0, 1, 0, 64);
+  assert.equal(captured, 28);
+
+  let minU = 1;
+  let maxU = 0;
+  for (let i = 0; i < fluid.activeCount; i++) {
+    if (fluid.tractorStretchU[i] < minU) minU = fluid.tractorStretchU[i];
+    if (fluid.tractorStretchU[i] > maxU) maxU = fluid.tractorStretchU[i];
+  }
+  assert.ok(maxU - minU > 0.75, 'Captured particles should span [0, 1] along stretch axis');
+
+  // Step fluid upward while dragging tractor beam high above planet surface
+  for (let s = 0; s < 35; s++) {
+    const progress = s / 34;
+    const headY = R + 2.0 + progress * 7.5;
+    const anchorY = R + 1.2 + progress * 2.5;
+    fluid.step(0.02, planet, g1Params, 2, {
+      anchorX: 0,
+      anchorY,
+      anchorZ: 0,
+      targetX: 0,
+      targetY: headY,
+      targetZ: 0,
+      dragVelX: 0,
+      dragVelY: 6.0,
+      dragVelZ: 0,
+      radius: 3.0,
+      beamPower: 2.8,
+      stretchStrength: 0.74,
+    });
+  }
+
+  let avgYDragged = 0;
+  let minYLifted = Infinity;
+  let maxYLifted = -Infinity;
+  for (let i = 0; i < fluid.activeCount; i++) {
+    avgYDragged += fluid.py[i];
+    if (fluid.py[i] < minYLifted) minYLifted = fluid.py[i];
+    if (fluid.py[i] > maxYLifted) maxYLifted = fluid.py[i];
+  }
+  avgYDragged /= fluid.activeCount;
+  assert.ok(avgYDragged > R + 3.0, `Expected fluid plume lifted above R+3 (${R + 3}), got ${avgYDragged}`);
+  assert.ok(maxYLifted - minYLifted > 1.8, `Expected tidal elongation span > 1.8m, got ${maxYLifted - minYLifted}`);
+  assert.ok(fluid.tractorTotalBeamForceN > 0 && fluid.tractorTotalGravityWeightN > 0);
+
+  // Release beam: particles must fall back toward planet under Newtonian gravity
+  fluid.releaseTractorCapture();
+  assert.equal(fluid.tractorCapturedCount, 0);
+  for (let s = 0; s < 55; s++) {
+    fluid.step(0.02, planet, g1Params, 2, null);
+  }
+  let avgYDropped = 0;
+  for (let i = 0; i < fluid.activeCount; i++) {
+    avgYDropped += fluid.py[i];
+  }
+  avgYDropped /= fluid.activeCount;
+  assert.ok(avgYDropped < avgYDragged - 1.5, `Released water should fall back under gravity (${avgYDropped} < ${avgYDragged})`);
+});

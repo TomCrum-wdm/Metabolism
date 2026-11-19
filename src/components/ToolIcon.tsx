@@ -1,0 +1,112 @@
+import React from 'react';
+import {
+  Activity,
+  ArrowUpFromLine,
+  Bomb,
+  Boxes,
+  Bug,
+  CloudLightning,
+  Crosshair,
+  Disc3,
+  Droplets,
+  Eraser,
+  Flame,
+  FlameKindling,
+  Gem,
+  Magnet,
+  Minus,
+  Mountain,
+  Orbit,
+  Paintbrush,
+  Pickaxe,
+  Pipette,
+  Radar,
+  Radiation,
+  Radio,
+  Rocket,
+  Scissors,
+  Snowflake,
+  Sparkles,
+  Sun,
+  Trees,
+  Wand2,
+  Waves,
+  Wind,
+  Zap,
+} from 'lucide-react';
+import { ToolIconName } from '../engine/toolRegistry';
+
+export const TOOL_ICON_MAP: Record<ToolIconName, React.FC<{ className?: string }>> = {
+  pipette: Pipette,
+  radar: Radar,
+  pickaxe: Pickaxe,
+  crosshair: Crosshair,
+  zap: Zap,
+  radio: Radio,
+  sun: Sun,
+  scissors: Scissors,
+  bomb: Bomb,
+  radiation: Radiation,
+  flame: Flame,
+  'flame-kindling': FlameKindling,
+  'cloud-lightning': CloudLightning,
+  orbit: Orbit,
+  bug: Bug,
+  rocket: Rocket,
+  disc3: Disc3,
+  wind: Wind,
+  boxes: Boxes,
+  'arrow-up-from-line': ArrowUpFromLine,
+  mountain: Mountain,
+  gem: Gem,
+  activity: Activity,
+  waves: Waves,
+  minus: Minus,
+  trees: Trees,
+  paintbrush: Paintbrush,
+  snowflake: Snowflake,
+  droplets: Droplets,
+  sparkles: Sparkles,
+  eraser: Eraser,
+  magnet: Magnet,
+  wand: Wand2,
+};
+
+export const TOOL_ICON_OPTIONS: ReadonlyArray<{
+  id: ToolIconName;
+  label: string;
+}> = [
+  { id: 'sun', label: '大激光' },
+  { id: 'radio', label: '连续束' },
+  { id: 'zap', label: '电弧束' },
+  { id: 'crosshair', label: '准星钻' },
+  { id: 'bomb', label: '炸弹' },
+  { id: 'radiation', label: '核爆' },
+  { id: 'flame', label: '火焰' },
+  { id: 'flame-kindling', label: '熔岩' },
+  { id: 'cloud-lightning', label: '闪电' },
+  { id: 'orbit', label: '陨石' },
+  { id: 'bug', label: '蠕虫' },
+  { id: 'rocket', label: '动能弹' },
+  { id: 'disc3', label: '黑洞' },
+  { id: 'wind', label: '龙卷' },
+  { id: 'mountain', label: '火山' },
+  { id: 'gem', label: '晶矿' },
+  { id: 'activity', label: '震波' },
+  { id: 'pickaxe', label: '矿镐' },
+  { id: 'boxes', label: '堆叠' },
+  { id: 'arrow-up-from-line', label: '拉伸' },
+  { id: 'trees', label: '绿化' },
+  { id: 'snowflake', label: '极冰' },
+  { id: 'droplets', label: '水滴' },
+  { id: 'magnet', label: '牵引光束' },
+  { id: 'wand', label: '自定义' },
+];
+
+export const ToolIcon: React.FC<{
+  iconName: ToolIconName;
+  className?: string;
+}> = ({ iconName, className }) => {
+  const IconComp = TOOL_ICON_MAP[iconName] ?? Wand2;
+  return <IconComp className={className} />;
+};

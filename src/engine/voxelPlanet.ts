@@ -17,7 +17,34 @@ export enum MaterialId {
   Sandstone = 6,
 }
 
-export type BrushMode = 'carve' | 'build' | 'smooth' | 'flatten' | 'water';
+export type BrushMode =
+  | 'probe'
+  | 'carve'
+  | 'tunnel'
+  | 'laser'
+  | 'bore'
+  | 'build'
+  | 'extrude'
+  | 'smooth'
+  | 'flatten'
+  | 'paint'
+  | 'crater'
+  | 'volcano'
+  | 'quake'
+  | 'water'
+  | 'drain';
+
+export interface BrushApplyOptions {
+  ex?: number;
+  ey?: number;
+  ez?: number;
+  shape?: 'sphere' | 'cylinder';
+  rimMaterial?: MaterialId;
+  rimHeight?: number;
+  floorMaterial?: MaterialId;
+  jaggedNoise?: number;
+}
+
 export type ChunkLodLevel = 0 | 1 | 2;
 export type TerrainRenderMode = 'smooth' | 'blocky';
 export type TerrainOverlayMode = 'material' | 'temperature' | 'density' | 'lod';
@@ -351,6 +378,80 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
   return t * t * (3 - 2 * t);
 }
 
+function distPointToSegment(
+  px: number,
+  py: number,
+  pz: number,
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+): number {
+  const vx = bx - ax;
+  const vy = by - ay;
+  const vz = bz - az;
+  const lenSq = vx * vx + vy * vy + vz * vz;
+  if (lenSq <= 1e-12) {
+    return Math.hypot(px - ax, py - ay, pz - az);
+  }
+  const t = clamp(
+    ((px - ax) * vx + (py - ay) * vy + (pz - az) * vz) / lenSq,
+    0,
+    1,
+  );
+  return Math.hypot(px - (ax + vx * t), py - (ay + vy * t), pz - (az + vz * t));
+}
+
+function distSegmentToAabbSq(
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+  minZ: number,
+  maxZ: number,
+): number {
+  const mx = (minX + maxX) * 0.5;
+  const my = (minY + maxY) * 0.5;
+  const mz = (minZ + maxZ) * 0.5;
+  const vx = bx - ax;
+  const vy = by - ay;
+  const vz = bz - az;
+  const lenSq = vx * vx + vy * vy + vz * vz;
+  let t =
+    lenSq > 1e-12
+      ? clamp(((mx - ax) * vx + (my - ay) * vy + (mz - az) * vz) / lenSq, 0, 1)
+      : 0;
+  let sx = ax + vx * t;
+  let sy = ay + vy * t;
+  let sz = az + vz * t;
+  let qx = clamp(sx, minX, maxX);
+  let qy = clamp(sy, minY, maxY);
+  let qz = clamp(sz, minZ, maxZ);
+
+  if (lenSq > 1e-12) {
+    t = clamp(((qx - ax) * vx + (qy - ay) * vy + (qz - az) * vz) / lenSq, 0, 1);
+    sx = ax + vx * t;
+    sy = ay + vy * t;
+    sz = az + vz * t;
+    qx = clamp(sx, minX, maxX);
+    qy = clamp(sy, minY, maxY);
+    qz = clamp(sz, minZ, maxZ);
+  }
+
+  const dx = sx - qx;
+  const dy = sy - qy;
+  const dz = sz - qz;
+  return dx * dx + dy * dy + dz * dz;
+}
+
 export interface SparseVoxelChunk {
   key: string;
   cx: number;
@@ -371,15 +472,25 @@ export interface SparseVoxelChunk {
   lastUsedFrame: number;
 }
 
+type SculptBrushMode = Exclude<BrushMode, 'water' | 'drain' | 'probe'>;
+
 interface BrushOpRecord {
   cx: number;
   cy: number;
   cz: number;
-  mode: 'carve' | 'build' | 'flatten';
+  ex: number;
+  ey: number;
+  ez: number;
+  shape: 'sphere' | 'cylinder';
+  mode: Exclude<SculptBrushMode, 'smooth'>;
   radius: number;
   strength: number;
   materialId: MaterialId;
   targetShellRadius: number;
+  rimMaterial?: MaterialId;
+  rimHeight?: number;
+  floorMaterial?: MaterialId;
+  jaggedNoise?: number;
 }
 
 interface AnalyticalContext {
@@ -1658,7 +1769,52 @@ export class VoxelPlanet {
       this.hasGenerated &&
       Math.abs(macroD) <= this.voxelSize * 2.5
     ) {
-      return this.evalAnalyticalAt(wx, wy, wz, true).density;
+      let d = this.evalAnalyticalAt(wx, wy, wz, true).density;
+      if (this.brushOps.length > 0) {
+        const rScale = this.baseRadius / 13.0;
+        for (let i = 0; i < this.brushOps.length; i++) {
+          const op = this.brushOps[i];
+          const dist =
+            op.shape === 'cylinder'
+              ? distPointToSegment(wx, wy, wz, op.cx, op.cy, op.cz, op.ex, op.ey, op.ez)
+              : Math.hypot(wx - op.cx, wy - op.cy, wz - op.cz);
+          if (dist >= op.radius) continue;
+          const falloff = 1 - smoothstep(0, op.radius, dist);
+          if (op.mode === 'carve' || op.mode === 'tunnel' || op.mode === 'laser' || op.mode === 'bore') {
+            const mult =
+              op.mode === 'tunnel' || op.mode === 'laser' ? 8.0 : op.mode === 'bore' ? 4.5 : 1.0;
+            d = Math.max(-4.5 * rScale, d - op.strength * rScale * mult * falloff);
+          } else if (op.mode === 'build' || op.mode === 'extrude') {
+            d = Math.min(4.5 * rScale, d + op.strength * rScale * falloff);
+          } else if (op.mode === 'flatten') {
+            const desired = op.targetShellRadius - Math.hypot(wx, wy, wz);
+            d = d + (desired - d) * clamp(falloff * op.strength * 0.65, 0, 1);
+          } else if (op.mode === 'crater') {
+            const nr = dist / op.radius;
+            if (nr < 0.72) {
+              const pit = 1 - smoothstep(0, 0.72, nr);
+              d = Math.max(-4.5 * rScale, d - op.strength * rScale * 2.2 * pit);
+            } else if ((op.rimHeight ?? 0) > 0) {
+              const rimT = Math.sin(clamp((nr - 0.68) / 0.32, 0, 1) * Math.PI);
+              d = Math.min(4.5 * rScale, d + (op.rimHeight ?? 0.65) * rScale * rimT);
+            }
+          } else if (op.mode === 'volcano') {
+            const nr = dist / op.radius;
+            if (nr < 0.34) {
+              const caldera = 1 - smoothstep(0, 0.34, nr);
+              d = Math.max(-4.5 * rScale, d - op.strength * rScale * 1.45 * caldera);
+            } else {
+              const cone = 1 - smoothstep(0.32, 1.0, nr);
+              d = Math.min(4.5 * rScale, d + op.strength * rScale * 2.1 * cone);
+            }
+          } else if (op.mode === 'quake') {
+            const n = Math.sin(wx * 3.7 + wy * 2.9 - wz * 4.1) * 0.5 + 0.5;
+            const crag = (n - 0.52) * 2.0 * (op.jaggedNoise ?? 1.0);
+            d = clamp(d + crag * op.strength * rScale * falloff * 1.8, -4.5 * rScale, 4.5 * rScale);
+          }
+        }
+      }
+      return d;
     }
 
     return macroD;
@@ -1814,35 +1970,42 @@ export class VoxelPlanet {
   }
 
   /**
-   * Sculpt, build, smooth, or spherically flatten the planetary voxel field (and active high-res sparse chunks).
+   * Sculpt, pierce, extrude, paint, smooth, or flatten the planetary voxel field (and active high-res sparse chunks).
    */
   public applyBrush(
     cx: number,
     cy: number,
     cz: number,
-    mode: Exclude<BrushMode, 'water'>,
+    mode: Exclude<BrushMode, 'water' | 'drain' | 'probe'>,
     radius: number,
     strength: number,
     materialId: MaterialId,
+    options?: BrushApplyOptions,
   ): BrushResult {
     const minUnit = this.isHighResStreaming
       ? Math.min(this.voxelSize, this.nativeVoxelSize)
       : this.voxelSize;
     const safeRad = Math.max(minUnit * 0.5, radius);
     const rScale = this.baseRadius / 13.0;
+    const isCylinder = options?.shape === 'cylinder';
+    const ex = isCylinder && options?.ex !== undefined ? options.ex : cx;
+    const ey = isCylinder && options?.ey !== undefined ? options.ey : cy;
+    const ez = isCylinder && options?.ez !== undefined ? options.ez : cz;
+    const shape: 'sphere' | 'cylinder' = isCylinder ? 'cylinder' : 'sphere';
+
     const pad = safeRad + this.voxelSize * 1.5;
     const cellsPerAxis = this.cellsPerAxis;
-    const minX = clamp(Math.floor(this.worldToGrid(cx - pad)), 1, cellsPerAxis - 1);
-    const maxX = clamp(Math.ceil(this.worldToGrid(cx + pad)), 1, cellsPerAxis - 1);
-    const minY = clamp(Math.floor(this.worldToGrid(cy - pad)), 1, cellsPerAxis - 1);
-    const maxY = clamp(Math.ceil(this.worldToGrid(cy + pad)), 1, cellsPerAxis - 1);
-    const minZ = clamp(Math.floor(this.worldToGrid(cz - pad)), 1, cellsPerAxis - 1);
-    const maxZ = clamp(Math.ceil(this.worldToGrid(cz + pad)), 1, cellsPerAxis - 1);
+    const minX = clamp(Math.floor(this.worldToGrid(Math.min(cx, ex) - pad)), 1, cellsPerAxis - 1);
+    const maxX = clamp(Math.ceil(this.worldToGrid(Math.max(cx, ex) + pad)), 1, cellsPerAxis - 1);
+    const minY = clamp(Math.floor(this.worldToGrid(Math.min(cy, ey) - pad)), 1, cellsPerAxis - 1);
+    const maxY = clamp(Math.ceil(this.worldToGrid(Math.max(cy, ey) + pad)), 1, cellsPerAxis - 1);
+    const minZ = clamp(Math.floor(this.worldToGrid(Math.min(cz, ez) - pad)), 1, cellsPerAxis - 1);
+    const maxZ = clamp(Math.ceil(this.worldToGrid(Math.max(cz, ez) + pad)), 1, cellsPerAxis - 1);
 
     const targetShellRadius = Math.hypot(cx, cy, cz);
     let deltaVolume = 0;
 
-    // 1. Update macro grid (attenuate slightly when brush is much smaller than a macro voxel)
+    // 1. Update macro grid
     const macroRad = Math.max(safeRad, this.voxelSize * 0.65);
     const macroWeight = clamp(safeRad / (this.voxelSize * 0.65), 0.12, 1.0);
     let copySnapshot: Float32Array | null = null;
@@ -1850,30 +2013,114 @@ export class VoxelPlanet {
       copySnapshot = new Float32Array(this.density);
     }
 
+    const isPiercingCarve = mode === 'tunnel' || mode === 'laser';
+    const carveMult = isPiercingCarve ? 9.0 : mode === 'bore' ? 5.0 : 1.0;
+
     for (let iz = minZ; iz <= maxZ; iz++) {
       const wz = this.gridToWorld(iz);
       for (let iy = minY; iy <= maxY; iy++) {
         const wy = this.gridToWorld(iy);
         for (let ix = minX; ix <= maxX; ix++) {
           const wx = this.gridToWorld(ix);
-          const dist = Math.hypot(wx - cx, wy - cy, wz - cz);
+          const dist =
+            shape === 'cylinder'
+              ? distPointToSegment(wx, wy, wz, cx, cy, cz, ex, ey, ez)
+              : Math.hypot(wx - cx, wy - cy, wz - cz);
           if (dist >= macroRad) continue;
 
-          const falloff = (1 - smoothstep(0, macroRad, dist)) * macroWeight;
+          const rawFalloff = 1 - smoothstep(0, macroRad, dist);
+          const falloff =
+            (isPiercingCarve
+              ? Math.max(rawFalloff, dist < macroRad * 0.72 ? 1.0 : rawFalloff)
+              : rawFalloff) * macroWeight;
           const idx = this.gridIndex(ix, iy, iz);
           const prev = this.density[idx];
           let next = prev;
 
-          if (mode === 'carve') {
-            next = Math.max(-4.5 * rScale, prev - strength * rScale * falloff);
+          if (mode === 'carve' || mode === 'tunnel' || mode === 'laser' || mode === 'bore') {
+            next = Math.max(-4.5 * rScale, prev - strength * rScale * carveMult * falloff);
             if (next <= 0) {
               this.material[idx] = MaterialId.Air;
+            } else if (
+              options?.rimMaterial !== undefined &&
+              options.rimMaterial !== MaterialId.Air &&
+              dist >= macroRad * 0.62
+            ) {
+              this.material[idx] = options.rimMaterial;
             }
-          } else if (mode === 'build') {
-            next = Math.min(4.5 * rScale, prev + strength * rScale * falloff);
+          } else if (mode === 'crater') {
+            const nr = dist / macroRad;
+            const rimH = options?.rimHeight ?? 0;
+            if (nr < 0.72) {
+              const pit = 1 - smoothstep(0, 0.72, nr);
+              next = Math.max(-4.5 * rScale, prev - strength * rScale * 2.4 * macroWeight * pit);
+              if (next <= 0) {
+                this.material[idx] = MaterialId.Air;
+              } else if (
+                options?.floorMaterial !== undefined &&
+                options.floorMaterial !== MaterialId.Air
+              ) {
+                this.material[idx] = options.floorMaterial;
+              }
+            } else if (rimH > 0) {
+              const rimT = Math.sin(clamp((nr - 0.68) / 0.32, 0, 1) * Math.PI);
+              next = Math.min(4.5 * rScale, prev + rimH * rScale * macroWeight * rimT);
+              if (
+                next > -0.2 * rScale &&
+                ((options?.rimMaterial !== undefined && options.rimMaterial !== MaterialId.Air) ||
+                  materialId !== MaterialId.Air)
+              ) {
+                this.material[idx] =
+                  options?.rimMaterial !== undefined && options.rimMaterial !== MaterialId.Air
+                    ? options.rimMaterial
+                    : materialId;
+              }
+            } else {
+              if (
+                next > 0 &&
+                options?.floorMaterial !== undefined &&
+                options.floorMaterial !== MaterialId.Air
+              ) {
+                this.material[idx] = options.floorMaterial;
+              }
+            }
+          } else if (mode === 'volcano') {
+            const nr = dist / macroRad;
+            if (nr < 0.34) {
+              const caldera = 1 - smoothstep(0, 0.34, nr);
+              next = Math.max(-4.5 * rScale, prev - strength * rScale * 1.5 * macroWeight * caldera);
+              if (next <= 0) this.material[idx] = MaterialId.Air;
+              else this.material[idx] = MaterialId.Basalt;
+            } else {
+              const cone = 1 - smoothstep(0.32, 1.0, nr);
+              next = Math.min(4.5 * rScale, prev + strength * rScale * 2.1 * macroWeight * cone);
+              if (next > -0.2 * rScale) {
+                this.material[idx] = materialId !== MaterialId.Air ? materialId : MaterialId.Basalt;
+              }
+            }
+          } else if (mode === 'quake') {
+            const wave = Math.sin(wx * 3.7 + wy * 2.9 - wz * 4.1) * Math.cos(wz * 2.4 - wx * 1.8);
+            const delta = (wave - 0.18) * (options?.jaggedNoise ?? 1.0) * strength * rScale * falloff * 2.1;
+            next = clamp(prev + delta, -4.5 * rScale, 4.5 * rScale);
+            if (next <= 0) {
+              this.material[idx] = MaterialId.Air;
+            } else if (Math.abs(delta) > 0.15 * rScale && options?.rimMaterial) {
+              this.material[idx] = options.rimMaterial;
+            }
+          } else if (mode === 'build' || mode === 'extrude') {
+            const mult = mode === 'extrude' ? 2.4 : 1.0;
+            next = Math.min(4.5 * rScale, prev + strength * rScale * mult * falloff);
             if (next > -0.25 * rScale && materialId !== MaterialId.Air) {
               this.material[idx] = materialId;
             }
+          } else if (mode === 'paint') {
+            if (prev > -0.15 * this.voxelSize && materialId !== MaterialId.Air) {
+              if (this.material[idx] !== materialId) {
+                this.material[idx] = materialId;
+                deltaVolume += 0.0005;
+              }
+            }
+            continue;
           } else if (mode === 'flatten') {
             const vr = Math.hypot(wx, wy, wz);
             const desired = targetShellRadius - vr;
@@ -1915,27 +2162,37 @@ export class VoxelPlanet {
     if (this.isHighResStreaming) {
       const nativeSpan = CHUNK_CELLS * this.nativeVoxelSize;
       const sparsePad = safeRad + this.nativeVoxelSize * 2.0;
-      const scMinX = Math.floor((cx - sparsePad) / nativeSpan);
-      const scMaxX = Math.floor((cx + sparsePad) / nativeSpan);
-      const scMinY = Math.floor((cy - sparsePad) / nativeSpan);
-      const scMaxY = Math.floor((cy + sparsePad) / nativeSpan);
-      const scMinZ = Math.floor((cz - sparsePad) / nativeSpan);
-      const scMaxZ = Math.floor((cz + sparsePad) / nativeSpan);
+      const scMinX = Math.floor((Math.min(cx, ex) - sparsePad) / nativeSpan);
+      const scMaxX = Math.floor((Math.max(cx, ex) + sparsePad) / nativeSpan);
+      const scMinY = Math.floor((Math.min(cy, ey) - sparsePad) / nativeSpan);
+      const scMaxY = Math.floor((Math.max(cy, ey) + sparsePad) / nativeSpan);
+      const scMinZ = Math.floor((Math.min(cz, ez) - sparsePad) / nativeSpan);
+      const scMaxZ = Math.floor((Math.max(cz, ez) + sparsePad) / nativeSpan);
 
       const totalTouched =
         (scMaxX - scMinX + 1) * (scMaxY - scMinY + 1) * (scMaxZ - scMinZ + 1);
 
+      const opRecord: BrushOpRecord = {
+        cx,
+        cy,
+        cz,
+        ex,
+        ey,
+        ez,
+        shape,
+        mode: mode === 'smooth' ? 'flatten' : mode,
+        radius: safeRad,
+        strength,
+        materialId,
+        targetShellRadius,
+        rimMaterial: options?.rimMaterial,
+        rimHeight: options?.rimHeight,
+        floorMaterial: options?.floorMaterial,
+        jaggedNoise: options?.jaggedNoise,
+      };
+
       const applyBrushToChunk = (chunk: SparseVoxelChunk) => {
-        const didEdit = this.applyBrushOpToSparseChunk(chunk, {
-          cx,
-          cy,
-          cz,
-          mode: mode === 'smooth' ? 'flatten' : mode,
-          radius: safeRad,
-          strength,
-          materialId,
-          targetShellRadius,
-        }, mode === 'smooth');
+        const didEdit = this.applyBrushOpToSparseChunk(chunk, opRecord, mode === 'smooth');
         if (didEdit) {
           deltaVolume += 0.001;
           chunk.edited = true;
@@ -1950,7 +2207,7 @@ export class VoxelPlanet {
         applyBrushToChunk(chunk);
       }
 
-      if (totalTouched <= 125) {
+      if (totalTouched <= 125 && shape === 'sphere') {
         for (let scz = scMinZ; scz <= scMaxZ; scz++) {
           for (let scy = scMinY; scy <= scMaxY; scy++) {
             for (let scx = scMinX; scx <= scMaxX; scx++) {
@@ -1963,19 +2220,24 @@ export class VoxelPlanet {
           }
         }
       } else if (mode !== 'smooth') {
-        if (this.brushOps.length >= 512) {
-          this.brushOps.shift();
+        // Coalesce near-identical consecutive cylinder ops (e.g. holding laser in place)
+        const prevOp = this.brushOps[this.brushOps.length - 1];
+        const canCoalesce =
+          prevOp &&
+          prevOp.shape === shape &&
+          prevOp.mode === opRecord.mode &&
+          shape === 'cylinder' &&
+          Math.hypot(prevOp.cx - cx, prevOp.cy - cy, prevOp.cz - cz) < safeRad * 0.25 &&
+          Math.hypot(prevOp.ex - ex, prevOp.ey - ey, prevOp.ez - ez) < safeRad * 0.25;
+        if (canCoalesce && prevOp) {
+          prevOp.strength = Math.max(prevOp.strength, strength);
+          prevOp.radius = Math.max(prevOp.radius, safeRad);
+        } else {
+          if (this.brushOps.length >= 512) {
+            this.brushOps.shift();
+          }
+          this.brushOps.push(opRecord);
         }
-        this.brushOps.push({
-          cx,
-          cy,
-          cz,
-          mode,
-          radius: safeRad,
-          strength,
-          materialId,
-          targetShellRadius,
-        });
       }
     }
 
@@ -2584,20 +2846,42 @@ export class VoxelPlanet {
     const cMinWZ = chunk.originZ - SPARSE_PAD * step;
     const cMaxWZ = chunk.originZ + (CHUNK_CELLS + SPARSE_PAD) * step;
 
-    if (
-      op.cx + safeRad < cMinWX ||
-      op.cx - safeRad > cMaxWX ||
-      op.cy + safeRad < cMinWY ||
-      op.cy - safeRad > cMaxWY ||
-      op.cz + safeRad < cMinWZ ||
-      op.cz - safeRad > cMaxWZ
-    ) {
-      return false;
+    if (op.shape === 'cylinder') {
+      const dSq = distSegmentToAabbSq(
+        op.cx,
+        op.cy,
+        op.cz,
+        op.ex,
+        op.ey,
+        op.ez,
+        cMinWX,
+        cMaxWX,
+        cMinWY,
+        cMaxWY,
+        cMinWZ,
+        cMaxWZ,
+      );
+      if (dSq > safeRad * safeRad) {
+        return false;
+      }
+    } else {
+      if (
+        op.cx + safeRad < cMinWX ||
+        op.cx - safeRad > cMaxWX ||
+        op.cy + safeRad < cMinWY ||
+        op.cy - safeRad > cMaxWY ||
+        op.cz + safeRad < cMinWZ ||
+        op.cz - safeRad > cMaxWZ
+      ) {
+        return false;
+      }
     }
 
     const localCopy = isSmooth ? new Float32Array(chunk.density) : null;
     let touched = false;
     const strengthScale = Math.max(step * 2.2, Math.min(rScale, safeRad * 1.4));
+    const isPiercingCarve = op.mode === 'tunnel' || op.mode === 'laser';
+    const carveMult = isPiercingCarve ? 9.0 : op.mode === 'bore' ? 5.0 : 1.0;
 
     for (let lz = 0; lz < SPARSE_N; lz++) {
       const wz = chunk.originZ + (lz - SPARSE_PAD) * step;
@@ -2605,10 +2889,17 @@ export class VoxelPlanet {
         const wy = chunk.originY + (ly - SPARSE_PAD) * step;
         for (let lx = 0; lx < SPARSE_N; lx++) {
           const wx = chunk.originX + (lx - SPARSE_PAD) * step;
-          const dist = Math.hypot(wx - op.cx, wy - op.cy, wz - op.cz);
+          const dist =
+            op.shape === 'cylinder'
+              ? distPointToSegment(wx, wy, wz, op.cx, op.cy, op.cz, op.ex, op.ey, op.ez)
+              : Math.hypot(wx - op.cx, wy - op.cy, wz - op.cz);
           if (dist >= safeRad) continue;
 
-          const falloff = 1 - smoothstep(0, safeRad, dist);
+          const rawFalloff = 1 - smoothstep(0, safeRad, dist);
+          const falloff =
+            isPiercingCarve
+              ? Math.max(rawFalloff, dist < safeRad * 0.72 ? 1.0 : rawFalloff)
+              : rawFalloff;
           const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
           const prev = chunk.density[idx];
           let next = prev;
@@ -2639,20 +2930,100 @@ export class VoxelPlanet {
                 chunk.material[idx] = MaterialId.Air;
               }
             }
-          } else if (op.mode === 'carve') {
+          } else if (
+            op.mode === 'carve' ||
+            op.mode === 'tunnel' ||
+            op.mode === 'laser' ||
+            op.mode === 'bore'
+          ) {
             next = Math.max(
               -4.5 * rScale,
-              prev - op.strength * strengthScale * falloff,
+              prev - op.strength * strengthScale * carveMult * falloff,
             );
-            if (next <= 0) chunk.material[idx] = MaterialId.Air;
-          } else if (op.mode === 'build') {
+            if (next <= 0) {
+              chunk.material[idx] = MaterialId.Air;
+            } else if (
+              op.rimMaterial !== undefined &&
+              op.rimMaterial !== MaterialId.Air &&
+              dist >= safeRad * 0.62
+            ) {
+              chunk.material[idx] = op.rimMaterial;
+              touched = true;
+            }
+          } else if (op.mode === 'crater') {
+            const nr = dist / safeRad;
+            const rimH = op.rimHeight ?? 0;
+            if (nr < 0.72) {
+              const pit = 1 - smoothstep(0, 0.72, nr);
+              next = Math.max(-4.5 * rScale, prev - op.strength * strengthScale * 2.4 * pit);
+              if (next <= 0) {
+                chunk.material[idx] = MaterialId.Air;
+              } else if (op.floorMaterial !== undefined && op.floorMaterial !== MaterialId.Air) {
+                chunk.material[idx] = op.floorMaterial;
+                touched = true;
+              }
+            } else if (rimH > 0) {
+              const rimT = Math.sin(clamp((nr - 0.68) / 0.32, 0, 1) * Math.PI);
+              next = Math.min(4.5 * rScale, prev + rimH * strengthScale * rimT);
+              if (
+                next > -0.2 * step &&
+                ((op.rimMaterial !== undefined && op.rimMaterial !== MaterialId.Air) ||
+                  op.materialId !== MaterialId.Air)
+              ) {
+                chunk.material[idx] =
+                  op.rimMaterial !== undefined && op.rimMaterial !== MaterialId.Air
+                    ? op.rimMaterial
+                    : op.materialId;
+                touched = true;
+              }
+            } else if (
+              next > 0 &&
+              op.floorMaterial !== undefined &&
+              op.floorMaterial !== MaterialId.Air
+            ) {
+              chunk.material[idx] = op.floorMaterial;
+              touched = true;
+            }
+          } else if (op.mode === 'volcano') {
+            const nr = dist / safeRad;
+            if (nr < 0.34) {
+              const caldera = 1 - smoothstep(0, 0.34, nr);
+              next = Math.max(-4.5 * rScale, prev - op.strength * strengthScale * 1.5 * caldera);
+              chunk.material[idx] = next <= 0 ? MaterialId.Air : MaterialId.Basalt;
+            } else {
+              const cone = 1 - smoothstep(0.32, 1.0, nr);
+              next = Math.min(4.5 * rScale, prev + op.strength * strengthScale * 2.1 * cone);
+              if (next > -0.2 * step) {
+                chunk.material[idx] = op.materialId !== MaterialId.Air ? op.materialId : MaterialId.Basalt;
+              }
+            }
+          } else if (op.mode === 'quake') {
+            const wave = Math.sin(wx * 3.7 + wy * 2.9 - wz * 4.1) * Math.cos(wz * 2.4 - wx * 1.8);
+            const delta = (wave - 0.18) * (op.jaggedNoise ?? 1.0) * op.strength * strengthScale * falloff * 2.1;
+            next = clamp(prev + delta, -4.5 * rScale, 4.5 * rScale);
+            if (next <= 0) {
+              chunk.material[idx] = MaterialId.Air;
+            } else if (Math.abs(delta) > 0.12 * step && op.rimMaterial) {
+              chunk.material[idx] = op.rimMaterial;
+              touched = true;
+            }
+          } else if (op.mode === 'build' || op.mode === 'extrude') {
+            const mult = op.mode === 'extrude' ? 2.4 : 1.0;
             next = Math.min(
               4.5 * rScale,
-              prev + op.strength * strengthScale * falloff,
+              prev + op.strength * strengthScale * mult * falloff,
             );
             if (next > -0.25 * step && op.materialId !== MaterialId.Air) {
               chunk.material[idx] = op.materialId;
             }
+          } else if (op.mode === 'paint') {
+            if (prev > -0.15 * step && op.materialId !== MaterialId.Air) {
+              if (chunk.material[idx] !== op.materialId) {
+                chunk.material[idx] = op.materialId;
+                touched = true;
+              }
+            }
+            continue;
           } else if (op.mode === 'flatten') {
             const vr = Math.hypot(wx, wy, wz);
             const desired = op.targetShellRadius - vr;
@@ -3557,17 +3928,38 @@ export class VoxelPlanet {
       this.genCtx.detailLogScale > 2.2 ? this.nativeVoxelSize * 3.2 : 0;
 
     const editedWorldBoxes: Array<{ minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number }> = [];
+    const editedSegments: Array<{
+      cx: number;
+      cy: number;
+      cz: number;
+      ex: number;
+      ey: number;
+      ez: number;
+      r: number;
+    }> = [];
     for (let i = 0; i < this.brushOps.length; i++) {
       const op = this.brushOps[i];
       const r = op.radius + nativeSpan * 0.5;
-      editedWorldBoxes.push({
-        minX: op.cx - r,
-        maxX: op.cx + r,
-        minY: op.cy - r,
-        maxY: op.cy + r,
-        minZ: op.cz - r,
-        maxZ: op.cz + r,
-      });
+      if (op.shape === 'cylinder') {
+        editedSegments.push({
+          cx: op.cx,
+          cy: op.cy,
+          cz: op.cz,
+          ex: op.ex,
+          ey: op.ey,
+          ez: op.ez,
+          r,
+        });
+      } else {
+        editedWorldBoxes.push({
+          minX: op.cx - r,
+          maxX: op.cx + r,
+          minY: op.cy - r,
+          maxY: op.cy + r,
+          minZ: op.cz - r,
+          maxZ: op.cz + r,
+        });
+      }
     }
     for (const c of this.sparseChunks.values()) {
       if (!c.edited || c.scaleMult > 1) continue;
@@ -3599,6 +3991,28 @@ export class VoxelPlanet {
           minY <= b.maxY &&
           maxZ >= b.minZ &&
           minZ <= b.maxZ
+        ) {
+          return true;
+        }
+      }
+      for (let i = 0; i < editedSegments.length; i++) {
+        const s = editedSegments[i];
+        if (
+          distSegmentToAabbSq(
+            s.cx,
+            s.cy,
+            s.cz,
+            s.ex,
+            s.ey,
+            s.ez,
+            minX,
+            maxX,
+            minY,
+            maxY,
+            minZ,
+            maxZ,
+          ) <=
+          s.r * s.r
         ) {
           return true;
         }

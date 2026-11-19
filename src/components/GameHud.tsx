@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import {
+  Aperture,
   Box,
   Camera,
   ChevronDown,
   ChevronUp,
+  Clapperboard,
   Cloud,
   Crosshair,
   ExternalLink,
@@ -15,21 +17,26 @@ import {
   Play,
   RotateCcw,
   Sliders,
+  SlidersHorizontal,
+  Square,
   Terminal,
   Thermometer,
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import {
-  BrushMode,
-  MaterialId,
-  TerrainOverlayMode,
-} from '../engine/voxelPlanet';
+import { TerrainOverlayMode } from '../engine/voxelPlanet';
+import { PlanetToolDef, ToolAttributes } from '../engine/toolRegistry';
 import {
   CameraMode,
   SandboxConfig,
   SandboxTelemetry,
 } from '../engine/webgpuScene';
+import {
+  EDITOR_MATERIALS,
+  LeftToolPalette,
+} from './LeftToolPalette';
+import { ToolIcon } from './ToolIcon';
+import { ToolStudioDrawer } from './ToolStudioDrawer';
 import { NumericCadInput } from './NumericCadInput';
 import { OfflineIndicator } from './OfflineIndicator';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -37,12 +44,27 @@ import { PWAInstallButton } from './PWAInstallButton';
 interface GameHudProps {
   telemetry: SandboxTelemetry;
   config: SandboxConfig;
+  tools: ReadonlyArray<PlanetToolDef>;
+  activeTool: PlanetToolDef;
+  hasToolOverride: boolean;
+  studioOpen: boolean;
+  directorOpen: boolean;
+  directorPreviewing: boolean;
   debugOpen: boolean;
   mapsOpen: boolean;
   atmosPanelOpen: boolean;
   dockOpen: boolean;
   touchEnabled: boolean;
   newTabUrl: string;
+  onToggleStudio: () => void;
+  onToggleDirector: () => void;
+  onQuickScreenshot: () => void;
+  onStopDirectorPreview: () => void;
+  onSelectTool: (tool: PlanetToolDef) => void;
+  onUpdateActiveAttributes: (partial: Partial<ToolAttributes>) => void;
+  onResetBuiltinOverride: (toolId: string) => void;
+  onSaveCustomTool: (tool: PlanetToolDef, activate?: boolean) => void;
+  onDeleteCustomTool: (toolId: string) => void;
   onToggleDock: () => void;
   onToggleTouch: () => void;
   onPrepareNewTab: () => void;
@@ -57,32 +79,6 @@ interface GameHudProps {
   onFocusCamera: () => void;
   onPause: () => void;
 }
-
-const TOOL_ITEMS: ReadonlyArray<{
-  id: BrushMode;
-  keyHint: string;
-  label: string;
-  accent: string;
-}> = [
-  { id: 'carve', keyHint: '1', label: '雕刻', accent: '#f97316' },
-  { id: 'build', keyHint: '2', label: '建造', accent: '#10b981' },
-  { id: 'smooth', keyHint: '3', label: '平滑', accent: '#a78bfa' },
-  { id: 'flatten', keyHint: '4', label: '整平', accent: '#facc15' },
-  { id: 'water', keyHint: '5', label: '注水', accent: '#38bdf8' },
-];
-
-const MATERIAL_ITEMS: ReadonlyArray<{
-  id: MaterialId;
-  label: string;
-  swatch: string;
-}> = [
-  { id: MaterialId.Soil, label: '沃土', swatch: '#4a8f4f' },
-  { id: MaterialId.Stone, label: '灰岩', swatch: '#7a828f' },
-  { id: MaterialId.Basalt, label: '玄武岩', swatch: '#333845' },
-  { id: MaterialId.Sandstone, label: '砂岩', swatch: '#c27d57' },
-  { id: MaterialId.Crystal, label: '晶矿', swatch: '#29d1e0' },
-  { id: MaterialId.Ice, label: '极冰', swatch: '#d6edfc' },
-];
 
 const CAMERA_LABEL: Record<CameraMode, string> = {
   explorer: '探索',
@@ -138,12 +134,27 @@ function fmtRadius(r: number): string {
 export const GameHud: React.FC<GameHudProps> = ({
   telemetry,
   config,
+  tools,
+  activeTool,
+  hasToolOverride,
+  studioOpen,
+  directorOpen,
+  directorPreviewing,
   debugOpen,
   mapsOpen,
   atmosPanelOpen,
   dockOpen,
   touchEnabled,
   newTabUrl,
+  onToggleStudio,
+  onToggleDirector,
+  onQuickScreenshot,
+  onStopDirectorPreview,
+  onSelectTool,
+  onUpdateActiveAttributes,
+  onResetBuiltinOverride,
+  onSaveCustomTool,
+  onDeleteCustomTool,
   onToggleDock,
   onToggleTouch,
   onPrepareNewTab,
@@ -159,6 +170,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   onPause,
 }) => {
   const [camMenuOpen, setCamMenuOpen] = useState(false);
+  const [paletteExpanded, setPaletteExpanded] = useState(true);
   const altStr = `${telemetry.altitude >= 0 ? '+' : ''}${telemetry.altitude.toFixed(1)}m`;
   const gravStr = `${telemetry.localGravity.toFixed(2)}m/s²`;
   const escStr = `${telemetry.escapeVelocity.toFixed(1)}m/s`;
@@ -167,6 +179,33 @@ export const GameHud: React.FC<GameHudProps> = ({
 
   return (
     <div className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between">
+      {/* Photoshop / CAD Left Tool Palette */}
+      <LeftToolPalette
+        config={config}
+        telemetry={telemetry}
+        tools={tools}
+        activeTool={activeTool}
+        expanded={paletteExpanded}
+        studioOpen={studioOpen}
+        onToggleExpanded={() => setPaletteExpanded((v) => !v)}
+        onToggleStudio={onToggleStudio}
+        onSelectTool={onSelectTool}
+        onUpdateConfig={onUpdateConfig}
+      />
+
+      {studioOpen && (
+        <ToolStudioDrawer
+          activeTool={activeTool}
+          paletteExpanded={paletteExpanded}
+          hasOverride={hasToolOverride}
+          onUpdateActiveAttributes={onUpdateActiveAttributes}
+          onResetBuiltinOverride={onResetBuiltinOverride}
+          onSaveCustomTool={onSaveCustomTool}
+          onDeleteCustomTool={onDeleteCustomTool}
+          onClose={onToggleStudio}
+        />
+      )}
+
       {/* Slim CAD Engineering Top Bar */}
       <header
         data-testid="cad-top-bar"
@@ -174,9 +213,9 @@ export const GameHud: React.FC<GameHudProps> = ({
       >
         {/* Left: Brand & Live Tabular Physics Telemetry */}
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] font-mono-tabular">
-          <div className="flex items-center gap-1.5 pr-1 border-r border-slate-800">
+          <div className="flex items-center gap-1.5 pr-1.5 border-r border-slate-800">
             <span className="font-display font-semibold text-xs text-white tracking-tight">
-              TerraSphere
+              TerraSphere Studio
             </span>
             <span className="text-[10px] text-sky-400">{telemetry.backend}</span>
           </div>
@@ -543,6 +582,41 @@ export const GameHud: React.FC<GameHudProps> = ({
           <button
             type="button"
             tabIndex={-1}
+            data-testid="quick-screenshot-btn"
+            title="立即抓取纯净高画质截屏 (F10)"
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onQuickScreenshot();
+            }}
+            className="h-7 px-2 rounded-xs border border-slate-700/80 bg-[#0d1322] hover:border-sky-400/80 text-[11px] font-medium text-slate-200 hover:text-white transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
+          >
+            <Aperture className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+            <span className="hidden xl:inline">截屏 [F10]</span>
+          </button>
+
+          <button
+            type="button"
+            tabIndex={-1}
+            data-testid="director-studio-btn"
+            aria-pressed={directorOpen}
+            title="高级导演系统：高分截屏、6K/165帧离线录像与动作运镜 (F9)"
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onToggleDirector();
+            }}
+            className={`h-7 px-2 rounded-xs border text-[11px] font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0 ${
+              directorOpen
+                ? 'border-rose-400 bg-rose-950/70 text-rose-100'
+                : 'border-slate-700/80 bg-[#0d1322] text-slate-200 hover:border-rose-400/70'
+            }`}
+          >
+            <Clapperboard className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+            <span>导演录制 [F9]</span>
+          </button>
+
+          <button
+            type="button"
+            tabIndex={-1}
             data-testid="debug-menu-btn"
             title="调试与体素格式检查器 (F3)"
             onClick={(e) => {
@@ -594,10 +668,29 @@ export const GameHud: React.FC<GameHudProps> = ({
         </div>
       </header>
 
+      {directorPreviewing && (
+        <div className="pointer-events-none flex justify-center pt-1.5 px-2">
+          <div className="pointer-events-auto h-7 px-3 rounded-xs border border-rose-500/70 bg-[#090d18]/94 text-[11px] text-rose-100 flex items-center gap-2.5 shadow-md">
+            <Clapperboard className="w-3.5 h-3.5 text-rose-400" />
+            <span>正在实时预览导演运镜</span>
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={onStopDirectorPreview}
+              className="h-5 px-2 rounded-xs border border-rose-400/60 bg-rose-950/70 hover:bg-rose-900/80 text-[10px] text-white flex items-center gap-1 cursor-pointer"
+            >
+              <Square className="w-2.5 h-2.5" />
+              <span>停止预览 [Esc]</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Mode-Specific Compact Camera Strip */}
-      {(config.cameraMode === 'detail' ||
-        config.cameraMode === 'landing' ||
-        config.cameraMode === 'perspective') && (
+      {!directorPreviewing &&
+        (config.cameraMode === 'detail' ||
+          config.cameraMode === 'landing' ||
+          config.cameraMode === 'perspective') && (
         <div className="pointer-events-none flex justify-center pt-1.5 px-2">
           <div
             data-testid="camera-mode-context-bar"
@@ -702,6 +795,60 @@ export const GameHud: React.FC<GameHudProps> = ({
         </div>
       )}
 
+      {!directorPreviewing &&
+        (activeTool.attributes.behavior === 'tractorBeam' || telemetry.tractorBeam.active) && (
+        <div className="pointer-events-none flex justify-center pt-1.5 px-2">
+          <div
+            data-testid="tractor-beam-context-bar"
+            className={`pointer-events-auto h-7 px-2.5 rounded-xs border bg-[#090d18]/92 text-[11px] font-mono-tabular flex items-center gap-2.5 shadow-md whitespace-nowrap ${
+              telemetry.tractorBeam.active
+                ? telemetry.tractorBeam.nearEscape
+                  ? 'border-amber-400/80 text-amber-100'
+                  : 'border-cyan-400/80 text-cyan-100'
+                : 'border-slate-700/80 text-slate-300'
+            }`}
+          >
+            <span className="flex items-center gap-1 font-display font-medium text-cyan-300 shrink-0">
+              <Magnet className="w-3.5 h-3.5 shrink-0" />
+              <span>{telemetry.tractorBeam.active ? '牵引光束捕获中' : '牵引光束 [Y]'}</span>
+            </span>
+
+            {telemetry.tractorBeam.active ? (
+              <>
+                <span className="text-slate-200">
+                  流体 <span className="text-cyan-300">{telemetry.tractorBeam.capturedFluidCount}</span>
+                  {' · '}
+                  实体 <span className="text-emerald-300">{telemetry.tractorBeam.capturedEntityCount}</span>
+                </span>
+                <span className="hidden sm:inline text-slate-300">
+                  g <span className="text-sky-300">{telemetry.tractorBeam.localGravityMs2.toFixed(2)}m/s²</span>
+                </span>
+                <span className="text-slate-200">
+                  F <span className="text-cyan-200">{telemetry.tractorBeam.beamForceN.toFixed(0)}N</span>
+                </span>
+                <span className="hidden md:inline text-slate-300">
+                  负载 <span className={telemetry.tractorBeam.loadRatio > 0.85 ? 'text-amber-300' : 'text-emerald-300'}>
+                    {telemetry.tractorBeam.loadRatio.toFixed(2)}×mg
+                  </span>
+                </span>
+                <span className="hidden lg:inline text-slate-300">
+                  拉伸 <span className="text-indigo-300">{telemetry.tractorBeam.stretchDistanceM.toFixed(1)}m</span>
+                </span>
+                {telemetry.tractorBeam.nearEscape && (
+                  <span className="text-amber-300 font-semibold">
+                    接近逃逸 ({telemetry.tractorBeam.peakSpeedMs.toFixed(1)}/{telemetry.tractorBeam.escapeVelocityMs.toFixed(1)}m/s)
+                  </span>
+                )}
+              </>
+            ) : (
+              <span className="text-slate-400 text-[10px]">
+                左键点击并拖拽SPH流体或动态物体 · 滚轮推进景深 · 按牛顿引力实时拉伸与反馈
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Center Reticle */}
       <div
         className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none"
@@ -739,43 +886,51 @@ export const GameHud: React.FC<GameHudProps> = ({
         {dockOpen && (
           <div
             data-testid="cad-bottom-dock"
-            className="pointer-events-auto w-full max-w-[980px] rounded-sm border border-slate-800 bg-[#090d18]/92 px-2.5 py-1.5 flex flex-col gap-1.5"
+            className="pointer-events-auto w-full max-w-[960px] rounded-sm border border-slate-800 bg-[#090d18]/92 px-2.5 py-1.5 flex flex-col gap-1.5"
           >
-            {/* Row 1: Sculpt Tools & Materials */}
-            <div className="flex flex-wrap items-center justify-between gap-1.5">
-              <div className="flex flex-wrap items-center gap-1">
-                {TOOL_ITEMS.map((t) => {
-                  const active = config.tool === t.id;
-                  return (
-                    <button
-                      key={t.id}
-                      type="button"
-                      tabIndex={-1}
-                      onClick={(e) => {
-                        e.currentTarget.blur();
-                        onUpdateConfig({ tool: t.id });
-                      }}
-                      className={`h-7 px-2 rounded-xs border text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
-                        active
-                          ? 'border-sky-400 bg-sky-950/70 text-white'
-                          : 'border-slate-800 bg-[#0d1322] text-slate-300 hover:border-slate-600'
-                      }`}
-                    >
-                      <span
-                        className="w-2 h-2 rounded-xs inline-block shrink-0"
-                        style={{ backgroundColor: t.accent }}
-                      />
-                      <span className="font-mono-tabular text-slate-400 text-[10px]">
-                        {t.keyHint}
-                      </span>
-                      <span>{t.label}</span>
-                    </button>
-                  );
-                })}
+            {/* Row 1: Active Tool Context & Material Quick Palette */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-[11px] min-w-0">
+                <span
+                  className="w-4 h-4 flex items-center justify-center shrink-0"
+                  style={{ color: activeTool.attributes.colorHex }}
+                >
+                  <ToolIcon iconName={activeTool.iconName} className="w-3.5 h-3.5" />
+                </span>
+                <span className="font-display font-semibold text-white whitespace-nowrap">
+                  {activeTool.name}
+                </span>
+                {activeTool.keyHint && (
+                  <span className="font-mono-tabular text-[10px] text-slate-400 whitespace-nowrap">
+                    [{activeTool.keyHint}]
+                  </span>
+                )}
+                <span className="hidden md:inline font-mono-tabular text-[10px] text-slate-400 whitespace-nowrap">
+                  {activeTool.attributes.radiusMult.toFixed(1)}×半径 · {activeTool.attributes.strengthMult.toFixed(1)}×强度
+                  {activeTool.attributes.thermalDeltaC !== 0 &&
+                    ` · ${activeTool.attributes.thermalDeltaC > 0 ? '+' : ''}${activeTool.attributes.thermalDeltaC}°C`}
+                </span>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  data-testid="hud-tool-attrs-btn"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    onToggleStudio();
+                  }}
+                  className={`h-5 px-1.5 rounded-xs border text-[10px] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
+                    studioOpen
+                      ? 'border-sky-400 bg-sky-950/70 text-sky-200'
+                      : 'border-slate-700 bg-[#0d1322] text-slate-300 hover:border-sky-400/70 hover:text-white'
+                  }`}
+                >
+                  <SlidersHorizontal className="w-2.5 h-2.5" />
+                  <span>属性/自定义</span>
+                </button>
               </div>
 
               <div className="flex flex-wrap items-center gap-1">
-                {MATERIAL_ITEMS.map((mat) => {
+                {EDITOR_MATERIALS.map((mat) => {
                   const active = config.material === mat.id;
                   return (
                     <button
@@ -787,7 +942,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                         e.currentTarget.blur();
                         onUpdateConfig({ material: mat.id });
                       }}
-                      className={`h-7 px-2 rounded-xs border text-[11px] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
+                      className={`h-6 px-2 rounded-xs border text-[11px] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
                         active
                           ? 'border-emerald-400 text-white bg-slate-800'
                           : 'border-slate-800 text-slate-400 hover:text-slate-200 bg-[#0d1322]'

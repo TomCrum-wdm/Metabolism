@@ -10,6 +10,14 @@ import {
   TRI_TABLE,
 } from './marchingCubesTables';
 import { VoxelPlanet } from './voxelPlanet';
+import {
+  computeRayPointDistanceSq,
+  computeTractorSpringForce,
+  evaluateStretchedAnchorPoint,
+  TractorForceParams,
+  TractorForceResult,
+  TractorRayPickResult,
+} from './tractorBeam';
 
 export const MAX_FLUID_PARTICLES = 2200;
 
@@ -30,6 +38,21 @@ export interface FluidSnapshot {
   activeCount: number;
   positions: Float32Array;
   velocities: Float32Array;
+}
+
+export interface ActiveFluidTractorField {
+  anchorX: number;
+  anchorY: number;
+  anchorZ: number;
+  targetX: number;
+  targetY: number;
+  targetZ: number;
+  dragVelX: number;
+  dragVelY: number;
+  dragVelZ: number;
+  radius: number;
+  beamPower: number;
+  stretchStrength?: number;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -88,8 +111,36 @@ export class FluidSim {
   private currentWaterHalf = BASE_WATER_HALF;
   private currentWaterVoxel = (BASE_WATER_HALF * 2) / WATER_CELLS;
 
+  // Tractor beam per-particle capture state (zero allocation)
+  public readonly tractorFactor = new Float32Array(MAX_FLUID_PARTICLES);
+  public readonly tractorStretchU = new Float32Array(MAX_FLUID_PARTICLES);
+  public tractorCapturedCount = 0;
+  public tractorTotalBeamForceN = 0;
+  public tractorTotalGravityWeightN = 0;
+  public tractorAvgLoadRatio = 0;
+  public tractorPeakSpeedMs = 0;
+
   private readonly tempGrav: Vec3Like = { x: 0, y: 0, z: 0 };
   private readonly tempNormal: [number, number, number] = [0, 0, 0];
+  private readonly tempStretchTarget: Vec3Like = { x: 0, y: 0, z: 0 };
+  private readonly tempRayPick: TractorRayPickResult = { hit: false, t: 0, distSq: 0 };
+  private readonly tempTractorParams: TractorForceParams = {
+    planetRadius: 13.0,
+    beamPower: 1.5,
+    gravityCompFactor: 0.45,
+    maxAccelG: 5.5,
+    massKg: 1.0,
+  };
+  private readonly tempTractorResult: TractorForceResult = {
+    fx: 0,
+    fy: 0,
+    fz: 0,
+    beamForceN: 0,
+    gravityWeightN: 0,
+    localGravityMs2: 0,
+    loadRatio: 0,
+    saturated: false,
+  };
 
   constructor() {
     const h = this.h;
@@ -101,6 +152,264 @@ export class FluidSim {
   public clear(): void {
     this.activeCount = 0;
     this.splashCount = 0;
+    this.releaseTractorCapture();
+  }
+
+  public drainWithinRadius(cx: number, cy: number, cz: number, radius: number): number {
+    const rSq = radius * radius;
+    let removed = 0;
+    let write = 0;
+    for (let i = 0; i < this.activeCount; i++) {
+      const dx = this.px[i] - cx;
+      const dy = this.py[i] - cy;
+      const dz = this.pz[i] - cz;
+      if (dx * dx + dy * dy + dz * dz <= rSq) {
+        removed++;
+        continue;
+      }
+      if (write !== i) {
+        this.px[write] = this.px[i];
+        this.py[write] = this.py[i];
+        this.pz[write] = this.pz[i];
+        this.vx[write] = this.vx[i];
+        this.vy[write] = this.vy[i];
+        this.vz[write] = this.vz[i];
+        this.rho[write] = this.rho[i];
+        this.press[write] = this.press[i];
+        this.tractorFactor[write] = this.tractorFactor[i];
+        this.tractorStretchU[write] = this.tractorStretchU[i];
+      }
+      write++;
+    }
+    this.activeCount = write;
+    return removed;
+  }
+
+  public releaseTractorCapture(): void {
+    this.tractorFactor.fill(0);
+    this.tractorStretchU.fill(0);
+    this.tractorCapturedCount = 0;
+    this.tractorTotalBeamForceN = 0;
+    this.tractorTotalGravityWeightN = 0;
+    this.tractorAvgLoadRatio = 0;
+    this.tractorPeakSpeedMs = 0;
+  }
+
+  public findClosestParticleToRay(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    maxRadius: number,
+  ): { index: number; x: number; y: number; z: number; distSq: number; rayT: number } | null {
+    const maxSq = maxRadius * maxRadius;
+    let bestIdx = -1;
+    let bestScore = Infinity;
+    let bestDistSq = Infinity;
+    let bestT = Infinity;
+    for (let i = 0; i < this.activeCount; i++) {
+      computeRayPointDistanceSq(
+        ox,
+        oy,
+        oz,
+        dx,
+        dy,
+        dz,
+        this.px[i],
+        this.py[i],
+        this.pz[i],
+        this.tempRayPick,
+      );
+      if (this.tempRayPick.distSq <= maxSq) {
+        // Favor close lateral match and front-facing nearest surface
+        const score = this.tempRayPick.distSq + this.tempRayPick.t * 0.015;
+        if (score < bestScore) {
+          bestScore = score;
+          bestDistSq = this.tempRayPick.distSq;
+          bestT = this.tempRayPick.t;
+          bestIdx = i;
+        }
+      }
+    }
+    if (bestIdx === -1) return null;
+    return {
+      index: bestIdx,
+      x: this.px[bestIdx],
+      y: this.py[bestIdx],
+      z: this.pz[bestIdx],
+      distSq: bestDistSq,
+      rayT: bestT,
+    };
+  }
+
+  /**
+   * Captures SPH particles within radius around (cx, cy, cz) and assigns coherent
+   * tidal stretch fractions tractorStretchU in [0, 1] along stretchAxis so dragging
+   * elongates water into continuous plumes instead of collapsing to a single dot.
+   */
+  public captureParticlesForTractor(
+    cx: number,
+    cy: number,
+    cz: number,
+    radius: number,
+    stretchAxisX = 0,
+    stretchAxisY = 1,
+    stretchAxisZ = 0,
+    maxCapture = 320,
+  ): number {
+    this.releaseTractorCapture();
+    if (this.activeCount === 0 || radius <= 1e-6) return 0;
+
+    const rSq = radius * radius;
+    let count = 0;
+    let minProj = Infinity;
+    let maxProj = -Infinity;
+
+    for (let i = 0; i < this.activeCount; i++) {
+      const dx = this.px[i] - cx;
+      const dy = this.py[i] - cy;
+      const dz = this.pz[i] - cz;
+      const dSq = dx * dx + dy * dy + dz * dz;
+      if (dSq > rSq) continue;
+      if (count >= maxCapture) break;
+      const dist = Math.sqrt(dSq);
+      const w = 0.55 + 0.45 * (1 - dist / radius);
+      this.tractorFactor[i] = w;
+      const proj = dx * stretchAxisX + dy * stretchAxisY + dz * stretchAxisZ;
+      this.tractorStretchU[i] = proj;
+      if (proj < minProj) minProj = proj;
+      if (proj > maxProj) maxProj = proj;
+      count++;
+    }
+
+    const span = maxProj - minProj;
+    for (let i = 0; i < this.activeCount; i++) {
+      if (this.tractorFactor[i] > 0) {
+        if (span > 1e-4) {
+          this.tractorStretchU[i] = clamp((this.tractorStretchU[i] - minProj) / span, 0, 1);
+        } else {
+          this.tractorStretchU[i] = 0.7;
+        }
+      }
+    }
+
+    this.tractorCapturedCount = count;
+    return count;
+  }
+
+  /**
+   * Entrains nearby uncaptured fluid particles along an active tractor drag path so
+   * sweeping across a lake lifts a continuous tidal stream.
+   */
+  public entrainParticlesNearTractor(
+    tx: number,
+    ty: number,
+    tz: number,
+    anchorX: number,
+    anchorY: number,
+    anchorZ: number,
+    radius: number,
+    maxCapture = 360,
+  ): number {
+    if (this.activeCount === 0 || this.tractorCapturedCount >= maxCapture) {
+      return this.tractorCapturedCount;
+    }
+    const rSq = radius * radius;
+    const sx = tx - anchorX;
+    const sy = ty - anchorY;
+    const sz = tz - anchorZ;
+    const sLenSq = sx * sx + sy * sy + sz * sz;
+
+    for (let i = 0; i < this.activeCount; i++) {
+      if (this.tractorFactor[i] > 0) continue;
+      const dx = this.px[i] - tx;
+      const dy = this.py[i] - ty;
+      const dz = this.pz[i] - tz;
+      const dSq = dx * dx + dy * dy + dz * dz;
+      if (dSq > rSq) continue;
+      const dist = Math.sqrt(dSq);
+      this.tractorFactor[i] = 0.5 + 0.5 * (1 - dist / radius);
+      if (sLenSq > 1e-4) {
+        const u = ((this.px[i] - anchorX) * sx + (this.py[i] - anchorY) * sy + (this.pz[i] - anchorZ) * sz) / sLenSq;
+        this.tractorStretchU[i] = clamp(u, 0.15, 1.0);
+      } else {
+        this.tractorStretchU[i] = 0.85;
+      }
+      this.tractorCapturedCount++;
+      if (this.tractorCapturedCount >= maxCapture) break;
+    }
+    return this.tractorCapturedCount;
+  }
+
+  public applyRadialImpulse(
+    cx: number,
+    cy: number,
+    cz: number,
+    radius: number,
+    impulseVel: number,
+    upwardLift = 0,
+  ): number {
+    const rSq = radius * radius;
+    let affected = 0;
+    for (let i = 0; i < this.activeCount; i++) {
+      const dx = this.px[i] - cx;
+      const dy = this.py[i] - cy;
+      const dz = this.pz[i] - cz;
+      const dSq = dx * dx + dy * dy + dz * dz;
+      if (dSq > rSq) continue;
+      const dist = Math.sqrt(dSq);
+      const falloff = 1 - dist / Math.max(radius, 1e-4);
+      const invD = dist > 1e-4 ? 1 / dist : 0;
+      this.vx[i] += dx * invD * impulseVel * falloff;
+      this.vy[i] += dy * invD * impulseVel * falloff;
+      this.vz[i] += dz * invD * impulseVel * falloff;
+      if (upwardLift !== 0) {
+        const pr = Math.hypot(this.px[i], this.py[i], this.pz[i]) || 1;
+        this.vx[i] += (this.px[i] / pr) * upwardLift * falloff;
+        this.vy[i] += (this.py[i] / pr) * upwardLift * falloff;
+        this.vz[i] += (this.pz[i] / pr) * upwardLift * falloff;
+      }
+      affected++;
+    }
+    return affected;
+  }
+
+  public applySwirlVortex(
+    cx: number,
+    cy: number,
+    cz: number,
+    ax: number,
+    ay: number,
+    az: number,
+    radius: number,
+    swirlVel: number,
+    liftVel: number,
+  ): number {
+    const rSq = radius * radius;
+    let affected = 0;
+    for (let i = 0; i < this.activeCount; i++) {
+      const dx = this.px[i] - cx;
+      const dy = this.py[i] - cy;
+      const dz = this.pz[i] - cz;
+      const dSq = dx * dx + dy * dy + dz * dz;
+      if (dSq > rSq) continue;
+      const dist = Math.sqrt(dSq);
+      const falloff = 1 - dist / Math.max(radius, 1e-4);
+      // Tangent swirl = axis x offset
+      const sx = ay * dz - az * dy;
+      const sy = az * dx - ax * dz;
+      const sz = ax * dy - ay * dx;
+      const sLen = Math.hypot(sx, sy, sz) || 1;
+      // Gently pull inward + spin + lift skyward
+      const invD = dist > 1e-4 ? 1 / dist : 0;
+      this.vx[i] += ((sx / sLen) * swirlVel + ax * liftVel - dx * invD * swirlVel * 0.25) * falloff;
+      this.vy[i] += ((sy / sLen) * swirlVel + ay * liftVel - dy * invD * swirlVel * 0.25) * falloff;
+      this.vz[i] += ((sz / sLen) * swirlVel + az * liftVel - dz * invD * swirlVel * 0.25) * falloff;
+      affected++;
+    }
+    return affected;
   }
 
   public spawnParticle(
@@ -121,6 +430,8 @@ export class FluidSim {
     this.vz[i] = vz;
     this.rho[i] = this.restDensity;
     this.press[i] = 0;
+    this.tractorFactor[i] = 0;
+    this.tractorStretchU[i] = 0;
     return true;
   }
 
@@ -413,10 +724,15 @@ export class FluidSim {
     planet: VoxelPlanet,
     gravityParams: PlanetaryGravityParams,
     substeps = 2,
+    tractorField?: ActiveFluidTractorField | null,
   ): void {
     const n = this.activeCount;
     if (n === 0) {
       this.splashCount = 0;
+      this.tractorTotalBeamForceN = 0;
+      this.tractorTotalGravityWeightN = 0;
+      this.tractorAvgLoadRatio = 0;
+      this.tractorPeakSpeedMs = 0;
       return;
     }
 
@@ -430,6 +746,20 @@ export class FluidSim {
     const sqrtScale = Math.sqrt(scale);
     const hashCell = h * scale;
     const invHash = 1 / hashCell;
+
+    const hasTractor = Boolean(tractorField && this.tractorCapturedCount > 0);
+    if (hasTractor && tractorField) {
+      this.tempTractorParams.planetRadius = planet.baseRadius;
+      this.tempTractorParams.beamPower = tractorField.beamPower;
+      this.tempTractorParams.gravityCompFactor = 0.44;
+      this.tempTractorParams.maxAccelG = 5.6;
+      this.tempTractorParams.massKg = 1.0;
+    }
+
+    let sumForceN = 0;
+    let sumWeightN = 0;
+    let sumLoadRatio = 0;
+    let capturedTelemetrySamples = 0;
 
     for (let sub = 0; sub < substeps; sub++) {
       // 1. Rebuild spatial hash grid
@@ -544,14 +874,60 @@ export class FluidSim {
 
         // Radial Newtonian gravity at particle position
         computeGravityVector(xi, yi, zi, gravityParams, this.tempGrav);
-        this.fx[i] = (fpx / rhoi) * scale + this.tempGrav.x;
-        this.fy[i] = (fpy / rhoi) * scale + this.tempGrav.y;
-        this.fz[i] = (fpz / rhoi) * scale + this.tempGrav.z;
+        let accX = (fpx / rhoi) * scale + this.tempGrav.x;
+        let accY = (fpy / rhoi) * scale + this.tempGrav.y;
+        let accZ = (fpz / rhoi) * scale + this.tempGrav.z;
+
+        if (hasTractor && tractorField && this.tractorFactor[i] > 0) {
+          evaluateStretchedAnchorPoint(
+            tractorField.anchorX,
+            tractorField.anchorY,
+            tractorField.anchorZ,
+            tractorField.targetX,
+            tractorField.targetY,
+            tractorField.targetZ,
+            this.tractorStretchU[i],
+            tractorField.stretchStrength ?? 0.68,
+            this.tempStretchTarget,
+          );
+          computeTractorSpringForce(
+            xi,
+            yi,
+            zi,
+            vxi,
+            vyi,
+            vzi,
+            this.tempStretchTarget.x,
+            this.tempStretchTarget.y,
+            this.tempStretchTarget.z,
+            tractorField.dragVelX,
+            tractorField.dragVelY,
+            tractorField.dragVelZ,
+            gravityParams,
+            this.tempTractorParams,
+            this.tractorFactor[i],
+            this.tempTractorResult,
+          );
+          accX += this.tempTractorResult.fx;
+          accY += this.tempTractorResult.fy;
+          accZ += this.tempTractorResult.fz;
+
+          if (sub === substeps - 1) {
+            sumForceN += this.tempTractorResult.beamForceN;
+            sumWeightN += this.tempTractorResult.gravityWeightN;
+            sumLoadRatio += this.tempTractorResult.loadRatio;
+            capturedTelemetrySamples++;
+          }
+        }
+
+        this.fx[i] = accX;
+        this.fy[i] = accY;
+        this.fz[i] = accZ;
       }
 
       // 4. Integrate velocity & position, then collide with live Marching Cubes terrain SDF
-      const maxSpeed = 16.0 * sqrtScale;
-      const boundaryR = 18.2 * scale;
+      const maxSpeed = (hasTractor ? 28.0 : 16.0) * sqrtScale;
+      const boundaryR = (hasTractor ? 24.0 : 18.2) * scale;
       const particleMargin = 0.24 * scale;
       for (let i = 0; i < n; i++) {
         let nvx = this.vx[i] + this.fx[i] * hStep;
@@ -619,11 +995,26 @@ export class FluidSim {
       }
     }
 
+    // Reset/accumulate tractor telemetry on final substep
+    if (hasTractor && capturedTelemetrySamples > 0) {
+      this.tractorTotalBeamForceN = sumForceN;
+      this.tractorTotalGravityWeightN = sumWeightN;
+      this.tractorAvgLoadRatio = sumLoadRatio / capturedTelemetrySamples;
+    } else {
+      this.tractorTotalBeamForceN = 0;
+      this.tractorTotalGravityWeightN = 0;
+      this.tractorAvgLoadRatio = 0;
+    }
+
     // Update splash droplet list (fast-moving or airborne spray particles)
     const splashThreshold = 1.35 * sqrtScale;
     let sc = 0;
+    let peakSpd = 0;
     for (let i = 0; i < n; i++) {
       const spd = Math.hypot(this.vx[i], this.vy[i], this.vz[i]);
+      if (this.tractorFactor[i] > 0 && spd > peakSpd) {
+        peakSpd = spd;
+      }
       if (spd > splashThreshold || this.rho[i] < this.restDensity * 1.15) {
         const s3 = sc * 3;
         this.splashPositions[s3] = this.px[i];
@@ -635,6 +1026,7 @@ export class FluidSim {
         sc++;
       }
     }
+    this.tractorPeakSpeedMs = peakSpd;
     this.splashCount = sc;
   }
 

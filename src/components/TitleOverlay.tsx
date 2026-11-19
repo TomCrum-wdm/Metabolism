@@ -373,10 +373,10 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
           </svg>
           <div className="min-w-0">
             <h1 className="font-display text-lg md:text-xl font-bold tracking-tight text-white leading-none">
-              TerraSphere
+              TerraSphere Studio
             </h1>
             <p className="text-[11px] text-slate-400 font-mono-tabular mt-1 truncate">
-              选定或编辑星球种子磁贴，随后异步生成并进入世界
+              行星创造器与体素地质编辑器 · 选定方案生成星球并用左侧工程工具雕刻、激光贯通或喷涂
             </p>
           </div>
         </div>

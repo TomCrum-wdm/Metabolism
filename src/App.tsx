@@ -6,7 +6,20 @@ import {
   MaterialId,
   PlanetSeedConfig,
 } from './engine/voxelPlanet';
+import {
+  BUILTIN_TOOLS,
+  loadCustomTools,
+  loadToolAttributeOverrides,
+  PlanetToolDef,
+  resolveToolDefinition,
+  saveCustomTools,
+  saveToolAttributeOverrides,
+  ToolAttributes,
+} from './engine/toolRegistry';
 import { DEFAULT_PLANET_RADIUS } from './engine/gravity';
+import {
+  createIdleTractorTelemetry,
+} from './engine/tractorBeam';
 import {
   CameraMode,
   GamePhase,
@@ -38,6 +51,15 @@ import { TouchControlsOverlay } from './components/TouchControlsOverlay';
 import { MapsModal } from './components/MapsModal';
 import { AtmosphereThermalPanel } from './components/AtmosphereThermalPanel';
 import { GenerationProgressOverlay } from './components/GenerationProgressOverlay';
+import {
+  DirectorScreenshotResult,
+  DirectorStudioDrawer,
+} from './components/DirectorStudioDrawer';
+import {
+  createDefaultDirectorPlan,
+  DirectorShotPlan,
+  ScreenshotFormat,
+} from './engine/director';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'orbit',
@@ -88,6 +110,7 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
 
   return {
     tool: 'carve',
+    toolAttributes: resolveToolDefinition('carve').attributes,
     material: MaterialId.Soil,
     brushRadius: Number((1.9 * rScale).toPrecision(4)),
     brushStrength: 1.85,
@@ -159,6 +182,7 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   landingStage: 'selecting',
   detailZoomMag: 1,
   perspectiveFov: 55,
+  tractorBeam: createIdleTractorTelemetry(),
 };
 
 export default function App() {
@@ -205,8 +229,30 @@ export default function App() {
   const [autoSaveEnabled, setAutoSaveEnabled] = useState<boolean>(
     () => loadStoredPrefs().autoSaveEnabled,
   );
+  const [customTools, setCustomTools] = useState<PlanetToolDef[]>(loadCustomTools);
+  const [toolOverrides, setToolOverrides] = useState<
+    Record<string, Partial<ToolAttributes>>
+  >(loadToolAttributeOverrides);
+  const [studioOpen, setStudioOpen] = useState(false);
+  const [directorOpen, setDirectorOpen] = useState(false);
+  const [directorPreviewing, setDirectorPreviewing] = useState(false);
+  const [directorPlan, setDirectorPlan] = useState<DirectorShotPlan>(createDefaultDirectorPlan);
+  const [shotToast, setShotToast] = useState<string | null>(null);
   const [seedVersion, setSeedVersion] = useState(0);
   const [genProgress, setGenProgress] = useState<GenerationProgress | null>(null);
+
+  const allTools = useMemo(() => {
+    const builtins = BUILTIN_TOOLS.map((t) => {
+      const ov = toolOverrides[t.id];
+      return ov ? { ...t, attributes: { ...t.attributes, ...ov } } : t;
+    });
+    return [...customTools, ...builtins];
+  }, [customTools, toolOverrides]);
+
+  const activeTool = useMemo(
+    () => resolveToolDefinition(config.tool, customTools, toolOverrides),
+    [config.tool, customTools, toolOverrides],
+  );
 
   const phaseRef = useRef<GamePhase>(phase);
   phaseRef.current = phase;
@@ -277,6 +323,9 @@ export default function App() {
     engineRef.current = engine;
     engine.setPhase(phaseRef.current);
     engine.setTouchEnabled(touchEnabledRef.current);
+    engine.setOnMaterialPicked((picked) => {
+      setConfig((prev) => ({ ...prev, material: picked }));
+    });
 
     let cancelled = false;
 
@@ -386,6 +435,94 @@ export default function App() {
       return next;
     });
   }, []);
+
+  const handleSelectTool = useCallback(
+    (toolDef: PlanetToolDef) => {
+      handleUpdateConfig({
+        tool: toolDef.id,
+        toolAttributes: { ...toolDef.attributes },
+      });
+    },
+    [handleUpdateConfig],
+  );
+
+  const handleSelectToolById = useCallback(
+    (toolId: string) => {
+      const resolved = resolveToolDefinition(toolId, customTools, toolOverrides);
+      handleSelectTool(resolved);
+    },
+    [customTools, handleSelectTool, toolOverrides],
+  );
+
+  const handleUpdateActiveAttributes = useCallback(
+    (partial: Partial<ToolAttributes>) => {
+      if (activeTool.isCustom) {
+        const nextList = customTools.map((t) =>
+          t.id === activeTool.id
+            ? { ...t, attributes: { ...t.attributes, ...partial } }
+            : t,
+        );
+        setCustomTools(nextList);
+        saveCustomTools(nextList);
+        handleUpdateConfig({
+          tool: activeTool.id,
+          toolAttributes: { ...activeTool.attributes, ...partial },
+        });
+      } else {
+        const nextOverrides = {
+          ...toolOverrides,
+          [activeTool.id]: {
+            ...(toolOverrides[activeTool.id] ?? {}),
+            ...partial,
+          },
+        };
+        setToolOverrides(nextOverrides);
+        saveToolAttributeOverrides(nextOverrides);
+        handleUpdateConfig({
+          tool: activeTool.id,
+          toolAttributes: { ...activeTool.attributes, ...partial },
+        });
+      }
+    },
+    [activeTool, customTools, handleUpdateConfig, toolOverrides],
+  );
+
+  const handleResetBuiltinOverride = useCallback(
+    (toolId: string) => {
+      const nextOverrides = { ...toolOverrides };
+      delete nextOverrides[toolId];
+      setToolOverrides(nextOverrides);
+      saveToolAttributeOverrides(nextOverrides);
+      const base = resolveToolDefinition(toolId, customTools, nextOverrides);
+      handleUpdateConfig({ tool: base.id, toolAttributes: { ...base.attributes } });
+    },
+    [customTools, handleUpdateConfig, toolOverrides],
+  );
+
+  const handleSaveCustomTool = useCallback(
+    (newTool: PlanetToolDef, activate = true) => {
+      const nextList = [newTool, ...customTools.filter((t) => t.id !== newTool.id)];
+      setCustomTools(nextList);
+      saveCustomTools(nextList);
+      if (activate) {
+        handleSelectTool(newTool);
+      }
+    },
+    [customTools, handleSelectTool],
+  );
+
+  const handleDeleteCustomTool = useCallback(
+    (toolId: string) => {
+      const nextList = customTools.filter((t) => t.id !== toolId);
+      setCustomTools(nextList);
+      saveCustomTools(nextList);
+      if (configRef.current.tool === toolId) {
+        const fallback = resolveToolDefinition('carve', nextList, toolOverrides);
+        handleSelectTool(fallback);
+      }
+    },
+    [customTools, handleSelectTool, toolOverrides],
+  );
 
   const handleToggleDebug = useCallback(() => {
     setDebugOpen((prev) => {
@@ -544,11 +681,55 @@ export default function App() {
     [refreshSavesList],
   );
 
+  const handleUpdateDirectorPlan = useCallback(
+    (partial: Partial<DirectorShotPlan>) => {
+      setDirectorPlan((prev) => ({ ...prev, ...partial }));
+    },
+    [],
+  );
+
+  const handleQuickScreenshot = useCallback(async () => {
+    const eng = engineRef.current;
+    if (!eng || !eng.hasWorld) return;
+    const w = Math.max(64, mountRef.current?.clientWidth || window.innerWidth);
+    const h = Math.max(64, mountRef.current?.clientHeight || window.innerHeight);
+    const res = await eng.captureDirectorScreenshot({
+      width: w,
+      height: h,
+      format: 'png',
+      hideHelpers: true,
+    });
+    const url = URL.createObjectURL(res.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `terrasphere-shot-${res.actualWidth}x${res.actualHeight}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 8000);
+    setShotToast(`已保存截屏 ${res.actualWidth}×${res.actualHeight} PNG`);
+    window.setTimeout(() => setShotToast(null), 2600);
+  }, []);
+
+  const handleStartDirectorPreview = useCallback(() => {
+    const eng = engineRef.current;
+    if (!eng || !eng.hasWorld) return;
+    setDirectorPreviewing(true);
+    eng.startDirectorPreview(directorPlan, () => {
+      setDirectorPreviewing(false);
+    });
+  }, [directorPlan]);
+
+  const handleStopDirectorPreview = useCallback(() => {
+    engineRef.current?.stopDirectorPreview();
+    setDirectorPreviewing(false);
+  }, []);
+
   // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
       if (phaseRef.current === 'title') {
         return;
@@ -556,6 +737,10 @@ export default function App() {
 
       if (e.code === 'Escape' || e.code === 'KeyP') {
         e.preventDefault();
+        if (directorPreviewing && e.code === 'Escape') {
+          handleStopDirectorPreview();
+          return;
+        }
         if (mapsOpen) {
           setMapsOpen(false);
           return;
@@ -564,13 +749,23 @@ export default function App() {
           setSeedModalOpen(false);
           return;
         }
+        if (directorOpen && e.code === 'Escape') {
+          setDirectorOpen(false);
+          return;
+        }
         setPhase((prev) => (prev === 'playing' ? 'paused' : 'playing'));
         return;
       }
 
       if (phaseRef.current !== 'playing') return;
 
-      if (e.code === 'F3' || e.code === 'Backquote') {
+      if (e.code === 'F9') {
+        e.preventDefault();
+        setDirectorOpen((prev) => !prev);
+      } else if (e.code === 'F10') {
+        e.preventDefault();
+        void handleQuickScreenshot();
+      } else if (e.code === 'F3' || e.code === 'Backquote') {
         e.preventDefault();
         handleToggleDebug();
       } else if (e.code === 'KeyB') {
@@ -604,16 +799,32 @@ export default function App() {
       } else if (e.code === 'KeyK') {
         e.preventDefault();
         handleUpdateConfig({ simPaused: !configRef.current.simPaused });
+      } else if (e.code === 'KeyI') {
+        handleSelectToolById('probe');
       } else if (e.code === 'Digit1') {
-        handleUpdateConfig({ tool: 'carve' });
+        handleSelectToolById('carve');
       } else if (e.code === 'Digit2') {
-        handleUpdateConfig({ tool: 'build' });
+        handleSelectToolById('tunnel');
       } else if (e.code === 'Digit3') {
-        handleUpdateConfig({ tool: 'smooth' });
+        handleSelectToolById('laser');
       } else if (e.code === 'Digit4') {
-        handleUpdateConfig({ tool: 'flatten' });
+        handleSelectToolById('continuousLaser');
       } else if (e.code === 'Digit5') {
-        handleUpdateConfig({ tool: 'water' });
+        handleSelectToolById('megaLaser');
+      } else if (e.code === 'Digit6') {
+        handleSelectToolById('explosion');
+      } else if (e.code === 'Digit7') {
+        handleSelectToolById('nuke');
+      } else if (e.code === 'Digit8') {
+        handleSelectToolById('burn');
+      } else if (e.code === 'Digit9') {
+        handleSelectToolById('magma');
+      } else if (e.code === 'Digit0') {
+        handleSelectToolById('water');
+      } else if (e.code === 'KeyX') {
+        handleSelectToolById('drain');
+      } else if (e.code === 'KeyY') {
+        handleSelectToolById('tractorBeam');
       } else if (e.code === 'Tab') {
         e.preventDefault();
         handleUpdateConfig({
@@ -643,7 +854,17 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleToggleDebug, handleUpdateConfig, mapsOpen, seedModalOpen]);
+  }, [
+    directorOpen,
+    directorPreviewing,
+    handleQuickScreenshot,
+    handleSelectToolById,
+    handleStopDirectorPreview,
+    handleToggleDebug,
+    handleUpdateConfig,
+    mapsOpen,
+    seedModalOpen,
+  ]);
 
   const voxelStats = useMemo(() => {
     void seedVersion;
@@ -736,12 +957,27 @@ export default function App() {
         <GameHud
           telemetry={telemetry}
           config={config}
+          tools={allTools}
+          activeTool={activeTool}
+          hasToolOverride={Boolean(toolOverrides[activeTool.id])}
+          studioOpen={studioOpen}
+          directorOpen={directorOpen}
+          directorPreviewing={directorPreviewing}
           debugOpen={debugOpen}
           mapsOpen={mapsOpen}
           atmosPanelOpen={atmosPanelOpen}
           dockOpen={dockOpen}
           touchEnabled={touchEnabled}
           newTabUrl={newTabUrl}
+          onToggleStudio={() => setStudioOpen((v) => !v)}
+          onToggleDirector={() => setDirectorOpen((v) => !v)}
+          onQuickScreenshot={() => void handleQuickScreenshot()}
+          onStopDirectorPreview={handleStopDirectorPreview}
+          onSelectTool={handleSelectTool}
+          onUpdateActiveAttributes={handleUpdateActiveAttributes}
+          onResetBuiltinOverride={handleResetBuiltinOverride}
+          onSaveCustomTool={handleSaveCustomTool}
+          onDeleteCustomTool={handleDeleteCustomTool}
           onToggleDock={() => setDockOpen((v) => !v)}
           onToggleTouch={handleToggleTouch}
           onPrepareNewTab={handlePrepareNewTab}
@@ -791,6 +1027,45 @@ export default function App() {
           onUpdateConfig={handleUpdateConfig}
           onClose={handleToggleDebug}
         />
+      )}
+
+      {phase === 'playing' && directorOpen && engineRef.current && (
+        <DirectorStudioDrawer
+          plan={directorPlan}
+          previewing={directorPreviewing}
+          hardwareCaps={engineRef.current.getDirectorHardwareCaps()}
+          viewportSize={{
+            width: Math.max(64, mountRef.current?.clientWidth || window.innerWidth),
+            height: Math.max(64, mountRef.current?.clientHeight || window.innerHeight),
+          }}
+          onUpdatePlan={handleUpdateDirectorPlan}
+          onCaptureKeyframe={() =>
+            engineRef.current!.captureCameraKeyframe(
+              `机位 ${directorPlan.keyframes.length + 1}`,
+            )
+          }
+          onStartPreview={handleStartDirectorPreview}
+          onStopPreview={handleStopDirectorPreview}
+          onCaptureScreenshot={async (opts: {
+            width: number;
+            height: number;
+            format: ScreenshotFormat;
+            hideHelpers: boolean;
+          }): Promise<DirectorScreenshotResult> => {
+            const res = await engineRef.current!.captureDirectorScreenshot(opts);
+            return { ...res, format: opts.format };
+          }}
+          onRenderOfflineVideo={(onProgress, signal) =>
+            engineRef.current!.renderDirectorVideoOffline(directorPlan, onProgress, signal)
+          }
+          onClose={() => setDirectorOpen(false)}
+        />
+      )}
+
+      {shotToast && (
+        <div className="fixed top-12 right-3 z-30 pointer-events-none px-3 py-1.5 rounded-xs border border-emerald-500/60 bg-[#090d18]/95 text-xs text-emerald-200 font-mono-tabular shadow-lg">
+          {shotToast}
+        </div>
       )}
 
       {phase === 'playing' && mapsOpen && engineRef.current && (

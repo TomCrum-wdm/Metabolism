@@ -42,7 +42,6 @@ import {
   Vec3Like,
 } from './gravity';
 import {
-  BrushMode,
   CHUNK_CELLS,
   ChunkLodLevel,
   HighResStreamBatch,
@@ -54,7 +53,23 @@ import {
   VoxelFormatStats,
   VoxelPlanet,
 } from './voxelPlanet';
-import { FluidSim, MAX_FLUID_PARTICLES } from './fluidSim';
+import {
+  ActiveFluidTractorField,
+  FluidSim,
+  MAX_FLUID_PARTICLES,
+} from './fluidSim';
+import {
+  computeRayPointDistanceSq,
+  computeTractorSpringForce,
+  createIdleTractorTelemetry,
+  evaluateStretchedAnchorPoint,
+  intersectCursorWithDragPlane,
+  summarizeEscapeStatus,
+  TractorBeamTelemetry,
+  TractorForceParams,
+  TractorForceResult,
+  TractorRayPickResult,
+} from './tractorBeam';
 import { SoundEngine } from './audio';
 import { PlanetSavePayload } from './persistence';
 import {
@@ -64,17 +79,35 @@ import {
   sampleAtmosphereAtPoint,
 } from './atmosphere';
 import {
+  computeHotspotDeltaC,
   DEFAULT_THERMAL_CONFIG,
   sampleThermalField,
   ThermalConfig,
+  ThermalHotspot,
 } from './thermal';
+import {
+  resolveToolDefinition,
+  ToolAttributes,
+} from './toolRegistry';
 import { dirToLonLat, lonLatToDir } from './cartography';
 import {
   computeDetailCameraOptics,
   computeSafeClipPlanes,
   DetailCameraOptics,
   evaluateLandingDescentPose,
+  resolveSphericalCoreUp,
+  stabilizeRadialAnchor,
+  transportCameraForwardOnSphere,
 } from './cameraMath';
+import {
+  computePlanFrameCount,
+  DirectorKeyframe,
+  DirectorRenderProgress,
+  DirectorSceneAnchor,
+  DirectorShotPlan,
+  evaluateDirectorPose,
+} from './director';
+import { buildTarArchive, WebmMuxer, WebmVideoCodec } from './webmMuxer';
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -136,10 +169,12 @@ export interface SandboxTelemetry {
   landingStage: LandingCameraStage;
   detailZoomMag: number;
   perspectiveFov: number;
+  tractorBeam: TractorBeamTelemetry;
 }
 
 export interface SandboxConfig {
-  tool: BrushMode;
+  tool: string;
+  toolAttributes?: ToolAttributes;
   material: MaterialId;
   brushRadius: number;
   brushStrength: number;
@@ -203,6 +238,12 @@ export class PlanetarySandboxEngine {
   public hasWorld = true;
   public isGenerating = false;
   private generationToken = 0;
+  private isOfflineRendering = false;
+  private directorPreviewPlan: DirectorShotPlan | null = null;
+  private directorPreviewTime = 0;
+  private directorPreviewAnchor: DirectorSceneAnchor | null = null;
+  private directorPreviewBaseSunAzimuth = 28;
+  private onDirectorPreviewEnd?: () => void;
 
   // Lighting & Sky
   private sunLight!: THREE.DirectionalLight;
@@ -300,7 +341,8 @@ export class PlanetarySandboxEngine {
   private squashY = 1.0;
 
   // Camera states (Explorer / Orbit / Detail / FPS / Landing / Perspective)
-  private camYaw = -0.35;
+  private explorerCamFwd = new THREE.Vector3(0, 0, -1);
+  private explorerCamAnchor = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
   private camPitch = 0.36;
   private camDistance = 9.0;
   private orbitYaw = 0.52;
@@ -314,7 +356,7 @@ export class PlanetarySandboxEngine {
   // Detail Inspection Camera (cursor-ray voxel zoom without clipping)
   private detailTarget = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
   private detailNormal = new THREE.Vector3(0, 1, 0);
-  private detailYaw = 0.45;
+  private detailBasisFwd = new THREE.Vector3(0, 0, -1);
   private detailPitch = 0.58;
   private detailViewDist = DEFAULT_PLANET_RADIUS * 1.1;
   private detailOptics: DetailCameraOptics = {
@@ -357,18 +399,176 @@ export class PlanetarySandboxEngine {
   private camLookSmooth = new THREE.Vector3(0, 6, 0);
   private titleAngle = 0.35;
 
-  // Brush preview, Procedural Landing Beacon & Detail Reticle, Debris particles
+  // Brush preview, Procedural Landing Beacon & Detail Reticle, Orbital Laser Beam, Debris
   private brushPreview!: THREE.Mesh;
   private brushMat!: THREE.MeshBasicNodeMaterial;
   private brushColorNode = uniform(new THREE.Color(0xf97316));
   private landingBeaconGroup!: THREE.Group;
   private detailReticleRing!: THREE.Mesh;
+  private laserBeamGroup!: THREE.Group;
+  private laserOuterMesh!: THREE.Mesh;
+  private laserCoreMesh!: THREE.Mesh;
+  private laserImpactMesh!: THREE.Mesh;
+  private laserBeamColorNode = uniform(new THREE.Color(0xf43f5e));
+  private laserImpactColorNode = uniform(new THREE.Color(0xfb7185));
+  private laserBeamScaleRad = 0.42;
+  private laserBeamActiveUntil = 0;
+  private laserBeamStart = new THREE.Vector3();
+  private laserBeamEnd = new THREE.Vector3();
+  private laserImpactPos = new THREE.Vector3();
+
+  // Dynamic Planet Creator Entity Pools (Meteors, Voxel Worms, Magma, Lightning, Shockwaves, Vortices)
   private debrisMesh!: THREE.InstancedMesh;
   private readonly MAX_DEBRIS = 96;
   private debrisPos = new Float32Array(96 * 3);
   private debrisVel = new Float32Array(96 * 3);
   private debrisLife = new Float32Array(96);
+  private debrisGrabbed = new Float32Array(96);
+  private debrisStretchU = new Float32Array(96);
   private debrisNext = 0;
+
+  private magmaMesh!: THREE.InstancedMesh;
+  private readonly MAX_MAGMA = 256;
+  private magmaPos = new Float32Array(256 * 3);
+  private magmaVel = new Float32Array(256 * 3);
+  private magmaLife = new Float32Array(256);
+  private magmaRad = new Float32Array(256);
+  private magmaGrabbed = new Float32Array(256);
+  private magmaStretchU = new Float32Array(256);
+  private magmaNext = 0;
+
+  private wormMesh!: THREE.InstancedMesh;
+  private readonly MAX_WORM_INSTANCES = 180;
+  private activeWorms: Array<{
+    segments: Array<[number, number, number]>;
+    dir: [number, number, number];
+    speed: number;
+    radius: number;
+    strength: number;
+    material: MaterialId;
+    life: number;
+    phase: number;
+    stepAccum: number;
+    grabbedWeight?: number;
+    stretchU?: number;
+  }> = [];
+
+  private meteorMesh!: THREE.InstancedMesh;
+  private readonly MAX_METEORS = 24;
+  private activeMeteors: Array<{
+    x: number;
+    y: number;
+    z: number;
+    vx: number;
+    vy: number;
+    vz: number;
+    radius: number;
+    strength: number;
+    thermalDeltaC: number;
+    debrisCount: number;
+    material: MaterialId;
+    rimMaterial: MaterialId;
+    leaveRim: boolean;
+    life: number;
+    grabbedWeight?: number;
+    stretchU?: number;
+  }> = [];
+
+  private shockwaveRingMesh!: THREE.InstancedMesh;
+  private fireballMesh!: THREE.InstancedMesh;
+  private readonly MAX_SHOCKWAVES = 16;
+  private activeShockwaves: Array<{
+    x: number;
+    y: number;
+    z: number;
+    nx: number;
+    ny: number;
+    nz: number;
+    age: number;
+    maxAge: number;
+    maxRadius: number;
+    hasFireball: boolean;
+    isNuke: boolean;
+  }> = [];
+
+  private vortexMesh!: THREE.InstancedMesh;
+  private readonly MAX_VORTEX_INSTANCES = 64;
+  private activeVortices: Array<{
+    x: number;
+    y: number;
+    z: number;
+    nx: number;
+    ny: number;
+    nz: number;
+    radius: number;
+    strength: number;
+    speed: number;
+    kind: 'blackHole' | 'tornado';
+    material: MaterialId;
+    age: number;
+    maxAge: number;
+    carveTimer: number;
+  }> = [];
+
+  private lightningLines!: THREE.LineSegments;
+  private readonly MAX_LIGHTNING_SEGS = 240;
+  private lightningPosArr = new Float32Array(240 * 6);
+  private lightningLife = 0;
+
+  // Procedural 3D Tractor Beam Assembly & Newtonian Force State
+  private tractorBeamGroup!: THREE.Group;
+  private tractorConeMesh!: THREE.Mesh;
+  private tractorRings: THREE.Mesh[] = [];
+  private tractorCursorOrb!: THREE.Mesh;
+  private tractorStretchLine!: THREE.Line;
+  private tractorStretchPosArr = new Float32Array(6);
+  private tractorBeamColorNode = uniform(new THREE.Color(0x22d3ee));
+  private isTractorDragging = false;
+  private tractorGrabbedPlayer = false;
+  private tractorCapturedEntityCount = 0;
+  private tractorAnchor = new THREE.Vector3();
+  private tractorTarget = new THREE.Vector3();
+  private tractorPrevTarget = new THREE.Vector3();
+  private tractorDragVel = new THREE.Vector3();
+  private tractorDragDepthDist = 20;
+  private tractorTelemetry: TractorBeamTelemetry = createIdleTractorTelemetry();
+  private readonly _tractorField: ActiveFluidTractorField = {
+    anchorX: 0,
+    anchorY: 0,
+    anchorZ: 0,
+    targetX: 0,
+    targetY: 0,
+    targetZ: 0,
+    dragVelX: 0,
+    dragVelY: 0,
+    dragVelZ: 0,
+    radius: 2.5,
+    beamPower: 1.5,
+    stretchStrength: 0.68,
+  };
+  private readonly _tractorForceParams: TractorForceParams = {
+    planetRadius: DEFAULT_PLANET_RADIUS,
+    beamPower: 1.5,
+    gravityCompFactor: 0.44,
+    maxAccelG: 5.8,
+    massKg: 1.0,
+  };
+  private readonly _tractorForceRes: TractorForceResult = {
+    fx: 0,
+    fy: 0,
+    fz: 0,
+    beamForceN: 0,
+    gravityWeightN: 0,
+    localGravityMs2: 0,
+    loadRatio: 0,
+    saturated: false,
+  };
+  private readonly _tractorRayPick: TractorRayPickResult = { hit: false, t: 0, distSq: 0 };
+  private readonly _tractorTargetPt: Vec3Like = { x: 0, y: 0, z: 0 };
+  private readonly _tractorPlaneHit: Vec3Like = { x: 0, y: 0, z: 0 };
+
+  private thermalHotspots: ThermalHotspot[] = [];
+  private onMaterialPicked: ((mat: MaterialId) => void) | null = null;
 
   // Input & Touch state
   private keys = new Set<string>();
@@ -1193,6 +1393,11 @@ export class PlanetarySandboxEngine {
   private updateHighResStreaming(
     hoveredHit: ReturnType<VoxelPlanet['raycastTerrain']> | null,
     budget = 28,
+    explicitOverride?: {
+      focus: readonly [number, number, number];
+      dist: number;
+      lodModeOverride?: LodMode;
+    },
   ): HighResStreamBatch | null {
     void hoveredHit;
     if (!this.planet.isHighResStreaming || !this.highResGroup) {
@@ -1208,7 +1413,16 @@ export class PlanetarySandboxEngine {
     let fz = 0;
     let useExplicitFocus = false;
     let effectiveCamDistOverride: number | null = null;
-    if (this.config.cameraMode === 'explorer' && (this.phase === 'playing' || this.isGenerating)) {
+
+    if (explicitOverride) {
+      this.lastHighResFocus.set(
+        explicitOverride.focus[0],
+        explicitOverride.focus[1],
+        explicitOverride.focus[2],
+      );
+      useExplicitFocus = true;
+      effectiveCamDistOverride = explicitOverride.dist;
+    } else if (this.config.cameraMode === 'explorer' && (this.phase === 'playing' || this.isGenerating)) {
       const pLen = this.playerPos.length();
       if (pLen > 1e-4) {
         fx = this.playerPos.x / pLen;
@@ -1340,7 +1554,10 @@ export class PlanetarySandboxEngine {
       camDistToFocus,
       camPosArr,
       camFwdArr,
-      { lodMode: this.config.lodMode, lod0Dist: this.config.lod0Dist },
+      {
+        lodMode: explicitOverride?.lodModeOverride ?? this.config.lodMode,
+        lod0Dist: this.config.lod0Dist,
+      },
     );
 
     if (!batch.active) {
@@ -1463,6 +1680,8 @@ export class PlanetarySandboxEngine {
       if (this.brushPreview) this.brushPreview.visible = false;
       if (this.landingBeaconGroup) this.landingBeaconGroup.visible = false;
       if (this.detailReticleRing) this.detailReticleRing.visible = false;
+      if (this.tractorBeamGroup) this.tractorBeamGroup.visible = false;
+      if (this.tractorStretchLine) this.tractorStretchLine.visible = false;
     }
   }
 
@@ -1849,6 +2068,324 @@ export class PlanetarySandboxEngine {
     this.debrisMesh.frustumCulled = false;
     this.debrisMesh.count = 0;
     this.scene.add(this.debrisMesh);
+
+    // Procedural Orbital Laser & Tunnel Piercing Beam
+    this.laserBeamGroup = new THREE.Group();
+    const outerBeamGeo = new THREE.CylinderGeometry(1, 1, 1, 16, 1, true);
+    const outerBeamMat = new THREE.MeshBasicNodeMaterial();
+    outerBeamMat.colorNode = this.laserBeamColorNode.mul(2.3);
+    outerBeamMat.opacityNode = float(0.45);
+    outerBeamMat.transparent = true;
+    outerBeamMat.side = THREE.DoubleSide;
+    outerBeamMat.depthWrite = false;
+    this.laserOuterMesh = new THREE.Mesh(outerBeamGeo, outerBeamMat);
+    this.laserBeamGroup.add(this.laserOuterMesh);
+
+    const coreBeamGeo = new THREE.CylinderGeometry(0.32, 0.32, 1, 10, 1, true);
+    const coreBeamMat = new THREE.MeshBasicNodeMaterial();
+    coreBeamMat.colorNode = color(0xffffff).mul(2.8);
+    coreBeamMat.opacityNode = float(0.92);
+    coreBeamMat.transparent = true;
+    coreBeamMat.side = THREE.DoubleSide;
+    coreBeamMat.depthWrite = false;
+    this.laserCoreMesh = new THREE.Mesh(coreBeamGeo, coreBeamMat);
+    this.laserBeamGroup.add(this.laserCoreMesh);
+
+    const impactGeo = new THREE.SphereGeometry(1, 14, 10);
+    const impactMat = new THREE.MeshBasicNodeMaterial();
+    impactMat.colorNode = this.laserImpactColorNode.mul(2.5);
+    impactMat.opacityNode = float(0.68);
+    impactMat.transparent = true;
+    impactMat.depthWrite = false;
+    this.laserImpactMesh = new THREE.Mesh(impactGeo, impactMat);
+    this.scene.add(this.laserImpactMesh);
+    this.laserImpactMesh.visible = false;
+
+    this.laserBeamGroup.visible = false;
+    this.scene.add(this.laserBeamGroup);
+
+    // Molten Magma / Fire Embers Pool
+    const magmaGeo = new THREE.DodecahedronGeometry(0.24, 0);
+    const magmaMat = new THREE.MeshBasicNodeMaterial();
+    magmaMat.colorNode = color(0xff5a1f).mul(2.4);
+    this.magmaMesh = new THREE.InstancedMesh(magmaGeo, magmaMat, this.MAX_MAGMA);
+    this.magmaMesh.frustumCulled = false;
+    this.magmaMesh.count = 0;
+    this.scene.add(this.magmaMesh);
+
+    // Living Voxel Worm Segments Pool
+    const wormGeo = new THREE.BoxGeometry(1, 1, 1);
+    const wormMat = new THREE.MeshStandardNodeMaterial();
+    wormMat.colorNode = color(0x84cc16).mul(1.35);
+    wormMat.roughnessNode = float(0.45);
+    this.wormMesh = new THREE.InstancedMesh(wormGeo, wormMat, this.MAX_WORM_INSTANCES);
+    this.wormMesh.castShadow = true;
+    this.wormMesh.frustumCulled = false;
+    this.wormMesh.count = 0;
+    this.scene.add(this.wormMesh);
+
+    // Flaming Meteor Boulders Pool
+    const meteorGeo = new THREE.IcosahedronGeometry(0.55, 1);
+    const meteorMat = new THREE.MeshBasicNodeMaterial();
+    meteorMat.colorNode = color(0xfb923c).mul(2.1);
+    this.meteorMesh = new THREE.InstancedMesh(meteorGeo, meteorMat, this.MAX_METEORS);
+    this.meteorMesh.frustumCulled = false;
+    this.meteorMesh.count = 0;
+    this.scene.add(this.meteorMesh);
+
+    // Shockwave Ring & Fireball Mushroom Pools
+    const shockGeo = new THREE.TorusGeometry(1.0, 0.08, 8, 36);
+    shockGeo.rotateX(Math.PI / 2);
+    const shockMat = new THREE.MeshBasicNodeMaterial();
+    shockMat.colorNode = color(0xfef08a).mul(2.3);
+    shockMat.opacityNode = float(0.62);
+    shockMat.transparent = true;
+    shockMat.depthWrite = false;
+    this.shockwaveRingMesh = new THREE.InstancedMesh(shockGeo, shockMat, this.MAX_SHOCKWAVES);
+    this.shockwaveRingMesh.frustumCulled = false;
+    this.shockwaveRingMesh.count = 0;
+    this.scene.add(this.shockwaveRingMesh);
+
+    const fbGeo = new THREE.SphereGeometry(0.65, 14, 10);
+    const fbMat = new THREE.MeshBasicNodeMaterial();
+    fbMat.colorNode = color(0xf97316).mul(2.2);
+    fbMat.opacityNode = float(0.58);
+    fbMat.transparent = true;
+    fbMat.depthWrite = false;
+    this.fireballMesh = new THREE.InstancedMesh(fbGeo, fbMat, this.MAX_SHOCKWAVES);
+    this.fireballMesh.frustumCulled = false;
+    this.fireballMesh.count = 0;
+    this.scene.add(this.fireballMesh);
+
+    // Tornado & Black Hole Vortex Rings Pool
+    const vortexGeo = new THREE.TorusGeometry(1.0, 0.14, 8, 24);
+    vortexGeo.rotateX(Math.PI / 2);
+    const vortexMat = new THREE.MeshBasicNodeMaterial();
+    vortexMat.colorNode = color(0x6366f1).mul(1.85);
+    vortexMat.opacityNode = float(0.68);
+    vortexMat.transparent = true;
+    vortexMat.depthWrite = false;
+    this.vortexMesh = new THREE.InstancedMesh(vortexGeo, vortexMat, this.MAX_VORTEX_INSTANCES);
+    this.vortexMesh.frustumCulled = false;
+    this.vortexMesh.count = 0;
+    this.scene.add(this.vortexMesh);
+
+    // Jagged Procedural 3D Lightning Arcs
+    const lGeo = new THREE.BufferGeometry();
+    lGeo.setAttribute('position', new THREE.BufferAttribute(this.lightningPosArr, 3));
+    lGeo.setDrawRange(0, 0);
+    const lMat = new THREE.LineBasicNodeMaterial();
+    lMat.colorNode = color(0x93c5fd).mul(3.2);
+    lMat.transparent = true;
+    this.lightningLines = new THREE.LineSegments(lGeo, lMat);
+    this.lightningLines.frustumCulled = false;
+    this.lightningLines.visible = false;
+    this.scene.add(this.lightningLines);
+
+    // Procedural 3D Tractor Beam Cone + Traveling Capture Rings + Stretch Spine
+    this.tractorBeamGroup = new THREE.Group();
+    const coneGeo = new THREE.CylinderGeometry(0.18, 1.0, 1, 20, 1, true);
+    const coneMat = new THREE.MeshBasicNodeMaterial();
+    coneMat.colorNode = this.tractorBeamColorNode.mul(1.8);
+    coneMat.opacityNode = float(0.24);
+    coneMat.transparent = true;
+    coneMat.side = THREE.DoubleSide;
+    coneMat.depthWrite = false;
+    this.tractorConeMesh = new THREE.Mesh(coneGeo, coneMat);
+    this.tractorBeamGroup.add(this.tractorConeMesh);
+
+    const tRingGeo = new THREE.TorusGeometry(1.0, 0.055, 8, 28);
+    tRingGeo.rotateX(Math.PI / 2);
+    const tRingMat = new THREE.MeshBasicNodeMaterial();
+    tRingMat.colorNode = this.tractorBeamColorNode.mul(2.4);
+    tRingMat.opacityNode = float(0.78);
+    tRingMat.transparent = true;
+    tRingMat.depthWrite = false;
+    this.tractorRings = [];
+    for (let r = 0; r < 3; r++) {
+      const ringMesh = new THREE.Mesh(tRingGeo, tRingMat);
+      this.tractorBeamGroup.add(ringMesh);
+      this.tractorRings.push(ringMesh);
+    }
+
+    const orbGeo = new THREE.SphereGeometry(0.28, 14, 12);
+    const orbMat = new THREE.MeshBasicNodeMaterial();
+    orbMat.colorNode = color(0xe0f2fe).mul(2.2);
+    orbMat.opacityNode = float(0.78);
+    orbMat.transparent = true;
+    orbMat.depthWrite = false;
+    this.tractorCursorOrb = new THREE.Mesh(orbGeo, orbMat);
+    this.tractorBeamGroup.add(this.tractorCursorOrb);
+    this.tractorBeamGroup.visible = false;
+    this.scene.add(this.tractorBeamGroup);
+
+    const stretchGeo = new THREE.BufferGeometry();
+    stretchGeo.setAttribute('position', new THREE.BufferAttribute(this.tractorStretchPosArr, 3));
+    const stretchMat = new THREE.LineBasicNodeMaterial();
+    stretchMat.colorNode = this.tractorBeamColorNode.mul(2.2);
+    stretchMat.opacityNode = float(0.82);
+    stretchMat.transparent = true;
+    this.tractorStretchLine = new THREE.Line(stretchGeo, stretchMat);
+    this.tractorStretchLine.frustumCulled = false;
+    this.tractorStretchLine.visible = false;
+    this.scene.add(this.tractorStretchLine);
+  }
+
+  private clearDynamicEntities(): void {
+    this.releaseTractorBeam();
+    this.debrisLife.fill(0);
+    this.debrisGrabbed.fill(0);
+    this.magmaLife.fill(0);
+    this.magmaGrabbed.fill(0);
+    this.activeWorms.length = 0;
+    this.activeMeteors.length = 0;
+    this.activeShockwaves.length = 0;
+    this.activeVortices.length = 0;
+    this.thermalHotspots.length = 0;
+    this.lightningLife = 0;
+    if (this.debrisMesh) this.debrisMesh.count = 0;
+    if (this.magmaMesh) this.magmaMesh.count = 0;
+    if (this.wormMesh) this.wormMesh.count = 0;
+    if (this.meteorMesh) this.meteorMesh.count = 0;
+    if (this.shockwaveRingMesh) this.shockwaveRingMesh.count = 0;
+    if (this.fireballMesh) this.fireballMesh.count = 0;
+    if (this.vortexMesh) this.vortexMesh.count = 0;
+    if (this.lightningLines) this.lightningLines.visible = false;
+    if (this.tractorBeamGroup) this.tractorBeamGroup.visible = false;
+    if (this.tractorStretchLine) this.tractorStretchLine.visible = false;
+  }
+
+  private addThermalHotspot(
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    deltaC: number,
+    decayPerSec = 45,
+  ): void {
+    if (Math.abs(deltaC) < 1) return;
+    if (this.thermalHotspots.length >= 24) {
+      this.thermalHotspots.shift();
+    }
+    this.thermalHotspots.push({ x, y, z, radius, deltaC, decayPerSec });
+  }
+
+  private spawnShockwave(
+    x: number,
+    y: number,
+    z: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    maxRadius: number,
+    hasFireball: boolean,
+    isNuke = false,
+  ): void {
+    if (this.activeShockwaves.length >= this.MAX_SHOCKWAVES) {
+      this.activeShockwaves.shift();
+    }
+    this.activeShockwaves.push({
+      x,
+      y,
+      z,
+      nx,
+      ny,
+      nz,
+      age: 0,
+      maxAge: isNuke ? 2.1 : hasFireball ? 0.95 : 0.65,
+      maxRadius,
+      hasFireball,
+      isNuke,
+    });
+  }
+
+  private spawnMagmaBurst(
+    cx: number,
+    cy: number,
+    cz: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    count: number,
+    rad: number,
+    speedMult = 1.0,
+    burnOnly = false,
+  ): void {
+    const scale = this.getPlanetScale();
+    const velScale = Math.sqrt(scale) * speedMult;
+    for (let k = 0; k < count; k++) {
+      const i = this.magmaNext;
+      this.magmaNext = (this.magmaNext + 1) % this.MAX_MAGMA;
+      const i3 = i * 3;
+      this.magmaPos[i3] = cx + (Math.random() - 0.5) * rad * 0.7;
+      this.magmaPos[i3 + 1] = cy + (Math.random() - 0.5) * rad * 0.7;
+      this.magmaPos[i3 + 2] = cz + (Math.random() - 0.5) * rad * 0.7;
+      this.magmaVel[i3] = (nx * (1.8 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.8) * velScale;
+      this.magmaVel[i3 + 1] = (ny * (1.8 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.8) * velScale;
+      this.magmaVel[i3 + 2] = (nz * (1.8 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.8) * velScale;
+      this.magmaLife[i] = burnOnly ? 0.65 + Math.random() * 0.55 : 2.6 + Math.random() * 1.4;
+      this.magmaRad[i] = burnOnly ? -Math.max(rad * 0.25, 0.2 * scale) : Math.max(rad * 0.35, 0.35 * scale);
+    }
+  }
+
+  private spawnLightningBolt(
+    hx: number,
+    hy: number,
+    hz: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    forks = 3,
+  ): void {
+    const scale = this.getPlanetScale();
+    const height = Math.max(this.planet.baseRadius * 0.95, 9 * scale);
+    let segIdx = 0;
+    const pushSeg = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => {
+      if (segIdx >= this.MAX_LIGHTNING_SEGS) return;
+      const o = segIdx * 6;
+      this.lightningPosArr[o] = ax;
+      this.lightningPosArr[o + 1] = ay;
+      this.lightningPosArr[o + 2] = az;
+      this.lightningPosArr[o + 3] = bx;
+      this.lightningPosArr[o + 4] = by;
+      this.lightningPosArr[o + 5] = bz;
+      segIdx++;
+    };
+
+    const fCount = clamp(Math.round(forks), 1, 6);
+    for (let f = 0; f < fCount; f++) {
+      let cx = hx + nx * height + (f === 0 ? 0 : (Math.random() - 0.5) * 3.5 * scale);
+      let cy = hy + ny * height + (f === 0 ? 0 : (Math.random() - 0.5) * 3.5 * scale);
+      let cz = hz + nz * height + (f === 0 ? 0 : (Math.random() - 0.5) * 3.5 * scale);
+      const steps = 14;
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        const jitter = (1 - t) * 1.45 * scale;
+        const tx = cx * (1 - 1 / (steps - s + 1)) + hx * (1 / (steps - s + 1)) + (s < steps ? (Math.random() - 0.5) * jitter : 0);
+        const ty = cy * (1 - 1 / (steps - s + 1)) + hy * (1 / (steps - s + 1)) + (s < steps ? (Math.random() - 0.5) * jitter : 0);
+        const tz = cz * (1 - 1 / (steps - s + 1)) + hz * (1 / (steps - s + 1)) + (s < steps ? (Math.random() - 0.5) * jitter : 0);
+        pushSeg(cx, cy, cz, tx, ty, tz);
+        // Occasional side arc branch
+        if (s > 3 && s < steps - 2 && Math.random() < 0.35) {
+          pushSeg(
+            tx,
+            ty,
+            tz,
+            tx + (Math.random() - 0.5) * 2.2 * scale,
+            ty + (Math.random() - 0.5) * 2.2 * scale,
+            tz + (Math.random() - 0.5) * 2.2 * scale,
+          );
+        }
+        cx = tx;
+        cy = ty;
+        cz = tz;
+      }
+    }
+
+    this.lightningLines.geometry.setDrawRange(0, segIdx * 2);
+    (this.lightningLines.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    this.lightningLines.visible = segIdx > 0;
+    this.lightningLife = 0.24;
   }
 
   private spawnDebrisBurst(
@@ -1859,6 +2396,8 @@ export class PlanetarySandboxEngine {
     ny: number,
     nz: number,
     count = 8,
+    lifeSec = 1.2,
+    grabWeight = 0,
   ): void {
     const scale = this.getPlanetScale();
     const velScale = Math.sqrt(scale);
@@ -1869,38 +2408,143 @@ export class PlanetarySandboxEngine {
       this.debrisPos[i3] = cx + (Math.random() - 0.5) * 0.9 * scale;
       this.debrisPos[i3 + 1] = cy + (Math.random() - 0.5) * 0.9 * scale;
       this.debrisPos[i3 + 2] = cz + (Math.random() - 0.5) * 0.9 * scale;
-      this.debrisVel[i3] = (nx * (2.5 + Math.random() * 3.0) + (Math.random() - 0.5) * 4.0) * velScale;
-      this.debrisVel[i3 + 1] = (ny * (2.5 + Math.random() * 3.0) + (Math.random() - 0.5) * 4.0) * velScale;
-      this.debrisVel[i3 + 2] = (nz * (2.5 + Math.random() * 3.0) + (Math.random() - 0.5) * 4.0) * velScale;
-      this.debrisLife[i] = 0.85 + Math.random() * 0.55;
+      this.debrisVel[i3] = (nx * (2.2 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.2) * velScale;
+      this.debrisVel[i3 + 1] = (ny * (2.2 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.2) * velScale;
+      this.debrisVel[i3 + 2] = (nz * (2.2 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.2) * velScale;
+      this.debrisLife[i] = lifeSec + Math.random() * 0.65;
+      this.debrisGrabbed[i] = grabWeight;
+      this.debrisStretchU[i] = count > 1 ? k / (count - 1) : 0.7;
     }
   }
 
-  private updateDebris(dt: number): void {
+  private updateDebris(dt: number): {
+    grabbedCount: number;
+    beamForceN: number;
+    gravityWeightN: number;
+    loadRatioSum: number;
+    peakSpeedMs: number;
+  } {
     const params = this.getGravityParams();
     const scale = this.getPlanetScale();
     let active = 0;
-    for (let i = 0; i < this.MAX_DEBRIS; i++) {
-      const life = this.debrisLife[i];
-      if (life <= 0) continue;
-      this.debrisLife[i] = life - dt;
-      const i3 = i * 3;
-      computeGravityVector(
-        this.debrisPos[i3],
-        this.debrisPos[i3 + 1],
-        this.debrisPos[i3 + 2],
-        params,
-        this._grav,
-      );
-      this.debrisVel[i3] += this._grav.x * dt;
-      this.debrisVel[i3 + 1] += this._grav.y * dt;
-      this.debrisVel[i3 + 2] += this._grav.z * dt;
-      this.debrisPos[i3] += this.debrisVel[i3] * dt;
-      this.debrisPos[i3 + 1] += this.debrisVel[i3 + 1] * dt;
-      this.debrisPos[i3 + 2] += this.debrisVel[i3 + 2] * dt;
+    let grabbedCount = 0;
+    let beamForceN = 0;
+    let gravityWeightN = 0;
+    let loadRatioSum = 0;
+    let peakSpeedMs = 0;
+    const attrs = this.getActiveToolAttrs();
+    const beamPower = Math.max(0.25, this.config.brushStrength * attrs.strengthMult);
+    const debrisRadius = 0.19 * scale;
 
-      const s = clamp(life, 0.05, 1.0) * scale;
-      this._v1.set(this.debrisPos[i3], this.debrisPos[i3 + 1], this.debrisPos[i3 + 2]);
+    if (this.isTractorDragging) {
+      this._tractorForceParams.planetRadius = this.planet.baseRadius;
+      this._tractorForceParams.beamPower = beamPower;
+      this._tractorForceParams.gravityCompFactor = 0.44;
+      this._tractorForceParams.maxAccelG = 5.8;
+      this._tractorForceParams.massKg = 1.4;
+    }
+
+    for (let i = 0; i < this.MAX_DEBRIS; i++) {
+      let life = this.debrisLife[i];
+      if (life <= 0) continue;
+      const grabW = this.isTractorDragging ? this.debrisGrabbed[i] : 0;
+      if (grabW > 0) {
+        life = Math.max(life, 14.0);
+        this.debrisLife[i] = life;
+      } else {
+        life -= dt;
+        this.debrisLife[i] = life;
+      }
+      const i3 = i * 3;
+      const px = this.debrisPos[i3];
+      const py = this.debrisPos[i3 + 1];
+      const pz = this.debrisPos[i3 + 2];
+
+      computeGravityVector(px, py, pz, params, this._grav);
+      let ax = this._grav.x;
+      let ay = this._grav.y;
+      let az = this._grav.z;
+
+      if (grabW > 0) {
+        evaluateStretchedAnchorPoint(
+          this.tractorAnchor.x,
+          this.tractorAnchor.y,
+          this.tractorAnchor.z,
+          this.tractorTarget.x,
+          this.tractorTarget.y,
+          this.tractorTarget.z,
+          this.debrisStretchU[i],
+          0.72,
+          this._tractorTargetPt,
+        );
+        computeTractorSpringForce(
+          px,
+          py,
+          pz,
+          this.debrisVel[i3],
+          this.debrisVel[i3 + 1],
+          this.debrisVel[i3 + 2],
+          this._tractorTargetPt.x,
+          this._tractorTargetPt.y,
+          this._tractorTargetPt.z,
+          this.tractorDragVel.x,
+          this.tractorDragVel.y,
+          this.tractorDragVel.z,
+          params,
+          this._tractorForceParams,
+          grabW,
+          this._tractorForceRes,
+        );
+        const invM = 1 / this._tractorForceParams.massKg;
+        ax += this._tractorForceRes.fx * invM;
+        ay += this._tractorForceRes.fy * invM;
+        az += this._tractorForceRes.fz * invM;
+
+        grabbedCount++;
+        beamForceN += this._tractorForceRes.beamForceN;
+        gravityWeightN += this._tractorForceRes.gravityWeightN;
+        loadRatioSum += this._tractorForceRes.loadRatio;
+      }
+
+      this.debrisVel[i3] += ax * dt;
+      this.debrisVel[i3 + 1] += ay * dt;
+      this.debrisVel[i3 + 2] += az * dt;
+
+      let npx = px + this.debrisVel[i3] * dt;
+      let npy = py + this.debrisVel[i3 + 1] * dt;
+      let npz = pz + this.debrisVel[i3 + 2] * dt;
+
+      // Real SDF collision against voxel terrain so boulders bounce & roll across planet
+      const d = this.planet.sampleDensityAndNormal(npx, npy, npz, this._normalArr, true);
+      if (d > -debrisRadius) {
+        const pen = d + debrisRadius;
+        const nx = this._normalArr[0];
+        const ny = this._normalArr[1];
+        const nz = this._normalArr[2];
+        npx += nx * pen;
+        npy += ny * pen;
+        npz += nz * pen;
+        const vn = this.debrisVel[i3] * nx + this.debrisVel[i3 + 1] * ny + this.debrisVel[i3 + 2] * nz;
+        if (vn < 0) {
+          const restitution = 0.32;
+          this.debrisVel[i3] -= (1 + restitution) * vn * nx;
+          this.debrisVel[i3 + 1] -= (1 + restitution) * vn * ny;
+          this.debrisVel[i3 + 2] -= (1 + restitution) * vn * nz;
+          this.debrisVel[i3] *= 0.9;
+          this.debrisVel[i3 + 1] *= 0.9;
+          this.debrisVel[i3 + 2] *= 0.9;
+        }
+      }
+
+      this.debrisPos[i3] = npx;
+      this.debrisPos[i3 + 1] = npy;
+      this.debrisPos[i3 + 2] = npz;
+
+      const spd = Math.hypot(this.debrisVel[i3], this.debrisVel[i3 + 1], this.debrisVel[i3 + 2]);
+      if (grabW > 0 && spd > peakSpeedMs) peakSpeedMs = spd;
+
+      const s = clamp(life, 0.08, 1.15) * scale;
+      this._v1.set(npx, npy, npz);
       this._euler.set(life * 4.5, life * 3.1, i * 0.5);
       this._q1.setFromEuler(this._euler);
       this._s1.set(s, s, s);
@@ -1912,6 +2556,508 @@ export class PlanetarySandboxEngine {
     if (active > 0) {
       this.debrisMesh.instanceMatrix.needsUpdate = true;
     }
+    return { grabbedCount, beamForceN, gravityWeightN, loadRatioSum, peakSpeedMs };
+  }
+
+  private updateDynamicEntities(dt: number): {
+    grabbedCount: number;
+    beamForceN: number;
+    gravityWeightN: number;
+    loadRatioSum: number;
+    peakSpeedMs: number;
+  } {
+    const params = this.getGravityParams();
+    const scale = this.getPlanetScale();
+    let terrainDirty = false;
+    let grabbedCount = 0;
+    let beamForceN = 0;
+    let gravityWeightN = 0;
+    let loadRatioSum = 0;
+    let peakSpeedMs = 0;
+    const attrs = this.getActiveToolAttrs();
+    const beamPower = Math.max(0.25, this.config.brushStrength * attrs.strengthMult);
+
+    if (this.isTractorDragging) {
+      this._tractorForceParams.planetRadius = this.planet.baseRadius;
+      this._tractorForceParams.beamPower = beamPower;
+      this._tractorForceParams.gravityCompFactor = 0.44;
+      this._tractorForceParams.maxAccelG = 6.0;
+      this._tractorForceParams.massKg = 1.6;
+    }
+
+    // 1. Decay thermal hotspots
+    for (let i = this.thermalHotspots.length - 1; i >= 0; i--) {
+      const h = this.thermalHotspots[i];
+      const step = h.decayPerSec * dt;
+      if (Math.abs(h.deltaC) <= step) {
+        this.thermalHotspots.splice(i, 1);
+      } else {
+        h.deltaC -= Math.sign(h.deltaC) * step;
+      }
+    }
+
+    // 2. Lightning visibility fade
+    if (this.lightningLife > 0) {
+      this.lightningLife -= dt;
+      if (this.lightningLife <= 0 && this.lightningLines) {
+        this.lightningLines.visible = false;
+      }
+    }
+
+    // 3. Magma blobs & embers (magmaRad > 0 solidifies into Basalt when settling!)
+    let magmaActive = 0;
+    for (let i = 0; i < this.MAX_MAGMA; i++) {
+      let life = this.magmaLife[i];
+      if (life <= 0) continue;
+      const grabW = this.isTractorDragging ? this.magmaGrabbed[i] : 0;
+      const nextLife = grabW > 0 ? Math.max(life, 3.0) : life - dt;
+      this.magmaLife[i] = nextLife;
+      const i3 = i * 3;
+      const px = this.magmaPos[i3];
+      const py = this.magmaPos[i3 + 1];
+      const pz = this.magmaPos[i3 + 2];
+      computeGravityVector(px, py, pz, params, this._grav);
+      let ax = this._grav.x * 0.75;
+      let ay = this._grav.y * 0.75;
+      let az = this._grav.z * 0.75;
+
+      if (grabW > 0) {
+        evaluateStretchedAnchorPoint(
+          this.tractorAnchor.x,
+          this.tractorAnchor.y,
+          this.tractorAnchor.z,
+          this.tractorTarget.x,
+          this.tractorTarget.y,
+          this.tractorTarget.z,
+          this.magmaStretchU[i],
+          0.7,
+          this._tractorTargetPt,
+        );
+        computeTractorSpringForce(
+          px,
+          py,
+          pz,
+          this.magmaVel[i3],
+          this.magmaVel[i3 + 1],
+          this.magmaVel[i3 + 2],
+          this._tractorTargetPt.x,
+          this._tractorTargetPt.y,
+          this._tractorTargetPt.z,
+          this.tractorDragVel.x,
+          this.tractorDragVel.y,
+          this.tractorDragVel.z,
+          params,
+          this._tractorForceParams,
+          grabW,
+          this._tractorForceRes,
+        );
+        const invM = 1 / this._tractorForceParams.massKg;
+        ax += this._tractorForceRes.fx * invM;
+        ay += this._tractorForceRes.fy * invM;
+        az += this._tractorForceRes.fz * invM;
+        grabbedCount++;
+        beamForceN += this._tractorForceRes.beamForceN;
+        gravityWeightN += this._tractorForceRes.gravityWeightN;
+        loadRatioSum += this._tractorForceRes.loadRatio;
+      }
+
+      this.magmaVel[i3] += ax * dt;
+      this.magmaVel[i3 + 1] += ay * dt;
+      this.magmaVel[i3 + 2] += az * dt;
+      const nx = px + this.magmaVel[i3] * dt;
+      const ny = py + this.magmaVel[i3 + 1] * dt;
+      const nz = pz + this.magmaVel[i3 + 2] * dt;
+
+      const d = this.planet.sampleDensity(nx, ny, nz);
+      if (d > 0) {
+        // Bounce & slide along surface normal with viscous lava drag
+        this.magmaVel[i3] *= 0.48;
+        this.magmaVel[i3 + 1] *= 0.48;
+        this.magmaVel[i3 + 2] *= 0.48;
+        const speedSq =
+          this.magmaVel[i3] * this.magmaVel[i3] +
+          this.magmaVel[i3 + 1] * this.magmaVel[i3 + 1] +
+          this.magmaVel[i3 + 2] * this.magmaVel[i3 + 2];
+        if (nextLife <= 0.15 && this.magmaRad[i] > 0 && speedSq < 2.2 * scale) {
+          this.planet.applyBrush(px, py, pz, 'build', this.magmaRad[i], 0.9, MaterialId.Basalt);
+          this.magmaLife[i] = 0;
+          terrainDirty = true;
+          continue;
+        }
+      } else {
+        this.magmaPos[i3] = nx;
+        this.magmaPos[i3 + 1] = ny;
+        this.magmaPos[i3 + 2] = nz;
+      }
+
+      const mSpd = Math.hypot(this.magmaVel[i3], this.magmaVel[i3 + 1], this.magmaVel[i3 + 2]);
+      if (grabW > 0 && mSpd > peakSpeedMs) peakSpeedMs = mSpd;
+
+      const baseScale = Math.max(Math.abs(this.magmaRad[i]), 0.18 * scale) * clamp(nextLife, 0.25, 1.3);
+      this._v1.set(this.magmaPos[i3], this.magmaPos[i3 + 1], this.magmaPos[i3 + 2]);
+      this._euler.set(nextLife * 3.1, i * 0.7, 0);
+      this._q1.setFromEuler(this._euler);
+      this._s1.set(baseScale, baseScale, baseScale);
+      this._m4.compose(this._v1, this._q1, this._s1);
+      this.magmaMesh.setMatrixAt(magmaActive++, this._m4);
+    }
+    this.magmaMesh.count = magmaActive;
+    if (magmaActive > 0) this.magmaMesh.instanceMatrix.needsUpdate = true;
+
+    // 4. Flaming Meteors hurtling from orbit (deflectable mid-air via Tractor Beam!)
+    let meteorActive = 0;
+    for (let i = this.activeMeteors.length - 1; i >= 0; i--) {
+      const m = this.activeMeteors[i];
+      m.life -= dt;
+      const mGrab = this.isTractorDragging ? (m.grabbedWeight ?? 0) : 0;
+      if (mGrab > 0) {
+        m.life = Math.max(m.life, 4.0);
+        this._tractorForceParams.massKg = 4.2;
+        evaluateStretchedAnchorPoint(
+          this.tractorAnchor.x,
+          this.tractorAnchor.y,
+          this.tractorAnchor.z,
+          this.tractorTarget.x,
+          this.tractorTarget.y,
+          this.tractorTarget.z,
+          m.stretchU ?? 0.85,
+          0.75,
+          this._tractorTargetPt,
+        );
+        computeTractorSpringForce(
+          m.x,
+          m.y,
+          m.z,
+          m.vx,
+          m.vy,
+          m.vz,
+          this._tractorTargetPt.x,
+          this._tractorTargetPt.y,
+          this._tractorTargetPt.z,
+          this.tractorDragVel.x,
+          this.tractorDragVel.y,
+          this.tractorDragVel.z,
+          params,
+          this._tractorForceParams,
+          mGrab,
+          this._tractorForceRes,
+        );
+        computeGravityVector(m.x, m.y, m.z, params, this._grav);
+        const invM = 1 / this._tractorForceParams.massKg;
+        m.vx += (this._grav.x + this._tractorForceRes.fx * invM) * dt;
+        m.vy += (this._grav.y + this._tractorForceRes.fy * invM) * dt;
+        m.vz += (this._grav.z + this._tractorForceRes.fz * invM) * dt;
+        grabbedCount++;
+        beamForceN += this._tractorForceRes.beamForceN;
+        gravityWeightN += this._tractorForceRes.gravityWeightN;
+        loadRatioSum += this._tractorForceRes.loadRatio;
+        const mSpd = Math.hypot(m.vx, m.vy, m.vz);
+        if (mSpd > peakSpeedMs) peakSpeedMs = mSpd;
+        this._tractorForceParams.massKg = 1.6;
+      }
+      m.x += m.vx * dt;
+      m.y += m.vy * dt;
+      m.z += m.vz * dt;
+      // Trail ember
+      if (Math.random() < 0.75) {
+        this.spawnMagmaBurst(m.x, m.y, m.z, -m.vx * 0.05, -m.vy * 0.05, -m.vz * 0.05, 1, m.radius * 0.28, 0.3, true);
+      }
+
+      const d = this.planet.sampleDensity(m.x, m.y, m.z);
+      if (d >= 0 || m.life <= 0) {
+        // Meteor impact detonation!
+        const rLen = Math.hypot(m.x, m.y, m.z) || 1;
+        const nrmX = m.x / rLen;
+        const nrmY = m.y / rLen;
+        const nrmZ = m.z / rLen;
+        this.planet.applyBrush(m.x, m.y, m.z, 'crater', m.radius, m.strength, m.material, {
+          rimHeight: m.leaveRim ? 0.85 : 0,
+          rimMaterial: m.rimMaterial,
+          floorMaterial: m.material,
+        });
+        this.fluid.applyRadialImpulse(m.x, m.y, m.z, m.radius * 2.2, 16 * Math.sqrt(scale), 7 * Math.sqrt(scale));
+        this.spawnShockwave(m.x, m.y, m.z, nrmX, nrmY, nrmZ, m.radius * 2.6, true, false);
+        this.spawnDebrisBurst(m.x, m.y, m.z, nrmX, nrmY, nrmZ, m.debrisCount);
+        this.addThermalHotspot(m.x, m.y, m.z, m.radius * 2.4, m.thermalDeltaC, 65);
+        this.sound.playExplosion(true);
+        terrainDirty = true;
+        this.activeMeteors.splice(i, 1);
+        continue;
+      }
+
+      if (meteorActive < this.MAX_METEORS) {
+        const ms = clamp(m.radius * 0.75, 0.35 * scale, 5.0 * scale);
+        this._v1.set(m.x, m.y, m.z);
+        this._euler.set(this.simTimeSec * 4 + i, this.simTimeSec * 3, 0);
+        this._q1.setFromEuler(this._euler);
+        this._s1.set(ms, ms, ms);
+        this._m4.compose(this._v1, this._q1, this._s1);
+        this.meteorMesh.setMatrixAt(meteorActive++, this._m4);
+      }
+    }
+    this.meteorMesh.count = meteorActive;
+    if (meteorActive > 0) this.meteorMesh.instanceMatrix.needsUpdate = true;
+
+    // 5. Autonomous Burrowing Voxel Worms (can be yanked & stretched out of the crust!)
+    let wormSegCount = 0;
+    for (let i = this.activeWorms.length - 1; i >= 0; i--) {
+      const w = this.activeWorms[i];
+      w.life -= dt;
+      w.phase += dt * 4.5;
+      if (w.life <= 0) {
+        this.activeWorms.splice(i, 1);
+        continue;
+      }
+      const head = w.segments[0];
+      const wGrab = this.isTractorDragging ? (w.grabbedWeight ?? 0) : 0;
+      let nx: number;
+      let ny: number;
+      let nz: number;
+      const prevHeadX = head[0];
+      const prevHeadY = head[1];
+      const prevHeadZ = head[2];
+
+      if (wGrab > 0) {
+        w.life = Math.max(w.life, 6.0);
+        this._tractorForceParams.massKg = 2.4;
+        evaluateStretchedAnchorPoint(
+          this.tractorAnchor.x,
+          this.tractorAnchor.y,
+          this.tractorAnchor.z,
+          this.tractorTarget.x,
+          this.tractorTarget.y,
+          this.tractorTarget.z,
+          w.stretchU ?? 0.9,
+          0.72,
+          this._tractorTargetPt,
+        );
+        computeTractorSpringForce(
+          head[0],
+          head[1],
+          head[2],
+          w.dir[0] * w.speed * 7.5 * scale,
+          w.dir[1] * w.speed * 7.5 * scale,
+          w.dir[2] * w.speed * 7.5 * scale,
+          this._tractorTargetPt.x,
+          this._tractorTargetPt.y,
+          this._tractorTargetPt.z,
+          this.tractorDragVel.x,
+          this.tractorDragVel.y,
+          this.tractorDragVel.z,
+          params,
+          this._tractorForceParams,
+          wGrab,
+          this._tractorForceRes,
+        );
+        const pullVecX = this._tractorTargetPt.x - head[0];
+        const pullVecY = this._tractorTargetPt.y - head[1];
+        const pullVecZ = this._tractorTargetPt.z - head[2];
+        const pullRate = clamp(beamPower * 6.5, 2.5, 16) * dt;
+        nx = head[0] + pullVecX * clamp(pullRate, 0, 0.75);
+        ny = head[1] + pullVecY * clamp(pullRate, 0, 0.75);
+        nz = head[2] + pullVecZ * clamp(pullRate, 0, 0.75);
+        const pdLen = Math.hypot(nx - prevHeadX, ny - prevHeadY, nz - prevHeadZ);
+        if (pdLen > 1e-4) {
+          w.dir[0] = (nx - prevHeadX) / pdLen;
+          w.dir[1] = (ny - prevHeadY) / pdLen;
+          w.dir[2] = (nz - prevHeadZ) / pdLen;
+        }
+        grabbedCount++;
+        beamForceN += this._tractorForceRes.beamForceN;
+        gravityWeightN += this._tractorForceRes.gravityWeightN;
+        loadRatioSum += this._tractorForceRes.loadRatio;
+        const wSpd = pdLen / Math.max(dt, 1e-4);
+        if (wSpd > peakSpeedMs) peakSpeedMs = wSpd;
+        this._tractorForceParams.massKg = 1.6;
+      } else {
+        // Steer gently in 3D wiggle and curve back inside planet sphere if far outside
+        const rHead = Math.hypot(head[0], head[1], head[2]);
+        let dx = w.dir[0] + Math.sin(w.phase * 1.3 + i) * 0.42 * dt * 4;
+        let dy = w.dir[1] + Math.cos(w.phase * 1.1 + i * 2) * 0.42 * dt * 4;
+        let dz = w.dir[2] + Math.sin(w.phase * 0.9 - i) * 0.42 * dt * 4;
+        if (rHead > this.planet.baseRadius * 1.05) {
+          dx -= (head[0] / rHead) * dt * 3.5;
+          dy -= (head[1] / rHead) * dt * 3.5;
+          dz -= (head[2] / rHead) * dt * 3.5;
+        }
+        const dLen = Math.hypot(dx, dy, dz) || 1;
+        w.dir[0] = dx / dLen;
+        w.dir[1] = dy / dLen;
+        w.dir[2] = dz / dLen;
+
+        const stepDist = w.speed * 7.5 * scale * dt;
+        nx = head[0] + w.dir[0] * stepDist;
+        ny = head[1] + w.dir[1] * stepDist;
+        nz = head[2] + w.dir[2] * stepDist;
+      }
+
+      // Follow spine smoothly (stretches elastically when pulled by tractor beam!)
+      head[0] = nx;
+      head[1] = ny;
+      head[2] = nz;
+      const stepDist = Math.hypot(nx - prevHeadX, ny - prevHeadY, nz - prevHeadZ);
+      const spacing = w.radius * (wGrab > 0 ? 1.45 : 0.95);
+      for (let s = 1; s < w.segments.length; s++) {
+        const prev = w.segments[s - 1];
+        const cur = w.segments[s];
+        const vx = prev[0] - cur[0];
+        const vy = prev[1] - cur[1];
+        const vz = prev[2] - cur[2];
+        const dist = Math.hypot(vx, vy, vz);
+        if (dist > spacing && dist > 1e-5) {
+          const pull = (dist - spacing) / dist;
+          cur[0] += vx * pull;
+          cur[1] += vy * pull;
+          cur[2] += vz * pull;
+        }
+      }
+
+      w.stepAccum += stepDist;
+      if (w.stepAccum >= w.radius * 0.45) {
+        w.stepAccum = 0;
+        this.planet.applyBrush(prevHeadX, prevHeadY, prevHeadZ, 'carve', w.radius, w.strength, w.material, {
+          shape: 'cylinder',
+          ex: nx,
+          ey: ny,
+          ez: nz,
+          rimMaterial: w.material,
+        });
+        terrainDirty = true;
+      }
+
+      for (let s = 0; s < w.segments.length && wormSegCount < this.MAX_WORM_INSTANCES; s++) {
+        const seg = w.segments[s];
+        const taper = 1.0 - (s / w.segments.length) * 0.55;
+        const sc = Math.max(w.radius * 0.95 * taper, 0.25 * scale);
+        this._v1.set(seg[0], seg[1], seg[2]);
+        this._euler.set(w.phase + s * 0.3, s * 0.5, 0);
+        this._q1.setFromEuler(this._euler);
+        this._s1.set(sc, sc, sc);
+        this._m4.compose(this._v1, this._q1, this._s1);
+        this.wormMesh.setMatrixAt(wormSegCount++, this._m4);
+      }
+    }
+    this.wormMesh.count = wormSegCount;
+    if (wormSegCount > 0) this.wormMesh.instanceMatrix.needsUpdate = true;
+
+    // 6. Shockwave Rings & Nuke/Explosion Fireballs
+    let shockCount = 0;
+    let fbCount = 0;
+    for (let i = this.activeShockwaves.length - 1; i >= 0; i--) {
+      const sw = this.activeShockwaves[i];
+      sw.age += dt;
+      if (sw.age >= sw.maxAge) {
+        this.activeShockwaves.splice(i, 1);
+        continue;
+      }
+      const p = sw.age / sw.maxAge;
+      const easeOut = 1 - Math.pow(1 - p, 3);
+      const rad = Math.max(0.1 * scale, sw.maxRadius * easeOut);
+
+      if (shockCount < this.MAX_SHOCKWAVES) {
+        this._v1.set(sw.x + sw.nx * 0.25 * scale, sw.y + sw.ny * 0.25 * scale, sw.z + sw.nz * 0.25 * scale);
+        this._q1.setFromUnitVectors(this._v3.set(0, 1, 0), this._v2.set(sw.nx, sw.ny, sw.nz));
+        this._s1.set(rad, rad * (1 - p * 0.6), rad);
+        this._m4.compose(this._v1, this._q1, this._s1);
+        this.shockwaveRingMesh.setMatrixAt(shockCount++, this._m4);
+      }
+
+      if (sw.hasFireball && fbCount < this.MAX_SHOCKWAVES) {
+        const rise = (sw.isNuke ? sw.maxRadius * 0.9 : sw.maxRadius * 0.4) * easeOut;
+        const fbScale = Math.max(0.1 * scale, sw.maxRadius * (sw.isNuke ? 0.55 : 0.38) * Math.sin(p * Math.PI));
+        this._v1.set(sw.x + sw.nx * rise, sw.y + sw.ny * rise, sw.z + sw.nz * rise);
+        this._q1.identity();
+        this._s1.set(fbScale, fbScale * (sw.isNuke ? 1.25 : 0.9), fbScale);
+        this._m4.compose(this._v1, this._q1, this._s1);
+        this.fireballMesh.setMatrixAt(fbCount++, this._m4);
+      }
+    }
+    this.shockwaveRingMesh.count = shockCount;
+    this.fireballMesh.count = fbCount;
+    if (shockCount > 0) this.shockwaveRingMesh.instanceMatrix.needsUpdate = true;
+    if (fbCount > 0) this.fireballMesh.instanceMatrix.needsUpdate = true;
+
+    // 7. Tornados & Black Hole Gravity Vortices
+    let vortexInstCount = 0;
+    for (let i = this.activeVortices.length - 1; i >= 0; i--) {
+      const vx = this.activeVortices[i];
+      vx.age += dt;
+      if (vx.age >= vx.maxAge) {
+        if (vx.kind === 'blackHole') {
+          this.planet.applyBrush(vx.x, vx.y, vx.z, 'crater', vx.radius * 0.9, vx.strength * 1.8, vx.material, {
+            floorMaterial: MaterialId.Crystal,
+          });
+          this.spawnShockwave(vx.x, vx.y, vx.z, vx.nx, vx.ny, vx.nz, vx.radius * 1.8, false, false);
+          terrainDirty = true;
+        }
+        this.activeVortices.splice(i, 1);
+        continue;
+      }
+
+      if (vx.kind === 'blackHole') {
+        this.fluid.applyRadialImpulse(vx.x, vx.y, vx.z, vx.radius * 3.4, -22 * Math.sqrt(scale) * dt * 10, 0);
+        this.fluid.drainWithinRadius(vx.x, vx.y, vx.z, Math.max(vx.radius * 0.45, 0.5 * scale));
+        vx.carveTimer -= dt;
+        if (vx.carveTimer <= 0) {
+          vx.carveTimer = 0.35;
+          this.planet.applyBrush(vx.x, vx.y, vx.z, 'paint', vx.radius * 1.1, 1.0, MaterialId.Crystal);
+          terrainDirty = true;
+        }
+        if (vortexInstCount < this.MAX_VORTEX_INSTANCES) {
+          this._v1.set(vx.x + vx.nx * vx.radius * 0.5, vx.y + vx.ny * vx.radius * 0.5, vx.z + vx.nz * vx.radius * 0.5);
+          this._euler.set(this.simTimeSec * 7, this.simTimeSec * 4, i);
+          this._q1.setFromEuler(this._euler);
+          const sc = vx.radius * (0.65 + 0.12 * Math.sin(this.simTimeSec * 12));
+          this._s1.set(sc, sc, sc);
+          this._m4.compose(this._v1, this._q1, this._s1);
+          this.vortexMesh.setMatrixAt(vortexInstCount++, this._m4);
+        }
+      } else {
+        // Tornado: drifts tangentially across planet surface, lifting fluid & scouring dirt
+        this.fluid.applySwirlVortex(
+          vx.x,
+          vx.y,
+          vx.z,
+          vx.nx,
+          vx.ny,
+          vx.nz,
+          vx.radius * 2.4,
+          14 * Math.sqrt(scale) * dt * 10,
+          9 * Math.sqrt(scale) * dt * 10,
+        );
+        vx.carveTimer -= dt;
+        if (vx.carveTimer <= 0) {
+          vx.carveTimer = 0.25;
+          this.planet.applyBrush(vx.x, vx.y, vx.z, 'carve', vx.radius * 0.55, vx.strength * 0.55, vx.material);
+          terrainDirty = true;
+        }
+        const rings = 5;
+        for (let r = 0; r < rings && vortexInstCount < this.MAX_VORTEX_INSTANCES; r++) {
+          const hFrac = r / (rings - 1);
+          const h = hFrac * vx.radius * 2.6;
+          const swirlAng = this.simTimeSec * 9 + r * 1.1;
+          const rScaleRing = vx.radius * (0.28 + hFrac * 0.82);
+          this._v1.set(
+            vx.x + vx.nx * h + Math.cos(swirlAng) * 0.12 * scale,
+            vx.y + vx.ny * h,
+            vx.z + vx.nz * h + Math.sin(swirlAng) * 0.12 * scale,
+          );
+          this._q1.setFromUnitVectors(this._v3.set(0, 1, 0), this._v2.set(vx.nx, vx.ny, vx.nz));
+          this._s1.set(rScaleRing, rScaleRing, rScaleRing);
+          this._m4.compose(this._v1, this._q1, this._s1);
+          this.vortexMesh.setMatrixAt(vortexInstCount++, this._m4);
+        }
+      }
+    }
+    this.vortexMesh.count = vortexInstCount;
+    if (vortexInstCount > 0) this.vortexMesh.instanceMatrix.needsUpdate = true;
+
+    if (terrainDirty) {
+      this.updateChunksWithLod(36);
+      this.updateHighResStreaming(null, 44);
+      this.waterMeshDirty = true;
+    }
+    return { grabbedCount, beamForceN, gravityWeightN, loadRatioSum, peakSpeedMs };
   }
 
   public resetPlayerToSpawn(): void {
@@ -1919,7 +3065,7 @@ export class PlanetarySandboxEngine {
     this.playerPos.set(sx, sy, sz);
     this.playerVel.set(0, 0, 0);
     this.playerUp.copy(this.playerPos).normalize();
-    this.playerFwd.set(0, 0, 1);
+    this.playerFwd.set(0, 0, -1);
     parallelTransportTangentFrame(
       this.playerPos.x,
       this.playerPos.y,
@@ -1934,20 +3080,26 @@ export class PlanetarySandboxEngine {
     this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
 
     const scale = this.getPlanetScale();
-    this.camYaw = -0.35;
     this.camPitch = 0.36;
     this.camDistance = 9.0 * scale;
-    this._v1.set(1, 0, 0);
-    if (Math.abs(this.playerUp.x) > 0.85) this._v1.set(0, 0, 1);
-    const tangentE = this._v2.crossVectors(this.playerUp, this._v1).normalize();
-    const tangentN = this._v3.crossVectors(tangentE, this.playerUp).normalize();
+    const initBasis = transportCameraForwardOnSphere(
+      [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+      [this.playerFwd.x, this.playerFwd.y, this.playerFwd.z],
+      -0.35,
+    );
+    this.explorerCamFwd.set(
+      initBasis.forward[0],
+      initBasis.forward[1],
+      initBasis.forward[2],
+    );
+    this.explorerCamAnchor.copy(this.playerPos);
+
     const horiz = Math.cos(this.camPitch) * this.camDistance;
     const vert = Math.sin(this.camPitch) * this.camDistance + 2.2 * scale;
     this.camPosSmooth
       .copy(this.playerPos)
       .addScaledVector(this.playerUp, vert)
-      .addScaledVector(tangentN, Math.cos(this.camYaw) * horiz)
-      .addScaledVector(tangentE, Math.sin(this.camYaw) * horiz);
+      .addScaledVector(this.explorerCamFwd, -horiz);
     this.camLookSmooth.copy(this.playerPos).addScaledVector(this.playerUp, 1.25 * scale);
     if (this.camera) {
       this.camera.position.copy(this.camPosSmooth);
@@ -1966,17 +3118,6 @@ export class PlanetarySandboxEngine {
       this.fpsYaw = Math.atan2(-this._v1.x, -this._v1.z);
       this.fpsPitch = clamp(Math.asin(clamp(this._v1.y, -0.99, 0.99)), -1.45, 1.45);
     }
-  }
-
-  private buildTangentBasis(
-    upVec: THREE.Vector3,
-    outE: THREE.Vector3,
-    outN: THREE.Vector3,
-  ): void {
-    this._s1.set(1, 0, 0);
-    if (Math.abs(upVec.x) > 0.85) this._s1.set(0, 0, 1);
-    outE.crossVectors(upVec, this._s1).normalize();
-    outN.crossVectors(outE, upVec).normalize();
   }
 
   private raycastDetailAnchor(preferPointer: boolean): boolean {
@@ -2023,15 +3164,25 @@ export class PlanetarySandboxEngine {
       this.planet.baseRadius * 4.5,
     );
 
-    this.buildTangentBasis(this.detailNormal, this._tanE, this._tanN);
     if (rawDist > 1e-4) {
       offset.divideScalar(rawDist);
       const upProj = clamp(offset.dot(this.detailNormal), 0.12, 0.995);
       this.detailPitch = clamp(Math.asin(upProj), 0.14, 1.44);
-      this.detailYaw = Math.atan2(offset.dot(this._tanE), offset.dot(this._tanN));
+      const fwdToTarget = this._v2.copy(offset).negate();
+      const basis = transportCameraForwardOnSphere(
+        [this.detailNormal.x, this.detailNormal.y, this.detailNormal.z],
+        [fwdToTarget.x, fwdToTarget.y, fwdToTarget.z],
+        0,
+      );
+      this.detailBasisFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
     } else {
       this.detailPitch = 0.58;
-      this.detailYaw = 0.45;
+      const basis = transportCameraForwardOnSphere(
+        [this.detailNormal.x, this.detailNormal.y, this.detailNormal.z],
+        [this.detailBasisFwd.x, this.detailBasisFwd.y, this.detailBasisFwd.z],
+        0,
+      );
+      this.detailBasisFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
     }
   }
 
@@ -2471,6 +3622,7 @@ export class PlanetarySandboxEngine {
 
   public clearWater(): void {
     this.fluid.clear();
+    this.clearDynamicEntities();
     this.updateSplashInstances();
     this.rebuildWaterMesh();
   }
@@ -2535,6 +3687,7 @@ export class PlanetarySandboxEngine {
       this.keys.clear();
       this.isSculpting = false;
       this.isDraggingOrbit = false;
+      this.releaseTractorBeam();
       if (this.brushPreview) {
         this.brushPreview.visible = false;
       }
@@ -2660,7 +3813,18 @@ export class PlanetarySandboxEngine {
     this.playerUp.set(this._upLike.x, this._upLike.y, this._upLike.z);
     this.playerFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
     this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
+    this.explorerCamAnchor.copy(this.playerPos);
+    const basis = transportCameraForwardOnSphere(
+      [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+      [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+      0,
+    );
+    this.explorerCamFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
     this.syncPlayerTransform();
+  }
+
+  public setOnMaterialPicked(cb: ((mat: MaterialId) => void) | null): void {
+    this.onMaterialPicked = cb;
   }
 
   public updateConfig(partial: Partial<SandboxConfig>): void {
@@ -2690,6 +3854,10 @@ export class PlanetarySandboxEngine {
     this.sound.setMuted(this.config.muted);
 
     if (prevCamMode !== this.config.cameraMode) {
+      this.isSculpting = false;
+      this.isDraggingOrbit = false;
+      this.isPanningCamera = false;
+      this.releaseTractorBeam();
       if (this.config.cameraMode === 'fps') {
         this.syncFpsPoseFromActiveCamera();
       } else if (this.config.cameraMode === 'detail') {
@@ -2698,6 +3866,17 @@ export class PlanetarySandboxEngine {
         this.initLandingCamera();
       } else if (this.config.cameraMode === 'perspective') {
         this.initPerspectiveCamera();
+      } else if (this.config.cameraMode === 'explorer') {
+        this.explorerCamAnchor.copy(this.playerPos);
+        if (this.camera) {
+          this.camera.getWorldDirection(this._v1);
+          const basis = transportCameraForwardOnSphere(
+            [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+            [this._v1.x, this._v1.y, this._v1.z],
+            0,
+          );
+          this.explorerCamFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
+        }
       }
       if (this.camera && this.config.cameraMode !== 'detail' && this.config.cameraMode !== 'perspective') {
         this.camera.fov = 52;
@@ -2771,14 +3950,21 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    const toolColorMap: Record<BrushMode, number> = {
-      carve: 0xf97316,
-      build: 0x10b981,
-      smooth: 0xa78bfa,
-      flatten: 0xfacc15,
-      water: 0x38bdf8,
-    };
-    this.brushColorNode.value.setHex(toolColorMap[this.config.tool]);
+    const attrs = this.getActiveToolAttrs();
+    if (attrs.behavior !== 'tractorBeam' && this.isTractorDragging) {
+      this.releaseTractorBeam();
+    }
+    this.brushColorNode.value.set(attrs.colorHex);
+    this.laserBeamColorNode.value.set(attrs.colorHex);
+    this.laserImpactColorNode.value.set(attrs.colorHex);
+    this.tractorBeamColorNode.value.set(attrs.colorHex);
+  }
+
+  private getActiveToolAttrs(): ToolAttributes {
+    return (
+      this.config.toolAttributes ??
+      resolveToolDefinition(this.config.tool).attributes
+    );
   }
 
   public setTouchEnabled(enabled: boolean): void {
@@ -2852,13 +4038,772 @@ export class PlanetarySandboxEngine {
   };
 
   private handleResize = (): void => {
-    if (this.isDisposed) return;
+    if (this.isDisposed || this.isOfflineRendering) return;
     const w = Math.max(1, this.container.clientWidth);
     const h = Math.max(1, this.container.clientHeight);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
   };
+
+  public getDirectorHardwareCaps(): {
+    maxGpuTextureDim: number;
+    webCodecsAvailable: boolean;
+    mediaRecorderAvailable: boolean;
+  } {
+    let maxGpuTextureDim = 8192;
+    try {
+      const backend = this.renderer?.backend as
+        | {
+            device?: { limits?: { maxTextureDimension2D?: number } };
+            gl?: WebGL2RenderingContext;
+          }
+        | undefined;
+      if (backend?.device?.limits?.maxTextureDimension2D) {
+        maxGpuTextureDim = backend.device.limits.maxTextureDimension2D;
+      } else if (backend?.gl) {
+        const val = backend.gl.getParameter(backend.gl.MAX_TEXTURE_SIZE);
+        if (typeof val === 'number' && val > 512) {
+          maxGpuTextureDim = val;
+        }
+      }
+    } catch {
+      // safe default
+    }
+    const g = globalThis as unknown as {
+      VideoEncoder?: unknown;
+      VideoFrame?: unknown;
+      MediaRecorder?: unknown;
+    };
+    return {
+      maxGpuTextureDim,
+      webCodecsAvailable: typeof g.VideoEncoder === 'function' && typeof g.VideoFrame === 'function',
+      mediaRecorderAvailable: typeof g.MediaRecorder === 'function',
+    };
+  }
+
+  public captureCameraKeyframe(label?: string): DirectorKeyframe {
+    const dir = new THREE.Vector3();
+    this.camera.getWorldDirection(dir);
+    const lookDist =
+      this.config.cameraMode === 'detail'
+        ? Math.max(this.planet.nativeVoxelSize, this.camera.position.distanceTo(this.detailTarget))
+        : this.config.cameraMode === 'perspective'
+          ? Math.max(this.planet.nativeVoxelSize, this.camera.position.distanceTo(this.perspTarget))
+          : Math.max(this.planet.baseRadius * 0.4, 4);
+    const lookAt: [number, number, number] =
+      this.config.cameraMode === 'detail'
+        ? [this.detailTarget.x, this.detailTarget.y, this.detailTarget.z]
+        : this.config.cameraMode === 'perspective'
+          ? [this.perspTarget.x, this.perspTarget.y, this.perspTarget.z]
+          : [
+              this.camera.position.x + dir.x * lookDist,
+              this.camera.position.y + dir.y * lookDist,
+              this.camera.position.z + dir.z * lookDist,
+            ];
+    return {
+      id: `kf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+      label: label ?? '机位',
+      position: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+      lookAt,
+      up: [this.camera.up.x, this.camera.up.y, this.camera.up.z],
+      fovDeg: this.camera.fov,
+    };
+  }
+
+  public buildDirectorAnchor(): DirectorSceneAnchor {
+    const dir = new THREE.Vector3();
+    this.camera.getWorldDirection(dir);
+
+    let tp: [number, number, number];
+    if (this.config.cameraMode === 'detail') {
+      tp = [this.detailTarget.x, this.detailTarget.y, this.detailTarget.z];
+    } else if (this.config.cameraMode === 'perspective' && this.perspTarget.lengthSq() > 1e-4) {
+      const pLen = this.perspTarget.length();
+      const nx = this.perspTarget.x / pLen;
+      const ny = this.perspTarget.y / pLen;
+      const nz = this.perspTarget.z / pLen;
+      const sr = this.planet.findSurfaceRadiusAlongRay(nx, ny, nz);
+      tp = [nx * sr, ny * sr, nz * sr];
+    } else {
+      const hit = this.planet.raycastTerrain(
+        this.camera.position.x,
+        this.camera.position.y,
+        this.camera.position.z,
+        dir.x,
+        dir.y,
+        dir.z,
+        this.planet.worldHalf * 6,
+      );
+      if (hit.hit) {
+        tp = [hit.x, hit.y, hit.z];
+      } else {
+        const pLen = Math.hypot(this.playerPos.x, this.playerPos.y, this.playerPos.z) || 1;
+        const nx = this.playerPos.x / pLen;
+        const ny = this.playerPos.y / pLen;
+        const nz = this.playerPos.z / pLen;
+        const sr = this.planet.findSurfaceRadiusAlongRay(nx, ny, nz);
+        tp = [nx * sr, ny * sr, nz * sr];
+      }
+    }
+
+    const tpLen = Math.hypot(tp[0], tp[1], tp[2]) || 1;
+    const tn: [number, number, number] = [tp[0] / tpLen, tp[1] / tpLen, tp[2] / tpLen];
+    const kf = this.captureCameraKeyframe('seed');
+
+    return {
+      baseRadius: this.planet.baseRadius,
+      nativeVoxelSize: this.planet.nativeVoxelSize,
+      targetPoint: tp,
+      targetNormal: tn,
+      currentPos: kf.position,
+      currentLookAt: kf.lookAt,
+      currentUp: kf.up,
+      currentFovDeg: kf.fovDeg,
+      sampleSurfaceRadius: (dx, dy, dz) => this.planet.findSurfaceRadiusAlongRay(dx, dy, dz),
+    };
+  }
+
+  public startDirectorPreview(plan: DirectorShotPlan, onEnd?: () => void): void {
+    this.directorPreviewPlan = {
+      ...plan,
+      keyframes: plan.keyframes.map((k) => ({ ...k })),
+    };
+    this.directorPreviewTime = 0;
+    this.directorPreviewAnchor = this.buildDirectorAnchor();
+    this.directorPreviewBaseSunAzimuth = this.config.sunAzimuthDeg;
+    this.onDirectorPreviewEnd = onEnd;
+  }
+
+  public stopDirectorPreview(): void {
+    if (!this.directorPreviewPlan) return;
+    this.directorPreviewPlan = null;
+    this.directorPreviewAnchor = null;
+    this.config.sunAzimuthDeg = this.directorPreviewBaseSunAzimuth;
+    this.updateSunDirection();
+    if (Math.abs(this.camera.fov - 52) > 0.1) {
+      this.camera.fov = this.config.cameraMode === 'perspective' ? this.config.perspectiveFov : 52;
+      this.camera.updateProjectionMatrix();
+    }
+    const cb = this.onDirectorPreviewEnd;
+    this.onDirectorPreviewEnd = undefined;
+    cb?.();
+  }
+
+  private setEditorHelpersVisible(visible: boolean): {
+    brush: boolean;
+    detailRing: boolean;
+    landingBeacon: boolean;
+    chunkBounds: boolean;
+    player: boolean;
+    tractorBeam: boolean;
+    tractorStretch: boolean;
+  } {
+    const prev = {
+      brush: this.brushPreview?.visible ?? false,
+      detailRing: this.detailReticleRing?.visible ?? false,
+      landingBeacon: this.landingBeaconGroup?.visible ?? false,
+      chunkBounds: this.chunkBoundsLines?.visible ?? false,
+      player: this.playerGroup?.visible ?? false,
+      tractorBeam: this.tractorBeamGroup?.visible ?? false,
+      tractorStretch: this.tractorStretchLine?.visible ?? false,
+    };
+    if (!visible) {
+      if (this.brushPreview) this.brushPreview.visible = false;
+      if (this.detailReticleRing) this.detailReticleRing.visible = false;
+      if (this.landingBeaconGroup) this.landingBeaconGroup.visible = false;
+      if (this.chunkBoundsLines) this.chunkBoundsLines.visible = false;
+      if (this.tractorBeamGroup) this.tractorBeamGroup.visible = false;
+      if (this.tractorStretchLine) this.tractorStretchLine.visible = false;
+      if (this.playerGroup && this.config.cameraMode !== 'explorer') {
+        this.playerGroup.visible = false;
+      }
+    } else {
+      if (this.brushPreview) this.brushPreview.visible = prev.brush;
+      if (this.detailReticleRing) this.detailReticleRing.visible = prev.detailRing;
+      if (this.landingBeaconGroup) this.landingBeaconGroup.visible = prev.landingBeacon;
+      if (this.chunkBoundsLines) this.chunkBoundsLines.visible = prev.chunkBounds;
+      if (this.tractorBeamGroup) this.tractorBeamGroup.visible = prev.tractorBeam;
+      if (this.tractorStretchLine) this.tractorStretchLine.visible = prev.tractorStretch;
+      if (this.playerGroup) this.playerGroup.visible = prev.player;
+    }
+    return prev;
+  }
+
+  private restoreEditorHelpersVisible(prev: {
+    brush: boolean;
+    detailRing: boolean;
+    landingBeacon: boolean;
+    chunkBounds: boolean;
+    player: boolean;
+    tractorBeam: boolean;
+    tractorStretch: boolean;
+  }): void {
+    if (this.brushPreview) this.brushPreview.visible = prev.brush;
+    if (this.detailReticleRing) this.detailReticleRing.visible = prev.detailRing;
+    if (this.landingBeaconGroup) this.landingBeaconGroup.visible = prev.landingBeacon;
+    if (this.chunkBoundsLines) this.chunkBoundsLines.visible = prev.chunkBounds;
+    if (this.tractorBeamGroup) this.tractorBeamGroup.visible = prev.tractorBeam;
+    if (this.tractorStretchLine) this.tractorStretchLine.visible = prev.tractorStretch;
+    if (this.playerGroup) this.playerGroup.visible = prev.player;
+  }
+
+  private computeRenderBufferSize(
+    targetW: number,
+    targetH: number,
+  ): { renderW: number; renderH: number; maxGpuDim: number } {
+    const caps = this.getDirectorHardwareCaps();
+    const maxGpuDim = Math.max(1024, caps.maxGpuTextureDim);
+    const scaleDown = Math.min(1, maxGpuDim / Math.max(targetW, targetH));
+    const renderW = Math.max(2, Math.floor((targetW * scaleDown) / 2) * 2);
+    const renderH = Math.max(2, Math.floor((targetH * scaleDown) / 2) * 2);
+    return { renderW, renderH, maxGpuDim };
+  }
+
+  private async canvasToBlob(
+    canvas: HTMLCanvasElement,
+    mimeType: string,
+    quality?: number,
+  ): Promise<Blob> {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (blob) => {
+          if (blob) resolve(blob);
+          else reject(new Error('Failed to encode canvas image'));
+        },
+        mimeType,
+        quality,
+      );
+    });
+  }
+
+  public async captureDirectorScreenshot(options: {
+    width: number;
+    height: number;
+    format: 'png' | 'webp' | 'jpeg';
+    quality?: number;
+    hideHelpers?: boolean;
+  }): Promise<{
+    blob: Blob;
+    actualWidth: number;
+    actualHeight: number;
+    previewDataUrl: string;
+  }> {
+    const targetW = Math.max(16, Math.min(8192, Math.round(options.width)));
+    const targetH = Math.max(16, Math.min(8192, Math.round(options.height)));
+    const { renderW, renderH } = this.computeRenderBufferSize(targetW, targetH);
+
+    const prevAspect = this.camera.aspect;
+    const prevPixelRatio = this.renderer.getPixelRatio();
+    const prevW = Math.max(1, this.container.clientWidth);
+    const prevH = Math.max(1, this.container.clientHeight);
+    const prevHelpers = options.hideHelpers !== false ? this.setEditorHelpersVisible(false) : null;
+
+    this.isOfflineRendering = true;
+    try {
+      this.camera.aspect = targetW / targetH;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setPixelRatio(1);
+      this.renderer.setSize(renderW, renderH, false);
+
+      this.updateChunksWithLod(this.planet.totalChunks);
+      if (this.planet.isHighResStreaming) {
+        for (let pass = 0; pass < 24; pass++) {
+          const b = this.updateHighResStreaming(null, 80);
+          if (!b || b.pendingTotal === 0) break;
+        }
+      }
+
+      this.renderer.render(this.scene, this.camera);
+
+      const glCanvas = this.renderer.domElement;
+      let outputCanvas: HTMLCanvasElement = glCanvas;
+      if (renderW !== targetW || renderH !== targetH) {
+        const scratch = document.createElement('canvas');
+        scratch.width = targetW;
+        scratch.height = targetH;
+        const ctx = scratch.getContext('2d');
+        if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(glCanvas, 0, 0, targetW, targetH);
+          outputCanvas = scratch;
+        }
+      }
+
+      const mime =
+        options.format === 'webp'
+          ? 'image/webp'
+          : options.format === 'jpeg'
+            ? 'image/jpeg'
+            : 'image/png';
+      const blob = await this.canvasToBlob(outputCanvas, mime, options.quality ?? 0.96);
+
+      // Small thumbnail for instant UI confirmation
+      const thumbCanvas = document.createElement('canvas');
+      thumbCanvas.width = 480;
+      thumbCanvas.height = Math.max(120, Math.round((480 * targetH) / targetW));
+      const tctx = thumbCanvas.getContext('2d');
+      let previewDataUrl = '';
+      if (tctx) {
+        tctx.drawImage(outputCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
+        previewDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.85);
+      }
+
+      return {
+        blob,
+        actualWidth: outputCanvas.width,
+        actualHeight: outputCanvas.height,
+        previewDataUrl,
+      };
+    } finally {
+      this.camera.aspect = prevAspect;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setPixelRatio(prevPixelRatio);
+      this.renderer.setSize(prevW, prevH);
+      if (prevHelpers) this.restoreEditorHelpersVisible(prevHelpers);
+      this.isOfflineRendering = false;
+    }
+  }
+
+  public async renderDirectorVideoOffline(
+    plan: DirectorShotPlan,
+    onProgress: (p: DirectorRenderProgress) => void,
+    abortSignal?: AbortSignal,
+  ): Promise<{
+    blob: Blob;
+    mimeType: string;
+    filename: string;
+    frameCount: number;
+    actualWidth: number;
+    actualHeight: number;
+    fps: number;
+    elapsedMs: number;
+    encoderLabel: string;
+  }> {
+    this.stopDirectorPreview();
+    cancelAnimationFrame(this.frameHandle);
+    clearTimeout(this.timerHandle);
+
+    const targetW = Math.max(64, Math.min(8192, Math.floor(plan.width / 2) * 2));
+    const targetH = Math.max(64, Math.min(8192, Math.floor(plan.height / 2) * 2));
+    const fps = clamp(Math.round(plan.fps), 1, 300);
+    const totalFrames = computePlanFrameCount({ ...plan, fps });
+    const dt = 1 / fps;
+
+    const anchor = this.buildDirectorAnchor();
+    const { renderW, renderH } = this.computeRenderBufferSize(targetW, targetH);
+
+    // Snapshot live state to restore cleanly after offline export
+    const savedPos = this.camera.position.clone();
+    const savedQuat = this.camera.quaternion.clone();
+    const savedUp = this.camera.up.clone();
+    const savedFov = this.camera.fov;
+    const savedNear = this.camera.near;
+    const savedFar = this.camera.far;
+    const savedAspect = this.camera.aspect;
+    const savedPixelRatio = this.renderer.getPixelRatio();
+    const savedSunAzimuth = this.config.sunAzimuthDeg;
+    const savedSimTime = this.simTimeSec;
+    const savedContainerW = Math.max(1, this.container.clientWidth);
+    const savedContainerH = Math.max(1, this.container.clientHeight);
+    const prevHelpers = plan.cleanFrame ? this.setEditorHelpersVisible(false) : null;
+
+    this.isOfflineRendering = true;
+    const renderT0 = performance.now();
+
+    // Scratch canvas for optional exact resampling OR preview thumbnail
+    let encodeCanvas: HTMLCanvasElement = this.renderer.domElement;
+    let encodeCtx: CanvasRenderingContext2D | null = null;
+    if (renderW !== targetW || renderH !== targetH) {
+      encodeCanvas = document.createElement('canvas');
+      encodeCanvas.width = targetW;
+      encodeCanvas.height = targetH;
+      encodeCtx = encodeCanvas.getContext('2d');
+      if (encodeCtx) {
+        encodeCtx.imageSmoothingEnabled = true;
+        encodeCtx.imageSmoothingQuality = 'high';
+      }
+    }
+
+    const thumbCanvas = document.createElement('canvas');
+    thumbCanvas.width = 360;
+    thumbCanvas.height = Math.max(90, Math.round((360 * targetH) / targetW));
+    const thumbCtx = thumbCanvas.getContext('2d');
+
+    try {
+      this.renderer.setPixelRatio(1);
+      this.renderer.setSize(renderW, renderH, false);
+      this.camera.aspect = targetW / targetH;
+      this.camera.updateProjectionMatrix();
+
+      // Negotiate WebCodecs VideoEncoder unless user explicitly selected lossless PNG TAR archive
+      type WebCodecsEnc = {
+        configure: (cfg: Record<string, unknown>) => void;
+        encode: (frame: unknown, opts?: { keyFrame?: boolean }) => void;
+        flush: () => Promise<void>;
+        close: () => void;
+        encodeQueueSize: number;
+      };
+      type WebCodecsCtor = {
+        new (init: {
+          output: (chunk: {
+            byteLength: number;
+            timestamp: number;
+            type: 'key' | 'delta';
+            copyTo: (dest: Uint8Array) => void;
+          }) => void;
+          error: (err: unknown) => void;
+        }): WebCodecsEnc;
+        isConfigSupported: (cfg: Record<string, unknown>) => Promise<{ supported?: boolean }>;
+      };
+      type VideoFrameCtor = new (
+        source: HTMLCanvasElement,
+        init: { timestamp: number; duration: number },
+      ) => { close: () => void };
+
+      const g = globalThis as unknown as {
+        VideoEncoder?: WebCodecsCtor;
+        VideoFrame?: VideoFrameCtor;
+      };
+
+      let encoder: WebCodecsEnc | null = null;
+      let muxer: WebmMuxer | null = null;
+      let encoderError: unknown = null;
+      let encoderLabel = 'PNG 无损序列 (.tar)';
+      let activeEncodeW = targetW;
+      let activeEncodeH = targetH;
+
+      const wantWebm = plan.format !== 'png-tar';
+      if (wantWebm && typeof g.VideoEncoder === 'function' && typeof g.VideoFrame === 'function') {
+        const candidates: Array<{
+          codec: string;
+          webmCodec: WebmVideoCodec;
+          label: string;
+          w: number;
+          h: number;
+          hintFps: number;
+        }> = [];
+
+        const primaryCodecs =
+          plan.format === 'webm-vp8'
+            ? [{ codec: 'vp8', webmCodec: 'V_VP8' as WebmVideoCodec, label: 'WebCodecs VP8' }]
+            : [
+                { codec: 'vp09.00.62.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L6.2' },
+                { codec: 'vp09.00.61.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L6.1' },
+                { codec: 'vp09.00.52.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L5.2' },
+                { codec: 'vp09.00.51.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L5.1' },
+                { codec: 'vp8', webmCodec: 'V_VP8' as WebmVideoCodec, label: 'WebCodecs VP8' },
+              ];
+
+        for (const c of primaryCodecs) {
+          candidates.push({ ...c, w: targetW, h: targetH, hintFps: fps });
+          if (fps > 60) {
+            candidates.push({ ...c, w: targetW, h: targetH, hintFps: 60 });
+          }
+        }
+        // Step-down encode dimensions if browser WebCodecs limits max VP9 frame dimensions
+        if (targetW > 4096) {
+          const capScale = 4096 / targetW;
+          const capW = 4096;
+          const capH = Math.max(64, Math.floor((targetH * capScale) / 2) * 2);
+          for (const c of primaryCodecs) {
+            candidates.push({
+              ...c,
+              label: `${c.label} (4K编码适配)`,
+              w: capW,
+              h: capH,
+              hintFps: Math.min(fps, 60),
+            });
+          }
+        }
+
+        let selected: (typeof candidates)[0] | null = null;
+        for (const cand of candidates) {
+          try {
+            const bitrate = Math.min(
+              140_000_000,
+              Math.max(4_000_000, Math.round(cand.w * cand.h * Math.min(fps, 60) * 0.14)),
+            );
+            const res = await g.VideoEncoder.isConfigSupported({
+              codec: cand.codec,
+              width: cand.w,
+              height: cand.h,
+              bitrate,
+              framerate: cand.hintFps,
+            });
+            if (res.supported) {
+              selected = cand;
+              break;
+            }
+          } catch {
+            // Try next candidate
+          }
+        }
+
+        if (selected) {
+          activeEncodeW = selected.w;
+          activeEncodeH = selected.h;
+          if (activeEncodeW !== renderW || activeEncodeH !== renderH) {
+            if (encodeCanvas === this.renderer.domElement) {
+              encodeCanvas = document.createElement('canvas');
+              encodeCtx = encodeCanvas.getContext('2d');
+            }
+            encodeCanvas.width = activeEncodeW;
+            encodeCanvas.height = activeEncodeH;
+            if (encodeCtx) {
+              encodeCtx.imageSmoothingEnabled = true;
+              encodeCtx.imageSmoothingQuality = 'high';
+            }
+          }
+
+          muxer = new WebmMuxer({
+            width: activeEncodeW,
+            height: activeEncodeH,
+            fps,
+            codec: selected.webmCodec,
+          });
+          encoder = new g.VideoEncoder({
+            output: (chunk) => {
+              const bytes = new Uint8Array(chunk.byteLength);
+              chunk.copyTo(bytes);
+              muxer!.addVideoChunk(bytes, chunk.timestamp, chunk.type === 'key');
+            },
+            error: (err) => {
+              encoderError = err;
+            },
+          });
+          const bitrate = Math.min(
+            140_000_000,
+            Math.max(4_000_000, Math.round(activeEncodeW * activeEncodeH * Math.min(fps, 60) * 0.14)),
+          );
+          encoder.configure({
+            codec: selected.codec,
+            width: activeEncodeW,
+            height: activeEncodeH,
+            bitrate,
+            framerate: selected.hintFps,
+            latencyMode: 'quality',
+          });
+          encoderLabel = `${selected.label} · ${activeEncodeW}×${activeEncodeH} @ ${fps}FPS`;
+        }
+      }
+
+      const tarEntries: Array<{ name: string; data: Uint8Array }> = [];
+      const keyframeInterval = Math.max(15, Math.min(180, fps));
+      const frameDurUs = Math.round(1_000_000 / fps);
+      let prevStreamDist = -1;
+
+      for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+        if (abortSignal?.aborted) {
+          throw new DOMException('Director offline render aborted', 'AbortError');
+        }
+        if (encoderError) {
+          throw encoderError instanceof Error ? encoderError : new Error(String(encoderError));
+        }
+
+        const u = totalFrames > 1 ? frameIdx / (totalFrames - 1) : 1;
+        const pose = evaluateDirectorPose(plan, u, anchor);
+
+        // Advance simulation deterministically if timeScale > 0
+        if (plan.simTimeScale > 0 && frameIdx > 0) {
+          const simDt = dt * plan.simTimeScale;
+          this.simTimeSec += simDt;
+          this.simTimeNode.value = this.simTimeSec;
+          const scale = this.getPlanetScale();
+          this.moonGroup.position.x = Math.cos(this.simTimeSec * 0.12) * -36 * scale;
+          this.moonGroup.position.z = Math.sin(this.simTimeSec * 0.12) * -36 * scale;
+          this.updateCloudPuffs(simDt);
+          this.fluid.step(Math.min(simDt, 0.03), this.planet, this.getGravityParams(), 2);
+          this.updateSplashInstances();
+          this.rebuildWaterMesh();
+          this.updateDebris(simDt);
+          this.updateDynamicEntities(simDt);
+        }
+
+        this.config.sunAzimuthDeg = savedSunAzimuth + pose.sunAzimuthDeltaDeg;
+        this.updateSunDirection();
+
+        this.camera.position.set(pose.position[0], pose.position[1], pose.position[2]);
+        this.camera.up.set(pose.up[0], pose.up[1], pose.up[2]).normalize();
+        this.camera.fov = pose.fovDeg;
+        this.camera.lookAt(pose.lookAt[0], pose.lookAt[1], pose.lookAt[2]);
+
+        const distFromCenter = this.camera.position.length();
+        const surfDist = Math.max(
+          this.planet.nativeVoxelSize * 0.25,
+          Math.abs(distFromCenter - this.planet.baseRadius),
+        );
+        const focusDist = Math.max(
+          this.planet.nativeVoxelSize * 0.45,
+          Math.hypot(
+            this.camera.position.x - pose.streamFocus[0],
+            this.camera.position.y - pose.streamFocus[1],
+            this.camera.position.z - pose.streamFocus[2],
+          ),
+        );
+        const safeClips = computeSafeClipPlanes(
+          surfDist,
+          focusDist,
+          this.planet.baseRadius,
+          this.camera.fov,
+        );
+        this.camera.near = safeClips.near;
+        this.camera.far = safeClips.far;
+        this.camera.updateProjectionMatrix();
+
+        // Force voxel & SVO mesh convergence for the current frame's camera distance
+        this.updateChunksWithLod(this.planet.totalChunks);
+        if (this.planet.isHighResStreaming) {
+          const distJump =
+            prevStreamDist <= 0 ||
+            Math.abs(Math.log2(Math.max(pose.streamDist, 1e-8) / Math.max(prevStreamDist, 1e-8))) >
+              0.25;
+          const maxPasses = frameIdx === 0 ? 48 : distJump ? 12 : 4;
+          for (let pass = 0; pass < maxPasses; pass++) {
+            const b = this.updateHighResStreaming(null, 84, {
+              focus: pose.streamFocus,
+              dist: pose.streamDist,
+              lodModeOverride: plan.forceMaxVoxelDetail ? 0 : this.config.lodMode,
+            });
+            if (!b || b.pendingTotal === 0) break;
+          }
+          prevStreamDist = pose.streamDist;
+        }
+
+        this.renderer.render(this.scene, this.camera);
+
+        if (encodeCtx && encodeCanvas !== this.renderer.domElement) {
+          encodeCtx.drawImage(this.renderer.domElement, 0, 0, activeEncodeW, activeEncodeH);
+        }
+
+        if (encoder && muxer && g.VideoFrame) {
+          while (encoder.encodeQueueSize >= 6) {
+            await new Promise((r) => setTimeout(r, 4));
+          }
+          const timestampUs = Math.round((frameIdx * 1_000_000) / fps);
+          const vf = new g.VideoFrame(encodeCanvas, {
+            timestamp: timestampUs,
+            duration: frameDurUs,
+          });
+          encoder.encode(vf, { keyFrame: frameIdx % keyframeInterval === 0 });
+          vf.close();
+        } else {
+          // Lossless PNG frame archive fallback
+          const pngBlob = await this.canvasToBlob(encodeCanvas, 'image/png');
+          const ab = await pngBlob.arrayBuffer();
+          const numStr = String(frameIdx).padStart(5, '0');
+          tarEntries.push({
+            name: `frame_${numStr}.png`,
+            data: new Uint8Array(ab),
+          });
+        }
+
+        const nowMs = performance.now();
+        const elapsedSec = (nowMs - renderT0) / 1000;
+        const doneCount = frameIdx + 1;
+        const etaSec = doneCount > 0 ? (elapsedSec / doneCount) * (totalFrames - doneCount) : 0;
+
+        let previewDataUrl: string | undefined;
+        if (
+          thumbCtx &&
+          (frameIdx === 0 || frameIdx === totalFrames - 1 || frameIdx % Math.max(4, Math.floor(fps / 6)) === 0)
+        ) {
+          thumbCtx.drawImage(
+            this.renderer.domElement,
+            0,
+            0,
+            thumbCanvas.width,
+            thumbCanvas.height,
+          );
+          previewDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.72);
+        }
+
+        onProgress({
+          frame: doneCount,
+          totalFrames,
+          percent: Math.round((doneCount / totalFrames) * 1000) / 10,
+          elapsedSec,
+          etaSec,
+          actualWidth: activeEncodeW,
+          actualHeight: activeEncodeH,
+          encoderLabel,
+          statusText: `离线渲染中 · 第 ${doneCount}/${totalFrames} 帧`,
+          previewDataUrl,
+        });
+
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
+      const seedTag = this.planet.seedConfig.seed;
+      const elapsedMs = performance.now() - renderT0;
+
+      if (encoder && muxer) {
+        onProgress({
+          frame: totalFrames,
+          totalFrames,
+          percent: 99.5,
+          elapsedSec: elapsedMs / 1000,
+          etaSec: 0,
+          actualWidth: activeEncodeW,
+          actualHeight: activeEncodeH,
+          encoderLabel,
+          statusText: '正在封装 WebM 视频容器...',
+        });
+        await encoder.flush();
+        encoder.close();
+        const webmBytes = muxer.finalize();
+        const blob = new Blob([new Uint8Array(webmBytes)], { type: 'video/webm' });
+        return {
+          blob,
+          mimeType: 'video/webm',
+          filename: `terrasphere-${seedTag}-${plan.action}-${activeEncodeW}x${activeEncodeH}-${fps}fps.webm`,
+          frameCount: totalFrames,
+          actualWidth: activeEncodeW,
+          actualHeight: activeEncodeH,
+          fps,
+          elapsedMs: performance.now() - renderT0,
+          encoderLabel,
+        };
+      }
+
+      const tarBytes = buildTarArchive(tarEntries);
+      const blob = new Blob([new Uint8Array(tarBytes)], { type: 'application/x-tar' });
+      return {
+        blob,
+        mimeType: 'application/x-tar',
+        filename: `terrasphere-${seedTag}-${plan.action}-${activeEncodeW}x${activeEncodeH}-${fps}fps-frames.tar`,
+        frameCount: totalFrames,
+        actualWidth: activeEncodeW,
+        actualHeight: activeEncodeH,
+        fps,
+        elapsedMs: performance.now() - renderT0,
+        encoderLabel,
+      };
+    } finally {
+      this.camera.position.copy(savedPos);
+      this.camera.quaternion.copy(savedQuat);
+      this.camera.up.copy(savedUp);
+      this.camera.fov = savedFov;
+      this.camera.near = savedNear;
+      this.camera.far = savedFar;
+      this.camera.aspect = savedAspect;
+      this.camera.updateProjectionMatrix();
+
+      this.config.sunAzimuthDeg = savedSunAzimuth;
+      this.updateSunDirection();
+      this.simTimeSec = savedSimTime;
+      this.simTimeNode.value = savedSimTime;
+
+      this.renderer.setPixelRatio(savedPixelRatio);
+      this.renderer.setSize(savedContainerW, savedContainerH);
+      if (prevHelpers) this.restoreEditorHelpersVisible(prevHelpers);
+
+      this.isOfflineRendering = false;
+      this.lastTime = performance.now();
+      this.scheduleNextFrame();
+    }
+  }
 
   private handleKeyDown = (e: KeyboardEvent): void => {
     if (this.phase !== 'playing') return;
@@ -2885,6 +4830,7 @@ export class PlanetarySandboxEngine {
     this.isSculpting = false;
     this.isDraggingOrbit = false;
     this.isPanningCamera = false;
+    this.releaseTractorBeam();
   };
 
   private updatePointerNDC(clientX: number, clientY: number): void {
@@ -3017,12 +4963,15 @@ export class PlanetarySandboxEngine {
     this.lastPointerX = e.clientX;
     this.lastPointerY = e.clientY;
 
+    const isTractorTool = this.getActiveToolAttrs().behavior === 'tractorBeam';
+
     if (e.pointerType === 'touch') {
       this.activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this.activeTouches.size >= 2) {
         this.isSculpting = false;
         this.isDraggingOrbit = false;
         this.isPanningCamera = false;
+        this.releaseTractorBeam();
         this.prevPinchDist = this.getPinchDistance();
         return;
       }
@@ -3036,6 +4985,13 @@ export class PlanetarySandboxEngine {
         return;
       }
       if (this.touchEnabled && this.touchActionMode === 'look') {
+        this.isDraggingOrbit = true;
+        return;
+      }
+      if (isTractorTool) {
+        if (this.beginTractorBeamDrag()) {
+          return;
+        }
         this.isDraggingOrbit = true;
         return;
       }
@@ -3064,8 +5020,8 @@ export class PlanetarySandboxEngine {
     }
 
     if (e.button === 0) {
-      const hit = this.raycastFromPointer();
       if (this.config.cameraMode === 'landing' && this.landingStage === 'selecting') {
+        const hit = this.raycastFromPointer();
         if (hit.hit) {
           this.confirmLandingSite(hit);
         } else {
@@ -3073,11 +5029,22 @@ export class PlanetarySandboxEngine {
         }
         return;
       }
-      if (this.config.cameraMode === 'detail' && e.shiftKey && hit.hit) {
-        this.detailTarget.set(hit.x, hit.y, hit.z);
-        this.detailNormal.set(hit.nx, hit.ny, hit.nz).normalize();
+      if (this.config.cameraMode === 'detail' && e.shiftKey) {
+        const hit = this.raycastFromPointer();
+        if (hit.hit) {
+          this.detailTarget.set(hit.x, hit.y, hit.z);
+          this.detailNormal.set(hit.nx, hit.ny, hit.nz).normalize();
+          return;
+        }
+      }
+      if (isTractorTool) {
+        if (this.beginTractorBeamDrag()) {
+          return;
+        }
+        this.isDraggingOrbit = true;
         return;
       }
+      const hit = this.raycastFromPointer();
       if (hit.hit) {
         this.isSculpting = true;
         this.brushCooldown = 0;
@@ -3123,13 +5090,23 @@ export class PlanetarySandboxEngine {
 
     if (this.isDraggingOrbit) {
       if (this.config.cameraMode === 'explorer') {
-        this.camYaw -= dx * 0.0055;
+        const rot = transportCameraForwardOnSphere(
+          [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+          [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+          -dx * 0.0055,
+        );
+        this.explorerCamFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
         this.camPitch = clamp(this.camPitch + dy * 0.005, -0.35, 1.32);
       } else if (this.config.cameraMode === 'orbit') {
         this.orbitYaw -= dx * 0.0055;
         this.orbitPitch = clamp(this.orbitPitch + dy * 0.005, -1.35, 1.35);
       } else if (this.config.cameraMode === 'detail') {
-        this.detailYaw -= dx * 0.0052;
+        const rot = transportCameraForwardOnSphere(
+          [this.detailNormal.x, this.detailNormal.y, this.detailNormal.z],
+          [this.detailBasisFwd.x, this.detailBasisFwd.y, this.detailBasisFwd.z],
+          -dx * 0.0052,
+        );
+        this.detailBasisFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
         this.detailPitch = clamp(this.detailPitch + dy * 0.0048, 0.1, 1.46);
       } else if (this.config.cameraMode === 'perspective') {
         this.perspYaw += dx * 0.0055;
@@ -3159,13 +5136,613 @@ export class PlanetarySandboxEngine {
     this.isSculpting = false;
     this.isDraggingOrbit = false;
     this.isPanningCamera = false;
+    this.releaseTractorBeam();
   };
 
   private handleWheel = (e: WheelEvent): void => {
     if (this.phase !== 'playing') return;
     e.preventDefault();
+    if (this.isTractorDragging) {
+      const scale = this.getPlanetScale();
+      const minDepth = Math.max(this.planet.nativeVoxelSize * 8, 1.5 * scale);
+      const maxDepth = Math.max(this.planet.baseRadius * 8.0, 110.0 * scale);
+      this.tractorDragDepthDist = clamp(
+        this.tractorDragDepthDist * Math.exp(e.deltaY * 0.0014),
+        minDepth,
+        maxDepth,
+      );
+      return;
+    }
     this.applyZoomDelta(e.deltaY * 0.012);
   };
+
+  private beginTractorBeamDrag(): boolean {
+    if (!this.camera || !this.hasWorld) return false;
+    const scale = this.getPlanetScale();
+    const attrs = this.getActiveToolAttrs();
+    const effRad = Math.max(this.planet.nativeVoxelSize * 0.75, this.config.brushRadius * attrs.radiusMult);
+    const captureRadius = Math.max(effRad * 1.45, 2.2 * scale);
+
+    this.raycaster.setFromCamera(this.pointerNDC, this.camera);
+    const ox = this.raycaster.ray.origin.x;
+    const oy = this.raycaster.ray.origin.y;
+    const oz = this.raycaster.ray.origin.z;
+    const dir = this._v1.copy(this.raycaster.ray.direction);
+    if (dir.lengthSq() < 1e-8) return false;
+    dir.normalize();
+    const dx = dir.x;
+    const dy = dir.y;
+    const dz = dir.z;
+
+    let bestScore = Infinity;
+    let pickX = 0;
+    let pickY = 0;
+    let pickZ = 0;
+    let pickT = 0;
+    let foundNonTerrain = false;
+
+    const fHit = this.fluid.findClosestParticleToRay(ox, oy, oz, dx, dy, dz, captureRadius);
+    if (fHit) {
+      const score = fHit.distSq + fHit.rayT * 0.015;
+      if (score < bestScore) {
+        bestScore = score;
+        pickX = fHit.x;
+        pickY = fHit.y;
+        pickZ = fHit.z;
+        pickT = fHit.rayT;
+        foundNonTerrain = true;
+      }
+    }
+
+    const maxPickSq = captureRadius * captureRadius;
+    for (let i = 0; i < this.MAX_DEBRIS; i++) {
+      if (this.debrisLife[i] <= 0) continue;
+      const i3 = i * 3;
+      computeRayPointDistanceSq(
+        ox, oy, oz, dx, dy, dz,
+        this.debrisPos[i3], this.debrisPos[i3 + 1], this.debrisPos[i3 + 2],
+        this._tractorRayPick,
+      );
+      if (this._tractorRayPick.distSq <= maxPickSq) {
+        const score = this._tractorRayPick.distSq + this._tractorRayPick.t * 0.015;
+        if (score < bestScore) {
+          bestScore = score;
+          pickX = this.debrisPos[i3];
+          pickY = this.debrisPos[i3 + 1];
+          pickZ = this.debrisPos[i3 + 2];
+          pickT = this._tractorRayPick.t;
+          foundNonTerrain = true;
+        }
+      }
+    }
+
+    for (let i = 0; i < this.MAX_MAGMA; i++) {
+      if (this.magmaLife[i] <= 0) continue;
+      const i3 = i * 3;
+      computeRayPointDistanceSq(
+        ox, oy, oz, dx, dy, dz,
+        this.magmaPos[i3], this.magmaPos[i3 + 1], this.magmaPos[i3 + 2],
+        this._tractorRayPick,
+      );
+      if (this._tractorRayPick.distSq <= maxPickSq) {
+        const score = this._tractorRayPick.distSq + this._tractorRayPick.t * 0.015;
+        if (score < bestScore) {
+          bestScore = score;
+          pickX = this.magmaPos[i3];
+          pickY = this.magmaPos[i3 + 1];
+          pickZ = this.magmaPos[i3 + 2];
+          pickT = this._tractorRayPick.t;
+          foundNonTerrain = true;
+        }
+      }
+    }
+
+    const meteorPickSq = Math.max(maxPickSq, (captureRadius * 1.45) ** 2);
+    for (let i = 0; i < this.activeMeteors.length; i++) {
+      const m = this.activeMeteors[i];
+      computeRayPointDistanceSq(ox, oy, oz, dx, dy, dz, m.x, m.y, m.z, this._tractorRayPick);
+      if (this._tractorRayPick.distSq <= meteorPickSq) {
+        const score = this._tractorRayPick.distSq + this._tractorRayPick.t * 0.015;
+        if (score < bestScore) {
+          bestScore = score;
+          pickX = m.x;
+          pickY = m.y;
+          pickZ = m.z;
+          pickT = this._tractorRayPick.t;
+          foundNonTerrain = true;
+        }
+      }
+    }
+
+    for (let i = 0; i < this.activeWorms.length; i++) {
+      const head = this.activeWorms[i].segments[0];
+      if (!head) continue;
+      computeRayPointDistanceSq(ox, oy, oz, dx, dy, dz, head[0], head[1], head[2], this._tractorRayPick);
+      if (this._tractorRayPick.distSq <= maxPickSq) {
+        const score = this._tractorRayPick.distSq + this._tractorRayPick.t * 0.015;
+        if (score < bestScore) {
+          bestScore = score;
+          pickX = head[0];
+          pickY = head[1];
+          pickZ = head[2];
+          pickT = this._tractorRayPick.t;
+          foundNonTerrain = true;
+        }
+      }
+    }
+
+    if (this.config.cameraMode !== 'explorer' && this.playerGroup?.visible) {
+      computeRayPointDistanceSq(
+        ox, oy, oz, dx, dy, dz,
+        this.playerPos.x, this.playerPos.y, this.playerPos.z,
+        this._tractorRayPick,
+      );
+      if (this._tractorRayPick.distSq <= maxPickSq) {
+        const score = this._tractorRayPick.distSq + this._tractorRayPick.t * 0.015;
+        if (score < bestScore) {
+          bestScore = score;
+          pickX = this.playerPos.x;
+          pickY = this.playerPos.y;
+          pickZ = this.playerPos.z;
+          pickT = this._tractorRayPick.t;
+          foundNonTerrain = true;
+        }
+      }
+    }
+
+    const terrainHit = this.raycastFromPointer();
+    if (!foundNonTerrain) {
+      if (!terrainHit.hit) return false;
+      pickX = terrainHit.x;
+      pickY = terrainHit.y;
+      pickZ = terrainHit.z;
+      pickT = Math.hypot(pickX - ox, pickY - oy, pickZ - oz);
+    }
+
+    this.releaseTractorBeam();
+
+    const pLen = Math.hypot(pickX, pickY, pickZ);
+    const axX = pLen > 1e-5 ? pickX / pLen : 0;
+    const axY = pLen > 1e-5 ? pickY / pLen : 1;
+    const axZ = pLen > 1e-5 ? pickZ / pLen : 0;
+
+    const fluidCount = this.fluid.captureParticlesForTractor(
+      pickX,
+      pickY,
+      pickZ,
+      captureRadius,
+      axX,
+      axY,
+      axZ,
+      340,
+    );
+
+    this.debrisGrabbed.fill(0);
+    this.magmaGrabbed.fill(0);
+    let entityCount = 0;
+
+    for (let i = 0; i < this.MAX_DEBRIS; i++) {
+      if (this.debrisLife[i] <= 0) continue;
+      const i3 = i * 3;
+      const ddx = this.debrisPos[i3] - pickX;
+      const ddy = this.debrisPos[i3 + 1] - pickY;
+      const ddz = this.debrisPos[i3 + 2] - pickZ;
+      const dist = Math.hypot(ddx, ddy, ddz);
+      if (dist <= captureRadius) {
+        this.debrisGrabbed[i] = 0.65 + 0.35 * (1 - dist / captureRadius);
+        this.debrisStretchU[i] = clamp(0.5 + ((ddx * axX + ddy * axY + ddz * axZ) / captureRadius) * 0.45, 0.05, 1.0);
+        this.debrisLife[i] = Math.max(this.debrisLife[i], 14.0);
+        entityCount++;
+      }
+    }
+
+    for (let i = 0; i < this.MAX_MAGMA; i++) {
+      if (this.magmaLife[i] <= 0) continue;
+      const i3 = i * 3;
+      const ddx = this.magmaPos[i3] - pickX;
+      const ddy = this.magmaPos[i3 + 1] - pickY;
+      const ddz = this.magmaPos[i3 + 2] - pickZ;
+      const dist = Math.hypot(ddx, ddy, ddz);
+      if (dist <= captureRadius) {
+        this.magmaGrabbed[i] = 0.65 + 0.35 * (1 - dist / captureRadius);
+        this.magmaStretchU[i] = clamp(0.5 + ((ddx * axX + ddy * axY + ddz * axZ) / captureRadius) * 0.45, 0.05, 1.0);
+        entityCount++;
+      }
+    }
+
+    for (const m of this.activeMeteors) {
+      const dist = Math.hypot(m.x - pickX, m.y - pickY, m.z - pickZ);
+      if (dist <= captureRadius * 1.45) {
+        m.grabbedWeight = 1.0;
+        m.stretchU = 0.88;
+        entityCount++;
+      }
+    }
+
+    for (const w of this.activeWorms) {
+      const head = w.segments[0];
+      if (!head) continue;
+      const dist = Math.hypot(head[0] - pickX, head[1] - pickY, head[2] - pickZ);
+      if (dist <= captureRadius) {
+        w.grabbedWeight = 1.0;
+        w.stretchU = 0.92;
+        entityCount++;
+      }
+    }
+
+    if (this.config.cameraMode !== 'explorer' && this.playerGroup?.visible) {
+      const pDist = Math.hypot(
+        this.playerPos.x - pickX,
+        this.playerPos.y - pickY,
+        this.playerPos.z - pickZ,
+      );
+      if (pDist <= captureRadius * 1.15) {
+        this.tractorGrabbedPlayer = true;
+        this.playerGrounded = false;
+        entityCount++;
+      }
+    }
+
+    // Dry terrain click-and-drag automatically detaches loose rock boulders into the beam
+    if (fluidCount === 0 && entityCount === 0 && terrainHit.hit) {
+      const pocketRad = Math.max(effRad * 0.42, this.planet.nativeVoxelSize * 1.4);
+      this.planet.applyBrush(
+        terrainHit.x,
+        terrainHit.y,
+        terrainHit.z,
+        'carve',
+        pocketRad,
+        Math.max(this.config.brushStrength * 0.78, 0.7),
+        MaterialId.Air,
+      );
+      const chunkCount = clamp(Math.round(attrs.debrisCount) || 6, 5, 10);
+      this.spawnDebrisBurst(
+        terrainHit.x + terrainHit.nx * 0.25 * scale,
+        terrainHit.y + terrainHit.ny * 0.25 * scale,
+        terrainHit.z + terrainHit.nz * 0.25 * scale,
+        terrainHit.nx,
+        terrainHit.ny,
+        terrainHit.nz,
+        chunkCount,
+        16.0,
+        1.0,
+      );
+      this.updateChunksWithLod(64);
+      this.updateHighResStreaming(terrainHit, 64);
+      entityCount += chunkCount;
+    }
+
+    if (fluidCount === 0 && entityCount === 0) {
+      return false;
+    }
+
+    this.isTractorDragging = true;
+    this.isDraggingOrbit = false;
+    this.isSculpting = false;
+    this.tractorCapturedEntityCount = entityCount;
+    this.tractorDragDepthDist = Math.max(
+      pickT,
+      Math.max(this.planet.nativeVoxelSize * 8, 1.5 * scale),
+    );
+    this.tractorAnchor.set(pickX, pickY, pickZ);
+    this.tractorTarget.set(pickX, pickY, pickZ);
+    this.tractorPrevTarget.set(pickX, pickY, pickZ);
+    this.tractorDragVel.set(0, 0, 0);
+    this.tractorBeamColorNode.value.set(attrs.colorHex);
+    this.sound.playProbe();
+    return true;
+  }
+
+  private updateTractorBeamSolver(dt: number): ActiveFluidTractorField | null {
+    if (!this.isTractorDragging || !this.camera) return null;
+    const scale = this.getPlanetScale();
+    const attrs = this.getActiveToolAttrs();
+    const effRad = Math.max(this.planet.nativeVoxelSize * 0.75, this.config.brushRadius * attrs.radiusMult);
+    const captureRadius = Math.max(effRad * 1.45, 2.2 * scale);
+
+    this.raycaster.setFromCamera(this.pointerNDC, this.camera);
+    const rayOrig = this.raycaster.ray.origin;
+    const rayDir = this.raycaster.ray.direction;
+    this.camera.getWorldDirection(this._v1);
+    const planeX = rayOrig.x + this._v1.x * this.tractorDragDepthDist;
+    const planeY = rayOrig.y + this._v1.y * this.tractorDragDepthDist;
+    const planeZ = rayOrig.z + this._v1.z * this.tractorDragDepthDist;
+
+    const minRayDist = Math.max(this.planet.nativeVoxelSize * 6, 1.2 * scale);
+    const maxRayDist = Math.max(this.planet.baseRadius * 9.0, 120.0 * scale);
+    const ok = intersectCursorWithDragPlane(
+      rayOrig.x,
+      rayOrig.y,
+      rayOrig.z,
+      rayDir.x,
+      rayDir.y,
+      rayDir.z,
+      planeX,
+      planeY,
+      planeZ,
+      this._v1.x,
+      this._v1.y,
+      this._v1.z,
+      minRayDist,
+      maxRayDist,
+      this.planet.baseRadius,
+      this._tractorPlaneHit,
+    );
+    if (ok) {
+      this.tractorPrevTarget.copy(this.tractorTarget);
+      this.tractorTarget.set(
+        this._tractorPlaneHit.x,
+        this._tractorPlaneHit.y,
+        this._tractorPlaneHit.z,
+      );
+      const invDt = dt > 1e-4 ? 1 / dt : 60;
+      this.tractorDragVel
+        .copy(this.tractorTarget)
+        .sub(this.tractorPrevTarget)
+        .multiplyScalar(clamp(invDt, 1, 90));
+    } else {
+      this.tractorDragVel.multiplyScalar(0.8);
+    }
+
+    const anchorFollow = 1 - Math.exp(-1.9 * dt);
+    this.tractorAnchor.lerp(this.tractorTarget, anchorFollow);
+
+    this.fluid.entrainParticlesNearTractor(
+      this.tractorTarget.x,
+      this.tractorTarget.y,
+      this.tractorTarget.z,
+      this.tractorAnchor.x,
+      this.tractorAnchor.y,
+      this.tractorAnchor.z,
+      captureRadius * 0.85,
+      360,
+    );
+
+    const beamPower = Math.max(0.25, this.config.brushStrength * attrs.strengthMult);
+    this._tractorField.anchorX = this.tractorAnchor.x;
+    this._tractorField.anchorY = this.tractorAnchor.y;
+    this._tractorField.anchorZ = this.tractorAnchor.z;
+    this._tractorField.targetX = this.tractorTarget.x;
+    this._tractorField.targetY = this.tractorTarget.y;
+    this._tractorField.targetZ = this.tractorTarget.z;
+    this._tractorField.dragVelX = this.tractorDragVel.x;
+    this._tractorField.dragVelY = this.tractorDragVel.y;
+    this._tractorField.dragVelZ = this.tractorDragVel.z;
+    this._tractorField.radius = captureRadius;
+    this._tractorField.beamPower = beamPower;
+    this._tractorField.stretchStrength = 0.72;
+
+    return this.fluid.tractorCapturedCount > 0 ? this._tractorField : null;
+  }
+
+  private releaseTractorBeam(): void {
+    this.isTractorDragging = false;
+    this.tractorGrabbedPlayer = false;
+    this.tractorCapturedEntityCount = 0;
+    this.tractorDragVel.set(0, 0, 0);
+    this.debrisGrabbed.fill(0);
+    this.magmaGrabbed.fill(0);
+    for (const m of this.activeMeteors) {
+      m.grabbedWeight = 0;
+    }
+    for (const w of this.activeWorms) {
+      w.grabbedWeight = 0;
+    }
+    this.fluid.releaseTractorCapture();
+    if (this.tractorBeamGroup) this.tractorBeamGroup.visible = false;
+    if (this.tractorStretchLine) this.tractorStretchLine.visible = false;
+    this.tractorTelemetry = createIdleTractorTelemetry();
+    const params = this.getGravityParams();
+    const r = this.planet.baseRadius;
+    this.tractorTelemetry.localGravityMs2 = computeGravityMagnitude(r, params);
+    this.tractorTelemetry.escapeVelocityMs = computeEscapeVelocity(r, params);
+  }
+
+  private integrateSuspendedExplorerPhysics(dt: number): {
+    grabbedCount: number;
+    beamForceN: number;
+    gravityWeightN: number;
+    loadRatioSum: number;
+    peakSpeedMs: number;
+  } {
+    const scale = this.getPlanetScale();
+    const params = this.getGravityParams();
+    parallelTransportTangentFrame(
+      this.playerPos.x,
+      this.playerPos.y,
+      this.playerPos.z,
+      this.playerFwd,
+      this._upLike,
+      this._fwdLike,
+      this._rightLike,
+    );
+    this.playerUp.set(this._upLike.x, this._upLike.y, this._upLike.z);
+    this.playerFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
+    this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
+
+    computeGravityVector(
+      this.playerPos.x,
+      this.playerPos.y,
+      this.playerPos.z,
+      params,
+      this._grav,
+    );
+    let ax = this._grav.x;
+    let ay = this._grav.y;
+    let az = this._grav.z;
+
+    let grabbedCount = 0;
+    let beamForceN = 0;
+    let gravityWeightN = 0;
+    let loadRatioSum = 0;
+    let peakSpeedMs = 0;
+
+    if (this.isTractorDragging && this.tractorGrabbedPlayer) {
+      const attrs = this.getActiveToolAttrs();
+      this._tractorForceParams.planetRadius = this.planet.baseRadius;
+      this._tractorForceParams.beamPower = Math.max(0.25, this.config.brushStrength * attrs.strengthMult);
+      this._tractorForceParams.gravityCompFactor = 0.45;
+      this._tractorForceParams.maxAccelG = 5.6;
+      this._tractorForceParams.massKg = 2.0;
+
+      evaluateStretchedAnchorPoint(
+        this.tractorAnchor.x,
+        this.tractorAnchor.y,
+        this.tractorAnchor.z,
+        this.tractorTarget.x,
+        this.tractorTarget.y,
+        this.tractorTarget.z,
+        0.85,
+        0.72,
+        this._tractorTargetPt,
+      );
+      computeTractorSpringForce(
+        this.playerPos.x,
+        this.playerPos.y,
+        this.playerPos.z,
+        this.playerVel.x,
+        this.playerVel.y,
+        this.playerVel.z,
+        this._tractorTargetPt.x,
+        this._tractorTargetPt.y,
+        this._tractorTargetPt.z,
+        this.tractorDragVel.x,
+        this.tractorDragVel.y,
+        this.tractorDragVel.z,
+        params,
+        this._tractorForceParams,
+        1.0,
+        this._tractorForceRes,
+      );
+      const invM = 1 / this._tractorForceParams.massKg;
+      ax += this._tractorForceRes.fx * invM;
+      ay += this._tractorForceRes.fy * invM;
+      az += this._tractorForceRes.fz * invM;
+
+      grabbedCount = 1;
+      beamForceN = this._tractorForceRes.beamForceN;
+      gravityWeightN = this._tractorForceRes.gravityWeightN;
+      loadRatioSum = this._tractorForceRes.loadRatio;
+    }
+
+    this.playerVel.x += ax * dt;
+    this.playerVel.y += ay * dt;
+    this.playerVel.z += az * dt;
+
+    const maxVel = 36 * scale;
+    const spd = this.playerVel.length();
+    if (spd > maxVel) {
+      this.playerVel.multiplyScalar(maxVel / spd);
+    }
+    if (grabbedCount > 0) {
+      peakSpeedMs = Math.min(spd, maxVel);
+    }
+
+    this.playerPos.addScaledVector(this.playerVel, dt);
+    const maxAtmo = this.planet.baseRadius + 40.0 * scale;
+    if (this.playerPos.length() > maxAtmo) {
+      this.playerPos.setLength(maxAtmo);
+    }
+
+    this.playerGrounded = false;
+    const footRadius = 0.36 * scale;
+    const dFoot = this.planet.sampleDensityAndNormal(
+      this.playerPos.x,
+      this.playerPos.y,
+      this.playerPos.z,
+      this._normalArr,
+    );
+    if (dFoot > -footRadius) {
+      const pen = dFoot + footRadius;
+      const nx = this._normalArr[0];
+      const ny = this._normalArr[1];
+      const nz = this._normalArr[2];
+      this.playerPos.x += nx * pen;
+      this.playerPos.y += ny * pen;
+      this.playerPos.z += nz * pen;
+
+      this._v1.set(nx, ny, nz);
+      const vn = this.playerVel.dot(this._v1);
+      if (vn < 0) {
+        this.playerVel.addScaledVector(this._v1, -vn * (this.tractorGrabbedPlayer ? 1.15 : 1.0));
+        this.playerVel.multiplyScalar(0.86);
+      }
+      if (this._v1.dot(this.playerUp) > 0.35 && !this.tractorGrabbedPlayer) {
+        this.playerGrounded = true;
+      }
+    }
+
+    this.syncPlayerTransform();
+    return { grabbedCount, beamForceN, gravityWeightN, loadRatioSum, peakSpeedMs };
+  }
+
+  private updateTractorBeamVisuals(): void {
+    if (!this.tractorBeamGroup || !this.tractorStretchLine || !this.camera) return;
+    if (this.phase !== 'playing' || !this.isTractorDragging) {
+      this.tractorBeamGroup.visible = false;
+      this.tractorStretchLine.visible = false;
+      return;
+    }
+
+    const scale = this.getPlanetScale();
+    const attrs = this.getActiveToolAttrs();
+    const effRad = Math.max(this.planet.nativeVoxelSize * 0.75, this.config.brushRadius * attrs.radiusMult);
+    const coneRadius = clamp(effRad * 0.65, 0.35 * scale, 5.5 * scale);
+
+    // Offset beam origin slightly below-right of lens so perspective shows an oblique energy funnel
+    this.camera.getWorldDirection(this._v3);
+    this._v4.crossVectors(this._v3, this.camera.up).normalize();
+    const beamOrigin = this._v1
+      .copy(this.camera.position)
+      .addScaledVector(this._v3, 0.8 * scale)
+      .addScaledVector(this.camera.up, -0.55 * scale)
+      .addScaledVector(this._v4, 0.65 * scale);
+
+    this._v2.copy(this.tractorTarget).sub(beamOrigin);
+    const beamLen = Math.max(this._v2.length(), 0.25 * scale);
+    const beamDir = this._v2.divideScalar(beamLen);
+    const beamMid = this._v3.copy(beamOrigin).addScaledVector(beamDir, beamLen * 0.5);
+
+    this._q1.setFromUnitVectors(this._v4.set(0, 1, 0), beamDir);
+    this.tractorBeamGroup.visible = true;
+    this.tractorBeamGroup.position.copy(beamMid);
+    this.tractorBeamGroup.quaternion.copy(this._q1);
+
+    const pulse = 1 + 0.08 * Math.sin(this.simTimeSec * 12.0);
+    this.tractorConeMesh.scale.set(coneRadius * pulse, beamLen, coneRadius * pulse);
+
+    // Three capture rings sweep smoothly from beam waist into dragged target head
+    for (let r = 0; r < this.tractorRings.length; r++) {
+      const ring = this.tractorRings[r];
+      const u = (this.simTimeSec * 1.15 + r / this.tractorRings.length) % 1;
+      const yLocal = (u - 0.5) * beamLen;
+      const ringR = coneRadius * (0.28 + 0.72 * u) * (1 + 0.06 * Math.sin(this.simTimeSec * 9 + r));
+      ring.position.set(0, yLocal, 0);
+      ring.scale.set(ringR, 1, ringR);
+    }
+
+    this.tractorCursorOrb.position.set(0, beamLen * 0.5, 0);
+    const orbScale = clamp(coneRadius * 0.42 * (1 + 0.12 * Math.sin(this.simTimeSec * 16)), 0.14 * scale, 1.8 * scale);
+    this.tractorCursorOrb.scale.setScalar(orbScale);
+
+    // Highlight color toward amber under high Newtonian gravitational load
+    if (this.tractorTelemetry.loadRatio > 0.85) {
+      this.tractorBeamColorNode.value.set(0xf59e0b);
+    } else {
+      this.tractorBeamColorNode.value.set(attrs.colorHex);
+    }
+
+    // Stretch filament line connecting lagging anchor to target cursor head
+    this.tractorStretchPosArr[0] = this.tractorAnchor.x;
+    this.tractorStretchPosArr[1] = this.tractorAnchor.y;
+    this.tractorStretchPosArr[2] = this.tractorAnchor.z;
+    this.tractorStretchPosArr[3] = this.tractorTarget.x;
+    this.tractorStretchPosArr[4] = this.tractorTarget.y;
+    this.tractorStretchPosArr[5] = this.tractorTarget.z;
+    (this.tractorStretchLine.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    this.tractorStretchLine.visible =
+      this.tractorAnchor.distanceToSquared(this.tractorTarget) > 1e-4;
+  }
 
   private raycastFromPointer() {
     this.raycaster.setFromCamera(this.pointerNDC, this.camera);
@@ -3184,27 +5761,515 @@ export class PlanetarySandboxEngine {
 
   private performBrushAction(hit: ReturnType<VoxelPlanet['raycastTerrain']>): void {
     if (!hit.hit) return;
-    const { tool, brushRadius, brushStrength, material } = this.config;
+    const { brushRadius, brushStrength, material } = this.config;
+    const attrs = this.getActiveToolAttrs();
     const scale = this.getPlanetScale();
 
-    if (tool === 'water') {
-      this.fluid.emitStream(
+    const effRad = Math.max(this.planet.nativeVoxelSize * 0.75, brushRadius * attrs.radiusMult);
+    const effStr = Math.max(0.05, brushStrength * attrs.strengthMult);
+    const depMat: MaterialId =
+      attrs.depositMaterial === 'active' ? material : attrs.depositMaterial;
+    const rimMat: MaterialId | undefined =
+      attrs.rimMaterial === 'none'
+        ? undefined
+        : attrs.rimMaterial === 'active'
+          ? material
+          : attrs.rimMaterial;
+
+    const getRayDir = () => {
+      this.raycaster.setFromCamera(this.pointerNDC, this.camera);
+      const d = this._v1.copy(this.raycaster.ray.direction);
+      if (d.lengthSq() < 1e-6) d.set(-hit.nx, -hit.ny, -hit.nz);
+      return d.normalize();
+    };
+
+    const bhv = attrs.behavior;
+
+    if (bhv === 'probe' || bhv === 'seismicProbe') {
+      const sampleStep = Math.max(this.planet.nativeVoxelSize * 0.6, this.planet.voxelSize * 0.2);
+      const picked = this.planet.sampleNearestMaterial(
+        hit.x - hit.nx * sampleStep,
+        hit.y - hit.ny * sampleStep,
+        hit.z - hit.nz * sampleStep,
+      );
+      this.lastProbe = this.planet.probeVoxelCell(hit.x, hit.y, hit.z);
+      if (picked !== MaterialId.Air && picked !== this.config.material) {
+        this.config = { ...this.config, material: picked };
+        this.onMaterialPicked?.(picked);
+      }
+      if (bhv === 'seismicProbe') {
+        this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * 2.5, false, false);
+      }
+      this.sound.playProbe();
+      return;
+    }
+
+    if (bhv === 'water' || bhv === 'geyser') {
+      const streamCount = clamp(Math.round(attrs.entityCount), 4, 48);
+      if (bhv === 'geyser') {
+        this.fluid.emitStream(
+          hit.x,
+          hit.y,
+          hit.z,
+          hit.nx,
+          hit.ny,
+          hit.nz,
+          streamCount,
+          effRad * 0.45,
+          scale,
+        );
+        this.fluid.applyRadialImpulse(
+          hit.x,
+          hit.y,
+          hit.z,
+          effRad * 1.4,
+          3.5 * Math.sqrt(scale) * attrs.entitySpeed,
+          12 * Math.sqrt(scale) * attrs.entitySpeed,
+        );
+        this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 1.8, attrs.thermalDeltaC, 40);
+      } else {
+        this.fluid.emitStream(
+          hit.x,
+          hit.y,
+          hit.z,
+          hit.nx,
+          hit.ny,
+          hit.nz,
+          streamCount,
+          effRad * 0.65,
+          scale,
+        );
+      }
+      this.waterMeshDirty = true;
+      this.sound.playWater();
+      return;
+    }
+
+    if (bhv === 'drain') {
+      this.fluid.drainWithinRadius(
         hit.x,
         hit.y,
         hit.z,
-        hit.nx,
-        hit.ny,
-        hit.nz,
-        18,
-        brushRadius * 0.65,
-        scale,
+        Math.max(effRad, 0.9 * scale),
       );
       this.waterMeshDirty = true;
       this.sound.playWater();
       return;
     }
 
-    const offset = tool === 'build' ? brushRadius * 0.25 : 0;
+    if (bhv === 'pierce' || bhv === 'continuousLaser' || bhv === 'megaLaser') {
+      const rayDir = getRayDir();
+      const depthMult = Math.max(attrs.pierceDepthRatio, 0.5);
+      const pierceLen = Math.max(this.planet.baseRadius * depthMult, effRad * 4.0);
+      const backPad = Math.max(effRad * 0.6, this.planet.voxelSize * 0.5);
+      const sx = hit.x - rayDir.x * backPad;
+      const sy = hit.y - rayDir.y * backPad;
+      const sz = hit.z - rayDir.z * backPad;
+      const ex = hit.x + rayDir.x * pierceLen;
+      const ey = hit.y + rayDir.y * pierceLen;
+      const ez = hit.z + rayDir.z * pierceLen;
+
+      const isBeam = attrs.continuousBeam || bhv !== 'pierce';
+      this.planet.applyBrush(
+        sx,
+        sy,
+        sz,
+        isBeam ? 'laser' : 'tunnel',
+        effRad,
+        effStr,
+        depMat,
+        { shape: 'cylinder', ex, ey, ez, rimMaterial: rimMat },
+      );
+      if (attrs.leaveRim && bhv === 'megaLaser') {
+        this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * 2.2, true, false);
+      }
+      this.updateChunksWithLod(64);
+      this.updateHighResStreaming(hit, 64);
+      this.waterMeshDirty = true;
+
+      const beamOriginDist = Math.max(this.planet.baseRadius * 0.85, 4.0 * scale);
+      if (isBeam) {
+        this.laserBeamStart.set(
+          hit.x - rayDir.x * beamOriginDist,
+          hit.y - rayDir.y * beamOriginDist,
+          hit.z - rayDir.z * beamOriginDist,
+        );
+      } else {
+        this.laserBeamStart.set(sx, sy, sz);
+      }
+      this.laserBeamEnd.set(ex, ey, ez);
+      this.laserImpactPos.set(hit.x, hit.y, hit.z);
+      this.laserBeamScaleRad = bhv === 'megaLaser' ? 0.62 * attrs.radiusMult : 0.42 * attrs.radiusMult;
+      this.laserBeamActiveUntil = this.simTimeSec + (bhv === 'continuousLaser' ? 0.09 : 0.18);
+
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.2, attrs.thermalDeltaC, 80);
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      if (isBeam) this.sound.playLaser();
+      else this.sound.playCarve();
+      return;
+    }
+
+    if (bhv === 'explosion' || bhv === 'nuke') {
+      const isNuke = bhv === 'nuke';
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'crater', effRad, effStr, depMat, {
+        rimHeight: attrs.leaveRim ? (isNuke ? 1.1 : 0.72) : 0,
+        rimMaterial: rimMat ?? MaterialId.Basalt,
+        floorMaterial: depMat,
+      });
+      this.fluid.applyRadialImpulse(
+        hit.x,
+        hit.y,
+        hit.z,
+        effRad * 2.6,
+        (isNuke ? 28 : 16) * Math.sqrt(scale),
+        (isNuke ? 14 : 6) * Math.sqrt(scale),
+      );
+      if (isNuke) {
+        this.fluid.drainWithinRadius(hit.x, hit.y, hit.z, effRad * 0.85);
+        this.spawnMagmaBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, 14, effRad * 0.3, 1.3, false);
+      }
+      this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * (isNuke ? 2.8 : 2.1), true, isNuke);
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.6, attrs.thermalDeltaC, 55);
+      this.updateChunksWithLod(56);
+      this.updateHighResStreaming(hit, 64);
+      this.waterMeshDirty = true;
+      this.sound.playExplosion(isNuke);
+      return;
+    }
+
+    if (bhv === 'burn' || bhv === 'magma') {
+      const isMagma = bhv === 'magma';
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'crater', effRad, effStr * (isMagma ? 0.95 : 0.65), depMat, {
+        rimHeight: attrs.leaveRim ? 0.38 : 0,
+        rimMaterial: rimMat ?? MaterialId.Basalt,
+        floorMaterial: depMat,
+      });
+      if (isMagma) {
+        this.fluid.drainWithinRadius(hit.x, hit.y, hit.z, effRad * 0.8);
+      }
+      this.spawnMagmaBurst(
+        hit.x,
+        hit.y,
+        hit.z,
+        hit.nx,
+        hit.ny,
+        hit.nz,
+        clamp(Math.round(attrs.entityCount), 1, 16),
+        effRad * 0.35,
+        attrs.entitySpeed,
+        !isMagma,
+      );
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.0, attrs.thermalDeltaC, 50);
+      this.updateChunksWithLod(36);
+      this.updateHighResStreaming(hit, 48);
+      this.waterMeshDirty = true;
+      this.sound.playBurnOrMagma();
+      return;
+    }
+
+    if (bhv === 'lightning') {
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'crater', effRad, effStr, depMat, {
+        rimHeight: attrs.leaveRim ? 0.45 : 0,
+        rimMaterial: rimMat ?? MaterialId.Crystal,
+        floorMaterial: depMat,
+      });
+      this.spawnLightningBolt(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.entityCount);
+      this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * 1.9, false, false);
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.0, attrs.thermalDeltaC, 110);
+      this.updateChunksWithLod(42);
+      this.updateHighResStreaming(hit, 48);
+      this.sound.playLightning();
+      return;
+    }
+
+    if (bhv === 'meteor') {
+      const mCount = clamp(Math.round(attrs.entityCount), 1, 6);
+      const orbitDist = Math.max(this.planet.baseRadius * 1.3, 14 * scale);
+      const speed = 26 * Math.sqrt(scale) * attrs.entitySpeed;
+      for (let k = 0; k < mCount; k++) {
+        if (this.activeMeteors.length >= this.MAX_METEORS) break;
+        const jx = (Math.random() - 0.5) * 3.5 * scale;
+        const jy = (Math.random() - 0.5) * 3.5 * scale;
+        const jz = (Math.random() - 0.5) * 3.5 * scale;
+        const tx = hit.x + (k === 0 ? 0 : (Math.random() - 0.5) * effRad * 1.6);
+        const ty = hit.y + (k === 0 ? 0 : (Math.random() - 0.5) * effRad * 1.6);
+        const tz = hit.z + (k === 0 ? 0 : (Math.random() - 0.5) * effRad * 1.6);
+        const sx = hit.x + hit.nx * orbitDist + jx;
+        const sy = hit.y + hit.ny * orbitDist + jy;
+        const sz = hit.z + hit.nz * orbitDist + jz;
+        const dx = tx - sx;
+        const dy = ty - sy;
+        const dz = tz - sz;
+        const dLen = Math.hypot(dx, dy, dz) || 1;
+        this.activeMeteors.push({
+          x: sx,
+          y: sy,
+          z: sz,
+          vx: (dx / dLen) * speed,
+          vy: (dy / dLen) * speed,
+          vz: (dz / dLen) * speed,
+          radius: effRad,
+          strength: effStr,
+          thermalDeltaC: attrs.thermalDeltaC,
+          debrisCount: attrs.debrisCount,
+          material: depMat,
+          rimMaterial: rimMat ?? MaterialId.Sandstone,
+          leaveRim: attrs.leaveRim,
+          life: 3.0,
+        });
+      }
+      this.sound.playVortex();
+      return;
+    }
+
+    if (bhv === 'worm') {
+      const segs = clamp(Math.round(attrs.entityCount), 4, 16);
+      const segments: Array<[number, number, number]> = [];
+      for (let s = 0; s < segs; s++) {
+        segments.push([
+          hit.x + hit.nx * s * 0.25 * scale,
+          hit.y + hit.ny * s * 0.25 * scale,
+          hit.z + hit.nz * s * 0.25 * scale,
+        ]);
+      }
+      const rLen = Math.hypot(hit.x, hit.y, hit.z) || 1;
+      const inX = -hit.x / rLen + (Math.random() - 0.5) * 0.35;
+      const inY = -hit.y / rLen + (Math.random() - 0.5) * 0.35;
+      const inZ = -hit.z / rLen + (Math.random() - 0.5) * 0.35;
+      const dLen = Math.hypot(inX, inY, inZ) || 1;
+      if (this.activeWorms.length >= 12) this.activeWorms.shift();
+      this.activeWorms.push({
+        segments,
+        dir: [inX / dLen, inY / dLen, inZ / dLen],
+        speed: attrs.entitySpeed,
+        radius: effRad,
+        strength: effStr,
+        material: depMat,
+        life: 9.0,
+        phase: Math.random() * Math.PI * 2,
+        stepAccum: 0,
+      });
+      this.sound.playWorm();
+      return;
+    }
+
+    if (bhv === 'orbitalStrike') {
+      const rounds = clamp(Math.round(attrs.entityCount), 1, 6);
+      const rayDir = getRayDir();
+      const depth = Math.max(effRad * 2.2, this.planet.baseRadius * attrs.pierceDepthRatio);
+      for (let k = 0; k < rounds; k++) {
+        const jx = (k === 0 ? 0 : (Math.random() - 0.5) * effRad * 2.0);
+        const jy = (k === 0 ? 0 : (Math.random() - 0.5) * effRad * 2.0);
+        const jz = (k === 0 ? 0 : (Math.random() - 0.5) * effRad * 2.0);
+        const sx = hit.x + jx;
+        const sy = hit.y + jy;
+        const sz = hit.z + jz;
+        this.planet.applyBrush(sx, sy, sz, 'bore', effRad * 0.72, effStr, depMat, {
+          shape: 'cylinder',
+          ex: sx + rayDir.x * depth,
+          ey: sy + rayDir.y * depth,
+          ez: sz + rayDir.z * depth,
+          rimMaterial: rimMat ?? MaterialId.Basalt,
+        });
+      }
+      this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * 2.4, true, false);
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.2, attrs.thermalDeltaC, 65);
+      this.updateChunksWithLod(56);
+      this.updateHighResStreaming(hit, 64);
+      this.waterMeshDirty = true;
+      this.sound.playExplosion(false);
+      return;
+    }
+
+    if (bhv === 'blackHole' || bhv === 'tornado') {
+      if (this.activeVortices.length >= 6) this.activeVortices.shift();
+      this.activeVortices.push({
+        x: hit.x,
+        y: hit.y,
+        z: hit.z,
+        nx: hit.nx,
+        ny: hit.ny,
+        nz: hit.nz,
+        radius: effRad,
+        strength: effStr,
+        speed: attrs.entitySpeed,
+        kind: bhv,
+        material: depMat,
+        age: 0,
+        maxAge: bhv === 'blackHole' ? 3.4 : 4.6,
+        carveTimer: 0,
+      });
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.0, attrs.thermalDeltaC, 30);
+      this.sound.playVortex();
+      return;
+    }
+
+    if (bhv === 'volcano') {
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'volcano', effRad, effStr, depMat);
+      this.spawnMagmaBurst(
+        hit.x + hit.nx * effRad * 0.45,
+        hit.y + hit.ny * effRad * 0.45,
+        hit.z + hit.nz * effRad * 0.45,
+        hit.nx,
+        hit.ny,
+        hit.nz,
+        clamp(Math.round(attrs.entityCount), 2, 12),
+        effRad * 0.25,
+        attrs.entitySpeed,
+        false,
+      );
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.2, attrs.thermalDeltaC, 35);
+      this.updateChunksWithLod(52);
+      this.updateHighResStreaming(hit, 56);
+      this.waterMeshDirty = true;
+      this.sound.playBurnOrMagma();
+      return;
+    }
+
+    if (bhv === 'crystalGrow') {
+      const spires = clamp(Math.round(attrs.entityCount), 1, 8);
+      const len = Math.max(effRad * 2.2, this.planet.voxelSize * 1.8);
+      for (let k = 0; k < spires; k++) {
+        const jx = k === 0 ? 0 : (Math.random() - 0.5) * 0.85;
+        const jy = k === 0 ? 0 : (Math.random() - 0.5) * 0.85;
+        const jz = k === 0 ? 0 : (Math.random() - 0.5) * 0.85;
+        const dLen = Math.hypot(hit.nx + jx, hit.ny + jy, hit.nz + jz) || 1;
+        this.planet.applyBrush(hit.x, hit.y, hit.z, 'extrude', effRad * 0.55, effStr, depMat, {
+          shape: 'cylinder',
+          ex: hit.x + ((hit.nx + jx) / dLen) * len,
+          ey: hit.y + ((hit.ny + jy) / dLen) * len,
+          ez: hit.z + ((hit.nz + jz) / dLen) * len,
+        });
+      }
+      this.updateChunksWithLod(48);
+      this.updateHighResStreaming(hit, 56);
+      this.sound.playBuild();
+      return;
+    }
+
+    if (bhv === 'quake') {
+      const rayDir = getRayDir();
+      const faultLen = Math.max(effRad * 2.4, this.planet.baseRadius * attrs.pierceDepthRatio);
+      // Tangential fault line perpendicular to strike normal
+      let tx = rayDir.y * hit.nz - rayDir.z * hit.ny;
+      let ty = rayDir.z * hit.nx - rayDir.x * hit.nz;
+      let tz = rayDir.x * hit.ny - rayDir.y * hit.nx;
+      const tLen = Math.hypot(tx, ty, tz) || 1;
+      tx /= tLen; ty /= tLen; tz /= tLen;
+      this.planet.applyBrush(
+        hit.x - tx * faultLen * 0.5,
+        hit.y - ty * faultLen * 0.5,
+        hit.z - tz * faultLen * 0.5,
+        'quake',
+        effRad,
+        effStr,
+        depMat,
+        {
+          shape: 'cylinder',
+          ex: hit.x + tx * faultLen * 0.5,
+          ey: hit.y + ty * faultLen * 0.5,
+          ez: hit.z + tz * faultLen * 0.5,
+          rimMaterial: rimMat ?? MaterialId.Basalt,
+          jaggedNoise: 1.25,
+        },
+      );
+      this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * 2.0, false, false);
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      this.updateChunksWithLod(52);
+      this.updateHighResStreaming(hit, 56);
+      this.sound.playExplosion(false);
+      return;
+    }
+
+    if (bhv === 'terraform') {
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'paint', effRad, effStr, depMat);
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'smooth', effRad, effStr * 0.65, depMat);
+      this.fluid.emitStream(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, clamp(Math.round(attrs.entityCount), 2, 14), effRad * 0.5, scale);
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 1.6, attrs.thermalDeltaC, 25);
+      this.updateChunksWithLod(40);
+      this.updateHighResStreaming(hit, 48);
+      this.waterMeshDirty = true;
+      this.sound.playBuild();
+      return;
+    }
+
+    if (bhv === 'freezeBeam') {
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'paint', effRad, effStr, MaterialId.Ice);
+      this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.2, attrs.thermalDeltaC, 45);
+      const rayDir = getRayDir();
+      const beamOriginDist = Math.max(this.planet.baseRadius * 0.75, 4.0 * scale);
+      this.laserBeamStart.set(
+        hit.x - rayDir.x * beamOriginDist,
+        hit.y - rayDir.y * beamOriginDist,
+        hit.z - rayDir.z * beamOriginDist,
+      );
+      this.laserBeamEnd.set(hit.x, hit.y, hit.z);
+      this.laserImpactPos.set(hit.x, hit.y, hit.z);
+      this.laserBeamScaleRad = 0.36 * attrs.radiusMult;
+      this.laserBeamActiveUntil = this.simTimeSec + 0.1;
+      this.updateChunksWithLod(36);
+      this.updateHighResStreaming(hit, 48);
+      this.sound.playFreeze();
+      return;
+    }
+
+    if (bhv === 'bore') {
+      const rayDir = getRayDir();
+      const boreDepth = Math.max(effRad * 3.4, this.planet.baseRadius * Math.max(attrs.pierceDepthRatio, 0.45));
+      const sx = hit.x - rayDir.x * (effRad * 0.25);
+      const sy = hit.y - rayDir.y * (effRad * 0.25);
+      const sz = hit.z - rayDir.z * (effRad * 0.25);
+      const ex = hit.x + rayDir.x * boreDepth;
+      const ey = hit.y + rayDir.y * boreDepth;
+      const ez = hit.z + rayDir.z * boreDepth;
+
+      this.planet.applyBrush(sx, sy, sz, 'bore', effRad, effStr, depMat, {
+        shape: 'cylinder',
+        ex,
+        ey,
+        ez,
+        rimMaterial: rimMat,
+      });
+      this.updateChunksWithLod(48);
+      this.updateHighResStreaming(hit, 56);
+      this.waterMeshDirty = true;
+      this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
+      this.sound.playCarve();
+      return;
+    }
+
+    if (bhv === 'extrude') {
+      const len = Math.max(effRad * 2.1, this.planet.voxelSize * 1.6);
+      const ex = hit.x + hit.nx * len;
+      const ey = hit.y + hit.ny * len;
+      const ez = hit.z + hit.nz * len;
+      this.planet.applyBrush(
+        hit.x,
+        hit.y,
+        hit.z,
+        'extrude',
+        effRad,
+        effStr * 0.9,
+        depMat,
+        { shape: 'cylinder', ex, ey, ez },
+      );
+      this.updateChunksWithLod(44);
+      this.updateHighResStreaming(hit, 52);
+      this.waterMeshDirty = true;
+      this.sound.playBuild();
+      return;
+    }
+
+    // Standard primitives: carve, build, smooth, flatten, paint
+    const primitiveMode =
+      bhv === 'build' || bhv === 'smooth' || bhv === 'flatten' || bhv === 'paint'
+        ? bhv
+        : 'carve';
+    const offset = primitiveMode === 'build' ? effRad * 0.25 : 0;
     const bx = hit.x + hit.nx * offset;
     const by = hit.y + hit.ny * offset;
     const bz = hit.z + hit.nz * offset;
@@ -3213,17 +6278,18 @@ export class PlanetarySandboxEngine {
       bx,
       by,
       bz,
-      tool,
-      brushRadius,
-      brushStrength * 0.72,
-      material,
+      primitiveMode,
+      effRad,
+      effStr * 0.72,
+      depMat,
+      { rimMaterial: rimMat },
     );
     this.updateChunksWithLod(36);
     this.updateHighResStreaming(hit, 48);
     this.waterMeshDirty = true;
 
-    if (tool === 'carve') {
-      this.spawnDebrisBurst(bx, by, bz, hit.nx, hit.ny, hit.nz, 6);
+    if (primitiveMode === 'carve') {
+      this.spawnDebrisBurst(bx, by, bz, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
       this.sound.playCarve();
     } else {
       this.sound.playBuild();
@@ -3233,25 +6299,36 @@ export class PlanetarySandboxEngine {
   private updateExplorerPhysics(dt: number): void {
     const params = this.getGravityParams();
     const scale = this.getPlanetScale();
+    const coreGuardR = this.planet.baseRadius * 0.08;
 
-    this._fwdLike.x = this.playerFwd.x;
-    this._fwdLike.y = this.playerFwd.y;
-    this._fwdLike.z = this.playerFwd.z;
-    parallelTransportTangentFrame(
-      this.playerPos.x,
-      this.playerPos.y,
-      this.playerPos.z,
-      this._fwdLike,
-      this._upLike,
-      this._fwdLike,
-      this._rightLike,
+    const guardedUp = resolveSphericalCoreUp(
+      [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+      [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+      coreGuardR,
     );
-    this.playerUp.set(this._upLike.x, this._upLike.y, this._upLike.z);
-    this.playerFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
-    this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
+    this.playerUp.set(guardedUp[0], guardedUp[1], guardedUp[2]);
 
-    if (this.keys.has('KeyQ')) this.camYaw += 1.9 * dt;
-    if (this.keys.has('KeyE')) this.camYaw -= 1.9 * dt;
+    const bodyBasis = transportCameraForwardOnSphere(
+      guardedUp,
+      [this.playerFwd.x, this.playerFwd.y, this.playerFwd.z],
+      0,
+    );
+    this.playerFwd.set(bodyBasis.forward[0], bodyBasis.forward[1], bodyBasis.forward[2]);
+    this.playerRight.set(bodyBasis.right[0], bodyBasis.right[1], bodyBasis.right[2]);
+
+    let keyYawDelta = 0;
+    if (this.keys.has('KeyQ')) keyYawDelta += 1.9 * dt;
+    if (this.keys.has('KeyE')) keyYawDelta -= 1.9 * dt;
+
+    // Decoupled from camera.position: transport persistent explorerCamFwd strictly around playerUp
+    const camBasis = transportCameraForwardOnSphere(
+      guardedUp,
+      [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+      keyYawDelta,
+    );
+    this.explorerCamFwd.set(camBasis.forward[0], camBasis.forward[1], camBasis.forward[2]);
+    this._v1.copy(this.explorerCamFwd);
+    this._v2.set(camBasis.right[0], camBasis.right[1], camBasis.right[2]);
 
     let moveF = this.virtualMoveY;
     let moveR = this.virtualMoveX;
@@ -3261,16 +6338,6 @@ export class PlanetarySandboxEngine {
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) moveR -= 1;
     moveF = clamp(moveF, -1, 1);
     moveR = clamp(moveR, -1, 1);
-
-    this._v1.copy(this.playerPos).sub(this.camera.position);
-    const dotUp = this._v1.dot(this.playerUp);
-    this._v1.addScaledVector(this.playerUp, -dotUp);
-    if (this._v1.lengthSq() < 1e-5) {
-      this._v1.copy(this.playerFwd);
-    } else {
-      this._v1.normalize();
-    }
-    this._v2.crossVectors(this._v1, this.playerUp).normalize();
 
     this._v3.set(0, 0, 0);
     const hasMove = Math.abs(moveF) > 0.02 || Math.abs(moveR) > 0.02;
@@ -3442,7 +6509,6 @@ export class PlanetarySandboxEngine {
   private updateDetailCamera(dt: number): void {
     const scale = this.getPlanetScale();
 
-    // Allow panning focus point across surface tangent plane with WASD / Arrows
     let moveF = this.virtualMoveY;
     let moveR = this.virtualMoveX;
     if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) moveF += 1;
@@ -3450,22 +6516,25 @@ export class PlanetarySandboxEngine {
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) moveR += 1;
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) moveR -= 1;
 
-    this.buildTangentBasis(this.detailNormal, this._tanE, this._tanN);
+    let keyYaw = 0;
+    if (this.keys.has('KeyQ')) keyYaw += 1.6 * dt;
+    if (this.keys.has('KeyE')) keyYaw -= 1.6 * dt;
+
+    let basis = transportCameraForwardOnSphere(
+      [this.detailNormal.x, this.detailNormal.y, this.detailNormal.z],
+      [this.detailBasisFwd.x, this.detailBasisFwd.y, this.detailBasisFwd.z],
+      keyYaw,
+    );
+    this.detailBasisFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
 
     if (Math.abs(moveF) > 0.02 || Math.abs(moveR) > 0.02) {
       const panSpeed = Math.max(this.detailViewDist * 0.65, this.planet.nativeVoxelSize * 8);
-      const fwdDir = this._v3
-        .set(
-          -Math.sin(this.detailYaw) * this._tanE.x - Math.cos(this.detailYaw) * this._tanN.x,
-          -Math.sin(this.detailYaw) * this._tanE.y - Math.cos(this.detailYaw) * this._tanN.y,
-          -Math.sin(this.detailYaw) * this._tanE.z - Math.cos(this.detailYaw) * this._tanN.z,
-        )
-        .normalize();
-      const rightDir = this._v4.crossVectors(fwdDir, this.detailNormal).normalize();
+      const fwdDir = this._v3.set(basis.forward[0], basis.forward[1], basis.forward[2]);
+      const rightDir = this._v4.set(basis.right[0], basis.right[1], basis.right[2]);
       this.detailTarget
         .addScaledVector(fwdDir, moveF * panSpeed * dt)
         .addScaledVector(rightDir, moveR * panSpeed * dt);
-      // Re-project target smoothly onto planet surface along radial direction
+
       const rLen = this.detailTarget.length();
       if (rLen > 1e-4) {
         const rx = this.detailTarget.x / rLen;
@@ -3474,12 +6543,14 @@ export class PlanetarySandboxEngine {
         const surfR = this.planet.findSurfaceRadiusAlongRay(rx, ry, rz);
         this.detailTarget.set(rx * surfR, ry * surfR, rz * surfR);
         this.detailNormal.set(rx, ry, rz);
+        basis = transportCameraForwardOnSphere(
+          [rx, ry, rz],
+          [this.detailBasisFwd.x, this.detailBasisFwd.y, this.detailBasisFwd.z],
+          0,
+        );
+        this.detailBasisFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
       }
-      this.buildTangentBasis(this.detailNormal, this._tanE, this._tanN);
     }
-
-    if (this.keys.has('KeyQ')) this.detailYaw += 1.6 * dt;
-    if (this.keys.has('KeyE')) this.detailYaw -= 1.6 * dt;
 
     this.detailOptics = computeDetailCameraOptics(
       this.detailViewDist,
@@ -3492,12 +6563,10 @@ export class PlanetarySandboxEngine {
     const dirToCam = this._v1
       .set(0, 0, 0)
       .addScaledVector(this.detailNormal, Math.sin(this.detailPitch))
-      .addScaledVector(this._tanN, Math.cos(this.detailYaw) * cosP)
-      .addScaledVector(this._tanE, Math.sin(this.detailYaw) * cosP)
+      .addScaledVector(this.detailBasisFwd, -cosP)
       .normalize();
 
     let safeDist = this.detailOptics.physicalDist;
-    // Raycast from detail target outward toward camera to prevent cliff/wall penetration
     const rayStartOffset = Math.max(this.planet.nativeVoxelSize * 2.5, 0.04 * scale);
     const occHit = this.planet.raycastTerrain(
       this.detailTarget.x + this.detailNormal.x * rayStartOffset,
@@ -3516,7 +6585,6 @@ export class PlanetarySandboxEngine {
       .copy(this.detailTarget)
       .addScaledVector(dirToCam, safeDist);
 
-    // Final signed-distance voxel clearance pushout so camera never embeds into solid geometry
     const minSurfaceClear = Math.max(this.planet.nativeVoxelSize * 3.0, 0.06 * scale);
     const dCam = this.planet.sampleDensityAndNormal(
       desiredPos.x,
@@ -3614,22 +6682,20 @@ export class PlanetarySandboxEngine {
       return;
     }
 
-    // Stage 3: 'landed' -> Planetary gravity-aligned surface FPS walk
-    this._fwdLike.x = this.landingFwd.x;
-    this._fwdLike.y = this.landingFwd.y;
-    this._fwdLike.z = this.landingFwd.z;
-    parallelTransportTangentFrame(
-      this.landingPos.x,
-      this.landingPos.y,
-      this.landingPos.z,
-      this._fwdLike,
-      this._upLike,
-      this._fwdLike,
-      this._rightLike,
+    // Stage 3: 'landed' -> Planetary gravity-aligned surface FPS walk (with core-pass guard)
+    const coreUp = resolveSphericalCoreUp(
+      [this.landingPos.x, this.landingPos.y, this.landingPos.z],
+      [this.landingUp.x, this.landingUp.y, this.landingUp.z],
+      this.planet.baseRadius * 0.08,
     );
-    this.landingUp.set(this._upLike.x, this._upLike.y, this._upLike.z);
-    this.landingFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
-    const rightVec = this._v4.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
+    this.landingUp.set(coreUp[0], coreUp[1], coreUp[2]);
+    const landedBasis = transportCameraForwardOnSphere(
+      coreUp,
+      [this.landingFwd.x, this.landingFwd.y, this.landingFwd.z],
+      0,
+    );
+    this.landingFwd.set(landedBasis.forward[0], landedBasis.forward[1], landedBasis.forward[2]);
+    const rightVec = this._v4.set(landedBasis.right[0], landedBasis.right[1], landedBasis.right[2]);
 
     if (this.keys.has('KeyQ')) {
       this.landingFwd.applyAxisAngle(this.landingUp, 1.8 * dt).normalize();
@@ -3803,6 +6869,29 @@ export class PlanetarySandboxEngine {
       return;
     }
 
+    if (this.directorPreviewPlan && this.directorPreviewAnchor) {
+      this.directorPreviewTime += dt;
+      const dur = Math.max(0.25, this.directorPreviewPlan.durationSec);
+      const u = clamp(this.directorPreviewTime / dur, 0, 1);
+      const pose = evaluateDirectorPose(
+        this.directorPreviewPlan,
+        u,
+        this.directorPreviewAnchor,
+      );
+      this.config.sunAzimuthDeg = this.directorPreviewBaseSunAzimuth + pose.sunAzimuthDeltaDeg;
+      this.updateSunDirection();
+      this.camera.position.set(pose.position[0], pose.position[1], pose.position[2]);
+      this.camera.up.set(pose.up[0], pose.up[1], pose.up[2]).normalize();
+      this.camera.fov = pose.fovDeg;
+      this.camera.updateProjectionMatrix();
+      this.camera.lookAt(pose.lookAt[0], pose.lookAt[1], pose.lookAt[2]);
+      this.lastHighResFocus.set(pose.streamFocus[0], pose.streamFocus[1], pose.streamFocus[2]);
+      if (this.directorPreviewTime >= dur) {
+        this.stopDirectorPreview();
+      }
+      return;
+    }
+
     if (this.config.cameraMode === 'fps') {
       this.updateFpsCamera(dt);
       return;
@@ -3862,36 +6951,85 @@ export class PlanetarySandboxEngine {
     }
 
     const up = this.playerUp;
-    this._v1.set(1, 0, 0);
-    if (Math.abs(up.x) > 0.85) this._v1.set(0, 0, 1);
-    const tangentE = this._v2.crossVectors(up, this._v1).normalize();
-    const tangentN = this._v3.crossVectors(tangentE, up).normalize();
-
-    const horiz = Math.cos(this.camPitch) * this.camDistance;
-    const shoulderLift = Math.min(
-      2.2 * scale,
-      Math.max(this.planet.nativeVoxelSize * 1.5, this.camDistance * 0.25),
+    const radAlpha = 1 - Math.exp(-9.5 * dt);
+    const tanAlpha = 1 - Math.exp(-22 * dt);
+    const stabilized = stabilizeRadialAnchor(
+      [this.explorerCamAnchor.x, this.explorerCamAnchor.y, this.explorerCamAnchor.z],
+      [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+      [up.x, up.y, up.z],
+      radAlpha,
+      tanAlpha,
     );
-    const vert = Math.sin(this.camPitch) * this.camDistance + shoulderLift;
+    this.explorerCamAnchor.set(stabilized[0], stabilized[1], stabilized[2]);
 
-    const desiredPos = this._v4
-      .copy(this.playerPos)
-      .addScaledVector(up, vert)
-      .addScaledVector(tangentN, Math.cos(this.camYaw) * horiz)
-      .addScaledVector(tangentE, Math.sin(this.camYaw) * horiz);
+    const expBasis = transportCameraForwardOnSphere(
+      [up.x, up.y, up.z],
+      [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+      0,
+    );
+    this.explorerCamFwd.set(expBasis.forward[0], expBasis.forward[1], expBasis.forward[2]);
 
     const lookLift = Math.min(
       1.25 * scale,
       Math.max(this.planet.nativeVoxelSize * 2.0, this.camDistance * 0.2),
     );
-    const desiredLook = this._v1.copy(this.playerPos).addScaledVector(up, lookLift);
+    const desiredLook = this._v1
+      .copy(this.explorerCamAnchor)
+      .addScaledVector(up, lookLift);
 
-    const damp = 1 - Math.exp(-10 * dt);
+    const cosP = Math.cos(this.camPitch);
+    const shoulderLift = Math.min(
+      1.4 * scale,
+      Math.max(this.planet.nativeVoxelSize * 1.2, this.camDistance * 0.14),
+    );
+    const camOffsetDir = this._v2
+      .copy(this.explorerCamFwd)
+      .multiplyScalar(-cosP)
+      .addScaledVector(up, Math.sin(this.camPitch))
+      .normalize();
+
+    let safeCamDist = this.camDistance;
+    const occHit = this.planet.raycastTerrain(
+      desiredLook.x,
+      desiredLook.y,
+      desiredLook.z,
+      camOffsetDir.x,
+      camOffsetDir.y,
+      camOffsetDir.z,
+      safeCamDist,
+    );
+    if (occHit.hit && occHit.distance < safeCamDist) {
+      safeCamDist = Math.max(
+        Math.min(1.8 * scale, this.camDistance * 0.45),
+        occHit.distance * 0.84,
+      );
+    }
+
+    const desiredPos = this._v4
+      .copy(desiredLook)
+      .addScaledVector(camOffsetDir, safeCamDist)
+      .addScaledVector(up, shoulderLift);
+
+    const minClear = Math.max(this.planet.nativeVoxelSize * 2.5, 0.28 * scale);
+    const dCam = this.planet.sampleDensityAndNormal(
+      desiredPos.x,
+      desiredPos.y,
+      desiredPos.z,
+      this._normalArr,
+    );
+    if (dCam > -minClear) {
+      const push = dCam + minClear;
+      desiredPos.x += this._normalArr[0] * push;
+      desiredPos.y += this._normalArr[1] * push;
+      desiredPos.z += this._normalArr[2] * push;
+    }
+
+    const damp = 1 - Math.exp(-15 * dt);
     this.camPosSmooth.lerp(desiredPos, damp);
     this.camLookSmooth.lerp(desiredLook, damp);
 
     this.camera.position.copy(this.camPosSmooth);
-    this.camera.up.lerp(up, 1 - Math.exp(-8 * dt)).normalize();
+    this.camera.up.lerp(up, 1 - Math.exp(-11 * dt)).normalize();
     this.camera.lookAt(this.camLookSmooth);
   }
 
@@ -3907,7 +7045,7 @@ export class PlanetarySandboxEngine {
   }
 
   private tick = (): void => {
-    if (this.isDisposed) return;
+    if (this.isDisposed || this.isOfflineRendering) return;
 
     const frameStart = performance.now();
     const rawDt = (frameStart - this.lastTime) / 1000;
@@ -3956,8 +7094,20 @@ export class PlanetarySandboxEngine {
 
     let hoveredHit: ReturnType<VoxelPlanet['raycastTerrain']> | null = null;
     if (this.phase === 'playing') {
+      let playerStats = {
+        grabbedCount: 0,
+        beamForceN: 0,
+        gravityWeightN: 0,
+        loadRatioSum: 0,
+        peakSpeedMs: 0,
+      };
       if (simActive && this.config.cameraMode === 'explorer') {
         this.updateExplorerPhysics(dt);
+      } else if (
+        simActive &&
+        (this.tractorGrabbedPlayer || !this.playerGrounded)
+      ) {
+        playerStats = this.integrateSuspendedExplorerPhysics(dt);
       }
 
       // Live brush hover preview, voxel probe, landing site hover & sculpting
@@ -3972,15 +7122,20 @@ export class PlanetarySandboxEngine {
           } else {
             this.landingHasHover = false;
           }
+        } else if (this.isTractorDragging) {
+          this.brushPreview.visible = false;
         } else if (hoveredHit.hit) {
+          const activeAttrs = this.getActiveToolAttrs();
           this.brushPreview.visible = true;
           this.brushPreview.position.set(hoveredHit.x, hoveredHit.y, hoveredHit.z);
-          this.brushPreview.scale.setScalar(this.config.brushRadius);
-          if (this.isSculpting) {
+          this.brushPreview.scale.setScalar(
+            Math.max(this.planet.nativeVoxelSize * 0.75, this.config.brushRadius * activeAttrs.radiusMult),
+          );
+          if (this.isSculpting && activeAttrs.behavior !== 'tractorBeam') {
             this.brushCooldown -= dt;
             if (this.brushCooldown <= 0) {
               this.performBrushAction(hoveredHit);
-              this.brushCooldown = 0.075;
+              this.brushCooldown = activeAttrs.cooldownSec;
             }
           }
         } else {
@@ -3991,7 +7146,11 @@ export class PlanetarySandboxEngine {
       if (simActive) {
         const simT0 = performance.now();
         const gravParams = this.getGravityParams();
-        this.fluid.step(dt, this.planet, gravParams, 2);
+        const activeFluidTractor = this.updateTractorBeamSolver(dt);
+        this.fluid.step(dt, this.planet, gravParams, 2, activeFluidTractor);
+        if (this.isTractorDragging && this.fluid.tractorCapturedCount > 0) {
+          this.waterMeshDirty = true;
+        }
         this.updateSplashInstances();
 
         this.waterRebuildCooldown -= dt;
@@ -4001,7 +7160,66 @@ export class PlanetarySandboxEngine {
           }
           this.waterRebuildCooldown = this.isSoftware ? 0.16 : 0.07;
         }
-        this.updateDebris(dt);
+        const debrisStats = this.updateDebris(dt);
+        const entityStats = this.updateDynamicEntities(dt);
+
+        if (this.isTractorDragging) {
+          const fluidCount = this.fluid.tractorCapturedCount;
+          const totalEntities =
+            debrisStats.grabbedCount + entityStats.grabbedCount + playerStats.grabbedCount;
+          const totalBeamForceN =
+            this.fluid.tractorTotalBeamForceN +
+            debrisStats.beamForceN +
+            entityStats.beamForceN +
+            playerStats.beamForceN;
+          const totalGravityWeightN =
+            this.fluid.tractorTotalGravityWeightN +
+            debrisStats.gravityWeightN +
+            entityStats.gravityWeightN +
+            playerStats.gravityWeightN;
+          const totalUnits = fluidCount + totalEntities;
+          const weightedLoad =
+            totalUnits > 0
+              ? (this.fluid.tractorAvgLoadRatio * fluidCount +
+                  debrisStats.loadRatioSum +
+                  entityStats.loadRatioSum +
+                  playerStats.loadRatioSum) /
+                totalUnits
+              : 0;
+          const peakSpeedMs = Math.max(
+            this.fluid.tractorPeakSpeedMs,
+            debrisStats.peakSpeedMs,
+            entityStats.peakSpeedMs,
+            playerStats.peakSpeedMs,
+          );
+          const esc = summarizeEscapeStatus(
+            this.tractorTarget.x,
+            this.tractorTarget.y,
+            this.tractorTarget.z,
+            peakSpeedMs,
+            gravParams,
+          );
+          this.tractorTelemetry = {
+            active: true,
+            capturedFluidCount: fluidCount,
+            capturedEntityCount: totalEntities,
+            localGravityMs2: esc.localGravityMs2,
+            beamForceN: totalBeamForceN,
+            gravityWeightN: totalGravityWeightN,
+            loadRatio: weightedLoad,
+            stretchDistanceM: this.tractorAnchor.distanceTo(this.tractorTarget),
+            peakSpeedMs,
+            escapeVelocityMs: esc.escapeVelocityMs,
+            nearEscape: esc.nearEscape,
+          };
+        } else {
+          const rCur = this.planet.baseRadius;
+          this.tractorTelemetry = {
+            ...createIdleTractorTelemetry(),
+            localGravityMs2: computeGravityMagnitude(rCur, gravParams),
+            escapeVelocityMs: computeEscapeVelocity(rCur, gravParams),
+          };
+        }
         this.simStepMsSmooth = this.simStepMsSmooth * 0.85 + (performance.now() - simT0) * 0.15;
       } else if (this.waterMeshDirty) {
         this.rebuildWaterMesh();
@@ -4018,6 +7236,7 @@ export class PlanetarySandboxEngine {
 
     // Update Camera & Procedural Visual Markers
     this.updateCamera(dt);
+    this.updateTractorBeamVisuals();
 
     if (this.landingBeaconGroup) {
       if (
@@ -4064,6 +7283,36 @@ export class PlanetarySandboxEngine {
       }
     }
 
+    if (this.laserBeamGroup) {
+      if (this.phase === 'playing' && this.simTimeSec < this.laserBeamActiveUntil) {
+        this.laserBeamGroup.visible = true;
+        this.laserImpactMesh.visible = true;
+
+        this._v1.copy(this.laserBeamEnd).sub(this.laserBeamStart);
+        const beamLen = Math.max(this._v1.length(), 0.01);
+        const beamMid = this._v2
+          .copy(this.laserBeamStart)
+          .add(this.laserBeamEnd)
+          .multiplyScalar(0.5);
+        this._v1.divideScalar(beamLen);
+        this._q1.setFromUnitVectors(this._v3.set(0, 1, 0), this._v1);
+
+        const pulse = 1 + 0.16 * Math.sin(this.simTimeSec * 42);
+        const rad = Math.max(this.config.brushRadius * this.laserBeamScaleRad * pulse, 0.06 * scale);
+        this.laserBeamGroup.position.copy(beamMid);
+        this.laserBeamGroup.quaternion.copy(this._q1);
+        this.laserBeamGroup.scale.set(rad, beamLen, rad);
+
+        this.laserImpactMesh.position.copy(this.laserImpactPos);
+        this.laserImpactMesh.scale.setScalar(
+          Math.max(this.config.brushRadius * this.laserBeamScaleRad * 1.9 * pulse, 0.14 * scale),
+        );
+      } else {
+        this.laserBeamGroup.visible = false;
+        this.laserImpactMesh.visible = false;
+      }
+    }
+
     if (this.planet.isHighResStreaming || this.config.cameraMode === 'detail') {
       const camR = this.camera.position.length();
       const surfDist = Math.max(
@@ -4101,7 +7350,29 @@ export class PlanetarySandboxEngine {
         : this.isSoftware
           ? 16
           : 28;
-    this.updateHighResStreaming(hoveredHit, streamBudget);
+    let previewStreamOverride:
+      | {
+          focus: readonly [number, number, number];
+          dist: number;
+          lodModeOverride?: LodMode;
+        }
+      | undefined;
+    if (this.directorPreviewPlan && this.directorPreviewAnchor) {
+      const dur = Math.max(0.25, this.directorPreviewPlan.durationSec);
+      const u = clamp(this.directorPreviewTime / dur, 0, 1);
+      const pose = evaluateDirectorPose(
+        this.directorPreviewPlan,
+        u,
+        this.directorPreviewAnchor,
+      );
+      previewStreamOverride = {
+        focus: pose.streamFocus,
+        dist: pose.streamDist,
+        lodModeOverride: this.directorPreviewPlan.forceMaxVoxelDetail ? 0 : this.config.lodMode,
+      };
+    }
+
+    this.updateHighResStreaming(hoveredHit, streamBudget, previewStreamOverride);
     if (this.config.showChunkBounds && this.chunkBoundsDirty) {
       this.refreshChunkBoundsOverlay();
     }
@@ -4164,6 +7435,7 @@ export class PlanetarySandboxEngine {
         this.simTimeSec,
         localMat,
         nearWater,
+        computeHotspotDeltaC(refPos.x, refPos.y, refPos.z, this.thermalHotspots),
       );
       const sph = dirToLonLat(refPos.x, refPos.y, refPos.z);
 
@@ -4205,6 +7477,7 @@ export class PlanetarySandboxEngine {
         landingStage: this.landingStage,
         detailZoomMag: Number(this.detailOptics.magnification.toFixed(1)),
         perspectiveFov: this.config.perspectiveFov,
+        tractorBeam: { ...this.tractorTelemetry },
       });
     }
 

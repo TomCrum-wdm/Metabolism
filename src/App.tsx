@@ -60,6 +60,16 @@ import {
   DirectorShotPlan,
   ScreenshotFormat,
 } from './engine/director';
+import {
+  createDefaultBackendDiagnostic,
+  createDefaultPerfSnapshot,
+} from './engine/perfMonitor';
+import {
+  DEFAULT_RENDER_QUALITY,
+  OfflineAccumSamples,
+  OfflineQualityOverride,
+  ShadowQualityLevel,
+} from './engine/renderQuality';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'orbit',
@@ -133,6 +143,7 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     voxelEdges: true,
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
+    renderQuality: { ...DEFAULT_RENDER_QUALITY },
   };
 }
 
@@ -183,6 +194,8 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   detailZoomMag: 1,
   perspectiveFov: 55,
   tractorBeam: createIdleTractorTelemetry(),
+  backendInfo: createDefaultBackendDiagnostic(),
+  perf: createDefaultPerfSnapshot(),
 };
 
 export default function App() {
@@ -947,6 +960,7 @@ export default function App() {
           saves={saves}
           initialSeedConfig={launchParams.seedConfig}
           isGenerating={Boolean(genProgress?.active)}
+          backendInfo={telemetry.backendInfo}
           onGenerateAndEnter={(cfg) => void handleGenerateWithSeed(cfg)}
           onLoadSaveSlot={(id) => void handleLoadSlot(id)}
           onDeleteSaveSlot={(id) => void handleDeleteSlot(id)}
@@ -1051,6 +1065,12 @@ export default function App() {
             height: number;
             format: ScreenshotFormat;
             hideHelpers: boolean;
+            qualityOverride?: OfflineQualityOverride;
+            accumSamples?: OfflineAccumSamples;
+            rayTracing?: boolean;
+            volumetrics?: boolean;
+            shadowQuality?: ShadowQualityLevel;
+            pbrEnhanced?: boolean;
           }): Promise<DirectorScreenshotResult> => {
             const res = await engineRef.current!.captureDirectorScreenshot(opts);
             return { ...res, format: opts.format };

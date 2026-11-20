@@ -24,6 +24,13 @@ import {
   RESOLUTION_PRESETS,
   ScreenshotFormat,
 } from '../engine/director';
+import {
+  createDefaultDirectorQuality,
+  DirectorQualitySettings,
+  OfflineAccumSamples,
+  OfflineQualityOverride,
+  ShadowQualityLevel,
+} from '../engine/renderQuality';
 
 export interface DirectorScreenshotResult {
   blob: Blob;
@@ -63,6 +70,12 @@ interface DirectorStudioDrawerProps {
     height: number;
     format: ScreenshotFormat;
     hideHelpers: boolean;
+    qualityOverride?: OfflineQualityOverride;
+    accumSamples?: OfflineAccumSamples;
+    rayTracing?: boolean;
+    volumetrics?: boolean;
+    shadowQuality?: ShadowQualityLevel;
+    pbrEnhanced?: boolean;
   }) => Promise<DirectorScreenshotResult>;
   onRenderOfflineVideo: (
     onProgress: (p: DirectorRenderProgress) => void,
@@ -138,6 +151,13 @@ export const DirectorStudioDrawer: React.FC<DirectorStudioDrawerProps> = ({
   const selectedActionMeta =
     DIRECTOR_ACTIONS.find((a) => a.id === plan.action) ?? DIRECTOR_ACTIONS[0];
 
+  const offlineQuality = plan.offlineQuality ?? createDefaultDirectorQuality();
+  const updateOfflineQuality = (partial: Partial<DirectorQualitySettings>) => {
+    onUpdatePlan({
+      offlineQuality: { ...offlineQuality, ...partial },
+    });
+  };
+
   const handleRunScreenshot = async () => {
     if (shotBusy || rendering) return;
     setShotBusy(true);
@@ -147,6 +167,12 @@ export const DirectorStudioDrawer: React.FC<DirectorStudioDrawerProps> = ({
         height: shotHeight,
         format: shotFormat,
         hideHelpers: shotHideHelpers,
+        qualityOverride: offlineQuality.overrideMode,
+        accumSamples: offlineQuality.accumSamples,
+        rayTracing: offlineQuality.rayTracing,
+        volumetrics: offlineQuality.volumetrics,
+        shadowQuality: offlineQuality.shadowQuality,
+        pbrEnhanced: offlineQuality.pbrEnhanced,
       });
       const ext = shotFormat === 'jpeg' ? 'jpg' : shotFormat;
       triggerBlobDownload(
@@ -155,7 +181,7 @@ export const DirectorStudioDrawer: React.FC<DirectorStudioDrawerProps> = ({
       );
       setLastShotInfo({
         previewDataUrl: res.previewDataUrl,
-        label: `${res.actualWidth} × ${res.actualHeight} ${shotFormat.toUpperCase()} (${(
+        label: `${res.actualWidth} × ${res.actualHeight} ${shotFormat.toUpperCase()} · ${offlineQuality.accumSamples}×SSAA (${(
           res.blob.size /
           (1024 * 1024)
         ).toFixed(2)} MB)`,
@@ -385,6 +411,50 @@ export const DirectorStudioDrawer: React.FC<DirectorStudioDrawerProps> = ({
                     <option value="jpeg">JPEG</option>
                   </select>
                 </label>
+              </div>
+
+              {/* Quick Offline Quality Strip for High-Res Screenshots */}
+              <div className="rounded-xs border border-slate-800 bg-[#0d1322] p-1.5 space-y-1">
+                <div className="flex items-center justify-between text-[10px]">
+                  <span className="text-slate-300">截屏画质强化 (以时间换质量)</span>
+                  <span className="font-mono-tabular text-cyan-300">
+                    {offlineQuality.overrideMode === 'inherit'
+                      ? '沿用实时'
+                      : offlineQuality.overrideMode === 'cinematic'
+                        ? '影院光追'
+                        : '极限路径'}{' '}
+                    · {offlineQuality.accumSamples}×SSAA
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-1">
+                  {(
+                    [
+                      ['inherit', '沿用实时'],
+                      ['cinematic', '影院光追'],
+                      ['offline_raytraced', '极限路径'],
+                    ] as const
+                  ).map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      tabIndex={-1}
+                      disabled={shotBusy || rendering}
+                      onClick={() =>
+                        updateOfflineQuality({
+                          overrideMode: mode,
+                          accumSamples: mode === 'offline_raytraced' ? 4 : mode === 'cinematic' ? 2 : 1,
+                        })
+                      }
+                      className={`h-6 rounded-xs border text-[10px] cursor-pointer ${
+                        offlineQuality.overrideMode === mode
+                          ? 'border-cyan-400 bg-cyan-950/60 text-white'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div className="flex items-center justify-between gap-2 pt-0.5">
@@ -914,6 +984,159 @@ export const DirectorStudioDrawer: React.FC<DirectorStudioDrawerProps> = ({
                   <span>纯净无辅助线</span>
                 </label>
               </div>
+            </div>
+
+            {/* Offline Render Quality Upgrade (Time-for-Quality) */}
+            <div
+              data-testid="director-offline-quality-box"
+              className="rounded-xs border border-cyan-500/35 bg-[#0d1322] p-2.5 space-y-2"
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-white">离线画质策略 · 以时间换质量</span>
+                <span className="font-mono-tabular text-[10px] text-cyan-300">
+                  {offlineQuality.accumSamples}× 超采样
+                </span>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1">
+                {(
+                  [
+                    ['inherit', '沿用实时画质'],
+                    ['cinematic', '离线影院级'],
+                    ['offline_raytraced', '极限路径累积'],
+                  ] as const
+                ).map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    tabIndex={-1}
+                    disabled={rendering}
+                    data-testid={`director-quality-mode-${mode}`}
+                    onClick={() =>
+                      updateOfflineQuality({
+                        overrideMode: mode,
+                        accumSamples:
+                          mode === 'offline_raytraced'
+                            ? 4
+                            : mode === 'cinematic'
+                              ? 2
+                              : offlineQuality.accumSamples,
+                      })
+                    }
+                    className={`py-1 px-1 rounded-xs border text-[10px] font-medium cursor-pointer transition-colors ${
+                      offlineQuality.overrideMode === mode
+                        ? 'border-cyan-400 bg-cyan-950/60 text-white'
+                        : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Subpixel Jitter Multi-Sample Accumulation */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-[10px] text-slate-400">
+                  <span>亚像素抖动超采样与光追去噪 (SSAA)</span>
+                  <span className="font-mono-tabular text-emerald-300">
+                    耗时 ×{offlineQuality.accumSamples}
+                  </span>
+                </div>
+                <div className="grid grid-cols-4 gap-1">
+                  {([1, 2, 4, 8] as OfflineAccumSamples[]).map((samples) => (
+                    <button
+                      key={samples}
+                      type="button"
+                      tabIndex={-1}
+                      disabled={rendering}
+                      data-testid={`director-accum-${samples}`}
+                      onClick={() => updateOfflineQuality({ accumSamples: samples })}
+                      className={`py-1 rounded-xs border text-[10px] font-mono-tabular cursor-pointer ${
+                        offlineQuality.accumSamples === samples
+                          ? 'border-emerald-400 bg-emerald-950/60 text-white'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {samples}× {samples === 1 ? '快速' : samples === 4 ? '推荐' : ''}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {offlineQuality.overrideMode !== 'inherit' && (
+                <div className="space-y-1.5 pt-1 border-t border-slate-800/80 text-[10px]">
+                  <div className="grid grid-cols-3 gap-1">
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      disabled={rendering}
+                      onClick={() =>
+                        updateOfflineQuality({ rayTracing: !offlineQuality.rayTracing })
+                      }
+                      className={`py-1 px-1.5 rounded-xs border cursor-pointer ${
+                        offlineQuality.rayTracing
+                          ? 'border-cyan-500/70 bg-cyan-950/40 text-cyan-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      SSGI+SSR: {offlineQuality.rayTracing ? '开' : '关'}
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      disabled={rendering}
+                      onClick={() =>
+                        updateOfflineQuality({ volumetrics: !offlineQuality.volumetrics })
+                      }
+                      className={`py-1 px-1.5 rounded-xs border cursor-pointer ${
+                        offlineQuality.volumetrics
+                          ? 'border-sky-500/70 bg-sky-950/40 text-sky-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      体积雾散射: {offlineQuality.volumetrics ? '开' : '关'}
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      disabled={rendering}
+                      onClick={() =>
+                        updateOfflineQuality({ pbrEnhanced: !offlineQuality.pbrEnhanced })
+                      }
+                      className={`py-1 px-1.5 rounded-xs border cursor-pointer ${
+                        offlineQuality.pbrEnhanced
+                          ? 'border-emerald-500/70 bg-emerald-950/40 text-emerald-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      PBR微法线: {offlineQuality.pbrEnhanced ? '开' : '关'}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1">
+                    {(['standard', 'high', 'ultra'] as ShadowQualityLevel[]).map((lvl) => (
+                      <button
+                        key={lvl}
+                        type="button"
+                        tabIndex={-1}
+                        disabled={rendering}
+                        onClick={() => updateOfflineQuality({ shadowQuality: lvl })}
+                        className={`py-1 rounded-xs border text-[10px] cursor-pointer ${
+                          offlineQuality.shadowQuality === lvl
+                            ? 'border-amber-400 bg-amber-950/50 text-amber-200'
+                            : 'border-slate-800 bg-[#090d18] text-slate-400'
+                        }`}
+                      >
+                        阴影: {lvl === 'standard' ? '标准' : lvl === 'high' ? '高精' : '极限+接触'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-400 leading-relaxed">
+                离线阶段临时切换全原生分辨率缓冲并关闭帧率妥协，按 {offlineQuality.accumSamples}× Halton 亚像素采样消除锯齿与光追噪点。
+              </p>
             </div>
 
             {/* Shot Summary Strip */}

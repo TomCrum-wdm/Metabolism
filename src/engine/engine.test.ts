@@ -47,6 +47,27 @@ import {
   RESOLUTION_PRESETS,
 } from './director';
 import { buildTarArchive, WebmMuxer } from './webmMuxer';
+import {
+  analyzeRgbaFrameLuma,
+  computeOfflineSubsteps,
+  normalizeReadbackRgbaToTopDown,
+} from './directorCapture';
+import {
+  classifyBackendDiagnostic,
+  RollingPerfTracker,
+} from './perfMonitor';
+import {
+  accumulateRgbaSample,
+  buildRenderQualityConfig,
+  computeSubpixelJitterOffset,
+  computeTightShadowFrustum,
+  createDefaultDirectorQuality,
+  createRgbaAccumulator,
+  finalizeAccumulatedRgba,
+  halton,
+  resolveDirectorOfflineQuality,
+  resolveShadowMapSize,
+} from './renderQuality';
 
 const GRAVITY_PARAMS = {
   referenceRadius: DEFAULT_PLANET_RADIUS,
@@ -1545,3 +1566,274 @@ test('Tractor Beam tool registry, ray/drag-plane math, Newtonian gravity load & 
   avgYDropped /= fluid.activeCount;
   assert.ok(avgYDropped < avgYDragged - 1.5, `Released water should fall back under gravity (${avgYDropped} < ${avgYDragged})`);
 });
+
+test('Director Capture normalizes WebGL2 bottom-up vs WebGPU top-down RGBA readback and forces opaque alpha', () => {
+  const width = 2;
+  const height = 3;
+  // Synthetic 2x3 image where row 0 is red-ish (alpha=0!), row 1 is green-ish (alpha=128), row 2 is blue-ish (alpha=255)
+  const src = new Uint8Array([
+    10, 20, 30, 0,    40, 50, 60, 12,
+    70, 80, 90, 128,  100, 110, 120, 200,
+    130, 140, 150, 0, 160, 170, 180, 255,
+  ]);
+
+  // WebGPU readback (flipY = false): preserves row order, forces alpha = 255
+  const webgpuOut = normalizeReadbackRgbaToTopDown(src, width, height, false);
+  assert.equal(webgpuOut.length, width * height * 4);
+  assert.equal(webgpuOut[0], 10);
+  assert.equal(webgpuOut[3], 255);
+  assert.equal(webgpuOut[7], 255);
+  assert.equal(webgpuOut[11], 255);
+  assert.equal(webgpuOut[16], 130);
+  assert.equal(webgpuOut[19], 255);
+
+  // WebGL2 readback (flipY = true): row 2 from bottom becomes row 0 at top, forces alpha = 255
+  const reusableOut = new Uint8ClampedArray(width * height * 4);
+  const webglOut = normalizeReadbackRgbaToTopDown(src, width, height, true, reusableOut);
+  assert.equal(webglOut, reusableOut);
+  assert.equal(webglOut[0], 130);
+  assert.equal(webglOut[1], 140);
+  assert.equal(webglOut[2], 150);
+  assert.equal(webglOut[3], 255);
+  assert.equal(webglOut[4], 160);
+  assert.equal(webglOut[7], 255);
+  // Middle row preserved
+  assert.equal(webglOut[8], 70);
+  assert.equal(webglOut[11], 255);
+  // Original row 0 moved to bottom row 2
+  assert.equal(webglOut[16], 10);
+  assert.equal(webglOut[19], 255);
+
+  const lumaStats = analyzeRgbaFrameLuma(webglOut, 1);
+  assert.equal(lumaStats.sampleCount, 6);
+  assert.equal(lumaStats.nonZeroRgbSamples, 6);
+  assert.equal(lumaStats.alphaMin, 255);
+  assert.ok(lumaStats.meanLuma > 50);
+});
+
+test('Director offline simulation substepping runs uncapped physics across long/fast-forward frame intervals', () => {
+  assert.deepEqual(computeOfflineSubsteps(0, 0.02), { subSteps: 0, subDt: 0 });
+  assert.deepEqual(computeOfflineSubsteps(-0.5, 0.02), { subSteps: 0, subDt: 0 });
+
+  // 30 FPS with 2.4x time scale => simDt = 0.08s => 4 substeps of 0.02s
+  const plan = computeOfflineSubsteps(0.08, 0.02);
+  assert.equal(plan.subSteps, 4);
+  assert.ok(Math.abs(plan.subDt - 0.02) < 1e-9);
+  assert.ok(Math.abs(plan.subSteps * plan.subDt - 0.08) < 1e-9);
+
+  // Compare FluidSim multi-substepped 0.08s offline integration vs single clamped 0.03s tick
+  const R = 14;
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, radius: R, voxelRadius: 18 });
+  const gParams = { referenceRadius: R, surfaceGravity: EARTH_SURFACE_GRAVITY };
+
+  const fluidOffline = new FluidSim();
+  const fluidClamped = new FluidSim();
+  fluidOffline.spawnParticle(0, R + 6, 0);
+  fluidClamped.spawnParticle(0, R + 6, 0);
+
+  for (let frame = 0; frame < 10; frame++) {
+    const { subSteps, subDt } = computeOfflineSubsteps(0.08, 0.02);
+    for (let s = 0; s < subSteps; s++) {
+      fluidOffline.step(subDt, planet, gParams, 2, null);
+    }
+    // Live clamped behavior used to cap dt at 0.03s
+    fluidClamped.step(Math.min(0.08, 0.03), planet, gParams, 2, null);
+  }
+
+  // After 10 frames (0.8s elapsed vs 0.3s clamped), offline particle should have fallen noticeably further
+  assert.ok(
+    fluidOffline.py[0] < fluidClamped.py[0] - 0.5,
+    `Offline substepped fluid (${fluidOffline.py[0]}) should advance full sim interval past clamped (${fluidClamped.py[0]})`,
+  );
+});
+
+test('PerfMonitor classifies WebGPU vs WebGL2 downgrade states, software rasterizers, and GPU timer sources', () => {
+  const hwWebGpu = classifyBackendDiagnostic({
+    isWebGPUBackend: true,
+    navigatorGpuAvailable: true,
+    gpuTimestampSupported: true,
+    adapterLabel: 'Apple M3 Max GPU',
+    maxTextureDim: 16384,
+  });
+  assert.equal(hwWebGpu.backend, 'WebGPU');
+  assert.equal(hwWebGpu.isDowngraded, false);
+  assert.equal(hwWebGpu.downgradeSeverity, 'none');
+  assert.equal(hwWebGpu.gpuTimestampSource, 'WebGPU timestamp-query');
+
+  const webglFallback = classifyBackendDiagnostic({
+    isWebGPUBackend: false,
+    navigatorGpuAvailable: false,
+    gpuTimestampSupported: true,
+    adapterLabel: 'ANGLE (NVIDIA GeForce RTX 4080)',
+  });
+  assert.equal(webglFallback.backend, 'WebGL2');
+  assert.equal(webglFallback.isDowngraded, true);
+  assert.equal(webglFallback.downgradeSeverity, 'warn');
+  assert.equal(webglFallback.isSoftwareRenderer, false);
+  assert.equal(webglFallback.gpuTimestampSource, 'WebGL2 EXT_disjoint_timer_query');
+  assert.ok(webglFallback.downgradeReason.includes('WebGL2'));
+
+  const swiftshaderWebgl = classifyBackendDiagnostic({
+    isWebGPUBackend: false,
+    navigatorGpuAvailable: true,
+    gpuTimestampSupported: false,
+    adapterLabel: 'Google SwiftShader (ANGLE Vulkan)',
+  });
+  assert.equal(swiftshaderWebgl.backend, 'WebGL2');
+  assert.equal(swiftshaderWebgl.isDowngraded, true);
+  assert.equal(swiftshaderWebgl.isSoftwareRenderer, true);
+  assert.equal(swiftshaderWebgl.downgradeSeverity, 'critical');
+  assert.equal(swiftshaderWebgl.gpuTimestampSource, '不可用 (仅CPU提交计时)');
+});
+
+test('RollingPerfTracker computes GPU time, CPU stage breakdown, P95, and 1% low FPS across ring wrap', () => {
+  const tracker = new RollingPerfTracker(16);
+  for (let i = 0; i < 24; i++) {
+    const spike = i === 18 ? 32 : 16;
+    tracker.recordCpuFrame({
+      frameIntervalMs: spike,
+      cpuTickMs: 3.5,
+      simStepMs: 1.2,
+      meshBuildMs: 1.1,
+      renderSubmitMs: 0.9,
+    });
+    tracker.recordGpuTime(i === 18 ? 14.5 : 4.2);
+  }
+
+  const history = tracker.getOrderedHistory();
+  assert.equal(history.length, 16, 'Ring buffer must stay capped at capacity 16');
+
+  const diag = classifyBackendDiagnostic({
+    isWebGPUBackend: true,
+    navigatorGpuAvailable: true,
+    gpuTimestampSupported: true,
+    adapterLabel: 'Test GPU',
+  });
+  const snap = tracker.buildSnapshot({
+    backendInfo: diag,
+    drawCalls: 42,
+    renderPasses: 2,
+    triangles: 120000,
+    points: 0,
+    lines: 120,
+    geometriesCount: 88,
+    texturesCount: 6,
+    renderTargetsCount: 1,
+    gpuMemoryBytes: 64 * 1024 * 1024,
+    jsHeapUsedMb: 128.5,
+    jsHeapLimitMb: 4096,
+    pixelRatio: 2,
+    canvasWidth: 2560,
+    canvasHeight: 1440,
+  });
+
+  assert.ok(snap.gpuTimeMs !== null && snap.gpuTimeMs > 3.5 && snap.gpuTimeMs < 15);
+  assert.equal(snap.gpuTimeLastMs, 4.2);
+  assert.ok(snap.gpuTimeP95Ms !== null && snap.gpuTimeP95Ms >= 4.2);
+  assert.ok(snap.frameTimeP95Ms >= 16);
+  assert.ok(snap.fps1PercentLow <= snap.fps);
+  assert.equal(snap.drawCalls, 42);
+  assert.equal(snap.triangles, 120000);
+  assert.equal(snap.history.length, 16);
+});
+
+test('RenderQuality presets & software fallback downgrade guard behave deterministically', () => {
+  const highHw = buildRenderQualityConfig('high', false);
+  assert.equal(highHw.preset, 'high');
+  assert.equal(highHw.pbrEnhanced, true);
+  assert.ok(highHw.pbrReliefDepth > 1.0);
+  assert.equal(highHw.rayTracingMode, 'ssr');
+  assert.equal(highHw.volumetricFog, true);
+  assert.equal(highHw.atmoScattering, true);
+  assert.equal(highHw.shadowQuality, 'high');
+
+  // Software rasterizer auto-downgrades balanced/high to performance,
+  // while still honoring explicit cinematic / offline_raytraced overrides.
+  const highSw = buildRenderQualityConfig('high', true);
+  assert.equal(highSw.preset, 'performance');
+  assert.equal(highSw.rayTracingMode, 'off');
+  assert.equal(highSw.volumetricFog, false);
+
+  const offlineSw = buildRenderQualityConfig('offline_raytraced', true);
+  assert.equal(offlineSw.preset, 'offline_raytraced');
+  assert.ok(offlineSw.pbrReliefDepth >= 1.4);
+  assert.equal(offlineSw.rayTracingMode, 'ssgi_ssr');
+  assert.equal(offlineSw.volumetricSteps, 40);
+  assert.equal(offlineSw.offlineAccumSamples, 4);
+});
+
+test('RenderQuality resolveDirectorOfflineQuality elevates live settings for time-for-quality offline rendering', () => {
+  const livePerf = buildRenderQualityConfig('performance', false);
+  assert.equal(livePerf.pbrReliefDepth, 0);
+  const inherited = resolveDirectorOfflineQuality(livePerf, {
+    overrideMode: 'inherit',
+    accumSamples: 4,
+  });
+  assert.equal(inherited.rayTracingMode, 'off');
+  assert.equal(inherited.offlineAccumSamples, 4);
+
+  const elevated = resolveDirectorOfflineQuality(livePerf, {
+    overrideMode: 'offline_raytraced',
+    accumSamples: 8,
+    rayTracing: true,
+    volumetrics: true,
+    shadowQuality: 'ultra',
+    pbrEnhanced: true,
+  });
+  assert.equal(elevated.preset, 'offline_raytraced');
+  assert.ok(elevated.pbrReliefDepth >= 1.4);
+  assert.equal(elevated.rayTracingMode, 'ssgi_ssr');
+  assert.equal(elevated.aoEnabled, true);
+  assert.equal(elevated.volumetricFog, true);
+  assert.equal(elevated.atmoScattering, true);
+  assert.equal(elevated.shadowQuality, 'ultra');
+  assert.equal(elevated.contactShadows, true);
+  assert.equal(elevated.offlineAccumSamples, 8);
+
+  const defPlan = createDefaultDirectorPlan();
+  assert.ok(defPlan.offlineQuality);
+  assert.deepEqual(defPlan.offlineQuality, createDefaultDirectorQuality());
+});
+
+test('RenderQuality shadow map sizing and tight dynamic frustum focusing tighten on close-up voxels', () => {
+  assert.equal(resolveShadowMapSize('standard', 8192, false), 1024);
+  assert.equal(resolveShadowMapSize('high', 8192, false), 2048);
+  assert.equal(resolveShadowMapSize('ultra', 8192, false), 4096);
+  // Clamped safely to hardware limit
+  assert.equal(resolveShadowMapSize('ultra', 3000, false), 2048);
+  assert.equal(resolveShadowMapSize('ultra', 8192, true), 2048);
+
+  // Close-up voxel focus tightens halfSpan & shifts frustum center toward surface target
+  const closeFrustum = computeTightShadowFrustum(13, 0.02, 0, 13, 0, 0.8, 'ultra');
+  const orbitFrustum = computeTightShadowFrustum(13, 0.02, 0, 13, 0, 32, 'ultra');
+  assert.ok(
+    closeFrustum.halfSpan < orbitFrustum.halfSpan * 0.25,
+    `Expected close frustum (${closeFrustum.halfSpan}) << orbit (${orbitFrustum.halfSpan})`,
+  );
+  assert.ok(closeFrustum.centerY > 10);
+  assert.ok(Math.abs(orbitFrustum.centerY) < 1e-6);
+});
+
+test('RenderQuality Halton subpixel jittering and RGBA accumulator produce clean SSAA averages', () => {
+  assert.equal(halton(1, 2), 0.5);
+  assert.equal(halton(2, 2), 0.25);
+  assert.equal(halton(3, 2), 0.75);
+
+  const single = computeSubpixelJitterOffset(0, 1);
+  assert.deepEqual(single, { offsetX: 0, offsetY: 0 });
+
+  for (let i = 0; i < 8; i++) {
+    const j = computeSubpixelJitterOffset(i, 8);
+    assert.ok(j.offsetX >= -0.5 && j.offsetX <= 0.5);
+    assert.ok(j.offsetY >= -0.5 && j.offsetY <= 0.5);
+  }
+
+  const acc = createRgbaAccumulator(2);
+  accumulateRgbaSample(acc, new Uint8ClampedArray([10, 20, 30, 0, 100, 150, 200, 128]));
+  accumulateRgbaSample(acc, new Uint8ClampedArray([20, 40, 50, 255, 120, 170, 220, 255]));
+  const finalRgba = finalizeAccumulatedRgba(acc, 2);
+  assert.deepEqual(Array.from(finalRgba), [15, 30, 40, 255, 110, 160, 210, 255]);
+});
+
+
+

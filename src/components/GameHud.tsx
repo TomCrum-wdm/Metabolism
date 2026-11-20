@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  AlertTriangle,
   Aperture,
   Box,
   Camera,
@@ -23,6 +24,7 @@ import {
   Thermometer,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import { TerrainOverlayMode } from '../engine/voxelPlanet';
 import { PlanetToolDef, ToolAttributes } from '../engine/toolRegistry';
@@ -171,6 +173,10 @@ export const GameHud: React.FC<GameHudProps> = ({
 }) => {
   const [camMenuOpen, setCamMenuOpen] = useState(false);
   const [paletteExpanded, setPaletteExpanded] = useState(true);
+  const [downgradeBannerDismissed, setDowngradeBannerDismissed] = useState(false);
+  const backendInfo = telemetry.backendInfo;
+  const isDowngraded = backendInfo.isDowngraded || telemetry.backend === 'WebGL2';
+  const showBackendAlert = isDowngraded || backendInfo.downgradeSeverity !== 'none';
   const altStr = `${telemetry.altitude >= 0 ? '+' : ''}${telemetry.altitude.toFixed(1)}m`;
   const gravStr = `${telemetry.localGravity.toFixed(2)}m/s²`;
   const escStr = `${telemetry.escapeVelocity.toFixed(1)}m/s`;
@@ -217,7 +223,40 @@ export const GameHud: React.FC<GameHudProps> = ({
             <span className="font-display font-semibold text-xs text-white tracking-tight">
               TerraSphere Studio
             </span>
-            <span className="text-[10px] text-sky-400">{telemetry.backend}</span>
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-backend-badge"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onToggleDebug();
+              }}
+              title={
+                showBackendAlert
+                  ? `${backendInfo.downgradeReason} (点击打开性能与后端监测 [F3])`
+                  : `${telemetry.backend} 硬件加速 · ${backendInfo.adapterLabel} (点击打开性能监测 [F3])`
+              }
+              className={`px-1.5 py-0.5 rounded-xs border text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition-colors ${
+                isDowngraded
+                  ? backendInfo.downgradeSeverity === 'critical'
+                    ? 'border-rose-500/80 bg-rose-950/75 text-rose-200 hover:bg-rose-900/80'
+                    : 'border-amber-500/80 bg-amber-950/75 text-amber-200 hover:bg-amber-900/80'
+                  : backendInfo.downgradeSeverity === 'warn'
+                    ? 'border-amber-500/70 bg-amber-950/60 text-amber-200 hover:bg-amber-900/70'
+                    : 'border-emerald-500/50 bg-emerald-950/45 text-emerald-300 hover:border-emerald-400'
+              }`}
+            >
+              {showBackendAlert && <AlertTriangle className="w-3 h-3 shrink-0" />}
+              <span>
+                {isDowngraded
+                  ? 'WebGL2 降级'
+                  : backendInfo.isSoftwareRenderer
+                    ? 'WebGPU 软光栅'
+                    : backendInfo.isCompatibilityMode
+                      ? 'WebGPU 兼容'
+                      : 'WebGPU'}
+              </span>
+            </button>
           </div>
 
           <div className="hidden sm:flex items-center gap-1">
@@ -279,8 +318,31 @@ export const GameHud: React.FC<GameHudProps> = ({
             </span>
           </div>
 
-          <div className="flex items-center gap-1">
-            <span className="text-emerald-300">{telemetry.fps} FPS</span>
+          <div className="flex items-center gap-1.5">
+            <span
+              className={
+                telemetry.fps >= 55
+                  ? 'text-emerald-300'
+                  : telemetry.fps >= 30
+                    ? 'text-amber-300'
+                    : 'text-rose-300'
+              }
+            >
+              {telemetry.fps} FPS
+            </span>
+            <span
+              data-testid="hud-gpu-time"
+              title={
+                telemetry.perf.gpuTimeMs !== null
+                  ? `GPU 硬件渲染耗时 (${backendInfo.gpuTimestampSource}) · CPU总耗时 ${telemetry.perf.cpuTickMs.toFixed(1)}ms`
+                  : `CPU 全帧耗时 ${telemetry.perf.cpuTickMs.toFixed(1)}ms (渲染提交 ${telemetry.perf.renderSubmitMs.toFixed(1)}ms；驱动未开放硬件GPU时间戳)`
+              }
+              className="hidden sm:inline text-cyan-300"
+            >
+              {telemetry.perf.gpuTimeMs !== null
+                ? `GPU ${telemetry.perf.gpuTimeMs.toFixed(1)}ms`
+                : `CPU ${telemetry.perf.cpuTickMs.toFixed(1)}ms`}
+            </span>
           </div>
 
           {(config.cameraMode === 'fps' ||
@@ -618,7 +680,7 @@ export const GameHud: React.FC<GameHudProps> = ({
             type="button"
             tabIndex={-1}
             data-testid="debug-menu-btn"
-            title="调试与体素格式检查器 (F3)"
+            title="性能监测、GPU耗时与体素检查器 (F3)"
             onClick={(e) => {
               e.currentTarget.blur();
               onToggleDebug();
@@ -630,7 +692,7 @@ export const GameHud: React.FC<GameHudProps> = ({
             }`}
           >
             <Terminal className="w-3.5 h-3.5 shrink-0" />
-            <span>体素 [F3]</span>
+            <span>性能/体素 [F3]</span>
           </button>
 
           <button
@@ -667,6 +729,53 @@ export const GameHud: React.FC<GameHudProps> = ({
           </button>
         </div>
       </header>
+
+      {showBackendAlert && !downgradeBannerDismissed && !directorPreviewing && (
+        <div className="pointer-events-none flex justify-center pt-1.5 px-3">
+          <div
+            data-testid="backend-downgrade-banner"
+            role="alert"
+            className={`pointer-events-auto max-w-2xl px-3 py-1.5 rounded-xs border text-[11px] flex flex-wrap items-center gap-2 shadow-lg ${
+              backendInfo.downgradeSeverity === 'critical'
+                ? 'border-rose-500/80 bg-[#1a0a12]/95 text-rose-100'
+                : 'border-amber-500/80 bg-[#181207]/95 text-amber-100'
+            }`}
+          >
+            <AlertTriangle
+              className={`w-3.5 h-3.5 shrink-0 ${
+                backendInfo.downgradeSeverity === 'critical'
+                  ? 'text-rose-400'
+                  : 'text-amber-400'
+              }`}
+            />
+            <span className="font-semibold">
+              {isDowngraded ? '警告：WebGPU 已降级为 WebGL2 后端' : '警告：WebGPU 运行在受限/软光栅模式'}
+            </span>
+            <span className="text-[10px] opacity-90">{backendInfo.downgradeReason}</span>
+            <div className="flex items-center gap-1 ml-auto">
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={() => {
+                  if (!debugOpen) onToggleDebug();
+                }}
+                className="h-5 px-2 rounded-xs border border-amber-400/60 bg-amber-950/60 hover:bg-amber-900/70 text-[10px] text-amber-100 cursor-pointer"
+              >
+                性能诊断 [F3]
+              </button>
+              <button
+                type="button"
+                tabIndex={-1}
+                aria-label="关闭降级提示"
+                onClick={() => setDowngradeBannerDismissed(true)}
+                className="h-5 w-5 rounded-xs border border-slate-700 hover:border-slate-500 flex items-center justify-center text-slate-300 hover:text-white cursor-pointer"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {directorPreviewing && (
         <div className="pointer-events-none flex justify-center pt-1.5 px-2">

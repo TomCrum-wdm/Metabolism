@@ -1,4 +1,8 @@
 import { computeDetailCameraOptics, transportCameraForwardOnSphere } from './cameraMath';
+import {
+  createDefaultDirectorQuality,
+  DirectorQualitySettings,
+} from './renderQuality';
 
 export type DirectorActionType =
   | 'micro_to_planet'
@@ -111,6 +115,8 @@ export interface DirectorShotPlan {
   cleanFrame: boolean;
   /** Force LOD0 highest voxel sharpness while rendering */
   forceMaxVoxelDetail: boolean;
+  /** Offline quality override settings ("trade time for quality") */
+  offlineQuality?: DirectorQualitySettings;
   /** User-recorded keyframes for 'keyframe_path' action */
   keyframes: DirectorKeyframe[];
 }
@@ -175,6 +181,7 @@ export function createDefaultDirectorPlan(): DirectorShotPlan {
     sunSweepDeg: 35,
     cleanFrame: true,
     forceMaxVoxelDetail: true,
+    offlineQuality: createDefaultDirectorQuality(),
     keyframes: [],
   };
 }

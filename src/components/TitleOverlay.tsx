@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   ChevronDown,
   ChevronUp,
   Copy,
@@ -11,6 +12,7 @@ import {
   Star,
   Trash2,
 } from 'lucide-react';
+import { BackendDiagnosticInfo } from '../engine/perfMonitor';
 import { OfflineIndicator } from './OfflineIndicator';
 import { PWAInstallButton } from './PWAInstallButton';
 import { NumericCadInput } from './NumericCadInput';
@@ -35,6 +37,7 @@ interface TitleOverlayProps {
   saves: PlanetSaveSummary[];
   initialSeedConfig?: PlanetSeedConfig;
   isGenerating: boolean;
+  backendInfo?: BackendDiagnosticInfo;
   onGenerateAndEnter: (seedConfig: PlanetSeedConfig) => void;
   onLoadSaveSlot: (slotId: string) => void;
   onDeleteSaveSlot: (slotId: string) => void;
@@ -164,6 +167,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   saves,
   initialSeedConfig,
   isGenerating,
+  backendInfo,
   onGenerateAndEnter,
   onLoadSaveSlot,
   onDeleteSaveSlot,
@@ -372,9 +376,37 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
             />
           </svg>
           <div className="min-w-0">
-            <h1 className="font-display text-lg md:text-xl font-bold tracking-tight text-white leading-none">
-              TerraSphere Studio
-            </h1>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="font-display text-lg md:text-xl font-bold tracking-tight text-white leading-none">
+                TerraSphere Studio
+              </h1>
+              {backendInfo && (
+                <span
+                  data-testid="title-backend-badge"
+                  title={backendInfo.downgradeReason || backendInfo.adapterLabel}
+                  className={`px-1.5 py-0.5 rounded-xs border text-[10px] font-mono-tabular font-semibold inline-flex items-center gap-1 ${
+                    backendInfo.isDowngraded
+                      ? backendInfo.downgradeSeverity === 'critical'
+                        ? 'border-rose-500/80 bg-rose-950/70 text-rose-200'
+                        : 'border-amber-500/80 bg-amber-950/70 text-amber-200'
+                      : backendInfo.downgradeSeverity === 'warn'
+                        ? 'border-amber-500/70 bg-amber-950/60 text-amber-200'
+                        : 'border-emerald-500/50 bg-emerald-950/50 text-emerald-300'
+                  }`}
+                >
+                  {(backendInfo.isDowngraded || backendInfo.downgradeSeverity !== 'none') && (
+                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                  )}
+                  <span>
+                    {backendInfo.isDowngraded
+                      ? 'WebGL2 降级后端'
+                      : backendInfo.isSoftwareRenderer
+                        ? 'WebGPU 软光栅'
+                        : backendInfo.backend}
+                  </span>
+                </span>
+              )}
+            </div>
             <p className="text-[11px] text-slate-400 font-mono-tabular mt-1 truncate">
               行星创造器与体素地质编辑器 · 选定方案生成星球并用左侧工程工具雕刻、激光贯通或喷涂
             </p>
@@ -444,6 +476,33 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
           </a>
         </div>
       </header>
+
+      {backendInfo && (backendInfo.isDowngraded || backendInfo.downgradeSeverity !== 'none') && (
+        <div
+          data-testid="title-downgrade-warning"
+          role="alert"
+          className={`relative z-10 px-4 md:px-6 py-1.5 border-b text-[11px] font-mono-tabular flex flex-wrap items-center gap-2 ${
+            backendInfo.downgradeSeverity === 'critical'
+              ? 'border-rose-500/70 bg-rose-950/60 text-rose-100'
+              : 'border-amber-500/70 bg-amber-950/50 text-amber-100'
+          }`}
+        >
+          <AlertTriangle
+            className={`w-3.5 h-3.5 shrink-0 ${
+              backendInfo.downgradeSeverity === 'critical' ? 'text-rose-400' : 'text-amber-400'
+            }`}
+          />
+          <span className="font-semibold">
+            {backendInfo.isDowngraded
+              ? '警告：当前图形后端已从 WebGPU 降级至 WebGL2'
+              : '警告：当前 WebGPU 运行在兼容/软光栅模式'}
+          </span>
+          <span className="text-[10px] opacity-90">{backendInfo.downgradeReason}</span>
+          <span className="ml-auto text-[10px] opacity-80">
+            适配器: {backendInfo.adapterLabel}
+          </span>
+        </div>
+      )}
 
       {/* Main Content: Tile Grid + Selected Tile Editor */}
       <div className="relative z-10 flex-1 min-h-0 max-w-7xl w-full mx-auto px-4 md:px-6 py-4 grid grid-cols-1 lg:grid-cols-12 gap-4 overflow-y-auto lg:overflow-hidden">

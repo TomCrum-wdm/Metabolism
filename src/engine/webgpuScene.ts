@@ -8,6 +8,7 @@ import {
   clamp as tslClamp,
   color,
   cos,
+  diffuseColor,
   dot,
   float,
   fract,
@@ -15,21 +16,31 @@ import {
   max,
   min,
   mix,
+  mrt,
   normalLocal,
+  normalView,
   normalWorld,
+  output,
+  pass,
   positionLocal,
   positionView,
   positionWorld,
   pow,
+  roughness,
   sin,
   smoothstep,
   sqrt,
-  time,
   uniform,
   uv,
   vec3,
+  vec4,
   vertexColor,
 } from 'three/tsl';
+import { ao as gtao } from 'three/addons/tsl/display/GTAONode.js';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+import { denoise } from 'three/addons/tsl/display/DenoiseNode.js';
+import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
+import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   computeEscapeVelocity,
@@ -107,7 +118,40 @@ import {
   DirectorShotPlan,
   evaluateDirectorPose,
 } from './director';
+import {
+  blitRgbaTopDownToCanvas2D,
+  computeOfflineSubsteps,
+  normalizeReadbackRgbaToTopDown,
+} from './directorCapture';
 import { buildTarArchive, WebmMuxer, WebmVideoCodec } from './webmMuxer';
+import {
+  BackendDiagnosticInfo,
+  classifyBackendDiagnostic,
+  createDefaultBackendDiagnostic,
+  PerformanceMetricsSnapshot,
+  RollingPerfTracker,
+} from './perfMonitor';
+import {
+  accumulateRgbaSample,
+  buildRenderQualityConfig,
+  computeSubpixelJitterOffset,
+  computeTightShadowFrustum,
+  createRgbaAccumulator,
+  DEFAULT_RENDER_QUALITY,
+  DirectorQualitySettings,
+  finalizeAccumulatedRgba,
+  OfflineAccumSamples,
+  OfflineQualityOverride,
+  RenderQualityConfig,
+  resolveDirectorOfflineQuality,
+  resolveShadowMapSize,
+  ShadowQualityLevel,
+} from './renderQuality';
+import {
+  buildTerrainSubVoxelPbrBundle,
+  buildVolumetricAtmoCompositeNode,
+  buildWaterWaveNormalNode,
+} from './tslVolumetrics';
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -170,6 +214,8 @@ export interface SandboxTelemetry {
   detailZoomMag: number;
   perspectiveFov: number;
   tractorBeam: TractorBeamTelemetry;
+  backendInfo: BackendDiagnosticInfo;
+  perf: PerformanceMetricsSnapshot;
 }
 
 export interface SandboxConfig {
@@ -197,6 +243,7 @@ export interface SandboxConfig {
   voxelEdges: boolean;
   atmosphere: AtmosphereConfig;
   thermal: ThermalConfig;
+  renderQuality: RenderQualityConfig;
 }
 
 function detectSoftwareRenderer(): boolean {
@@ -267,6 +314,28 @@ export class PlanetarySandboxEngine {
   private lapseRateNode = uniform(24.0);
   private scaleHeightNode = uniform(0.14);
   private greenhouseNode = uniform(18.0);
+  private pbrEnhancedNode = uniform(1.0);
+  private pbrReliefDepthNode = uniform(1.15);
+  private nativeVoxelSizeNode = uniform(DEFAULT_PLANET_RADIUS / 128);
+  private volFogEnabledNode = uniform(1.0);
+  private atmoScatterEnabledNode = uniform(1.0);
+  private volStepsNode = uniform(14.0);
+  private contactShadowNode = uniform(0.0);
+  private bloomEnabledNode = uniform(1.0);
+  private legacyAtmoShellScaleNode = uniform(1.0);
+
+  // TSL Post-Processing RenderPipeline (SSGI + SSR + GTAO + Volumetric Scattering + Bloom)
+  private renderPipeline: THREE.RenderPipeline | null = null;
+  private activePipelineKey = '';
+  private pipelineFailed = false;
+  private activeSsgiNode: ReturnType<typeof ssgi> | null = null;
+  private activeSsrNode: ReturnType<typeof ssr> | null = null;
+  private activeAoNode: ReturnType<typeof gtao> | null = null;
+  private activeDenoiseNodes: Array<ReturnType<typeof denoise>> = [];
+  private pipelineDisposables: Array<{ dispose?: () => void }> = [];
+  private currentShadowMapSize = 2048;
+  private lastShadowHalfSpan = 0;
+  private lastShadowCenter = new THREE.Vector3(9999, 9999, 9999);
 
   private sunOrbMesh!: THREE.Mesh;
   private starPoints!: THREE.Points;
@@ -292,12 +361,12 @@ export class PlanetarySandboxEngine {
   private chunkMeshes: Array<THREE.Mesh | null> = [];
   private chunkLod = new Int8Array(343).fill(-1);
   private chunkCenters = new Float32Array(343 * 3);
-  private terrainMaterial!: THREE.MeshStandardNodeMaterial;
-  private highResGlobeMaterial!: THREE.MeshStandardNodeMaterial;
-  private highResHemiMaterial!: THREE.MeshStandardNodeMaterial;
-  private highResMidOuterMaterial!: THREE.MeshStandardNodeMaterial;
-  private highResMidMaterial!: THREE.MeshStandardNodeMaterial;
-  private highResNativeMaterial!: THREE.MeshStandardNodeMaterial;
+  private terrainMaterial!: THREE.MeshPhysicalNodeMaterial;
+  private highResGlobeMaterial!: THREE.MeshPhysicalNodeMaterial;
+  private highResHemiMaterial!: THREE.MeshPhysicalNodeMaterial;
+  private highResMidOuterMaterial!: THREE.MeshPhysicalNodeMaterial;
+  private highResMidMaterial!: THREE.MeshPhysicalNodeMaterial;
+  private highResNativeMaterial!: THREE.MeshPhysicalNodeMaterial;
   private highResGroup!: THREE.Group;
   private highResMeshes = new Map<string, THREE.Mesh>();
   private highResVertices = 0;
@@ -617,13 +686,17 @@ export class PlanetarySandboxEngine {
     voxelEdges: true,
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
+    renderQuality: { ...DEFAULT_RENDER_QUALITY },
   };
 
   private lastTime = 0;
-  private telemetryTimer = 0;
+  private telemetryTimer = 0.2;
   private fpsSmooth = 60;
   private frameTimeSmooth = 16.6;
   private simStepMsSmooth = 0;
+  private backendDiagnostic: BackendDiagnosticInfo = createDefaultBackendDiagnostic();
+  private perfTracker = new RollingPerfTracker(60);
+  private gpuTimestampInFlight = false;
   private lastProbe: VoxelCellProbe | null = null;
   private raycaster = new THREE.Raycaster();
 
@@ -791,6 +864,7 @@ export class PlanetarySandboxEngine {
     this.renderer = new THREE.WebGPURenderer({
       antialias: !this.isSoftware,
       powerPreference: 'high-performance',
+      trackTimestamp: true,
     });
     this.renderer.setPixelRatio(
       this.isSoftware ? 1 : Math.min(window.devicePixelRatio || 1, 2),
@@ -811,12 +885,21 @@ export class PlanetarySandboxEngine {
     await this.renderer.init();
     if (this.isDisposed) return;
 
+    await this.inspectAndRecordBackendDiagnostic();
+
+    if (
+      (this.isSoftware || this.backendDiagnostic.isSoftwareRenderer) &&
+      this.config.renderQuality.preset !== 'performance'
+    ) {
+      this.config.renderQuality = buildRenderQualityConfig('performance', true);
+    }
+
     try {
       const pmrem = new THREE.PMREMGenerator(this.renderer);
       const envScene = new RoomEnvironment();
       const envRT = pmrem.fromScene(envScene, 0.04);
       this.scene.environment = envRT.texture;
-      this.scene.environmentIntensity = 0.28;
+      this.scene.environmentIntensity = this.config.renderQuality.pbrEnhanced ? 0.42 : 0.24;
       envScene.dispose();
       pmrem.dispose();
     } catch {
@@ -844,9 +927,154 @@ export class PlanetarySandboxEngine {
       this.setPlanetRigVisible(false);
     }
 
+    this.applyShadowQualitySettings();
+    this.syncRenderPipeline(false);
+
     this.bindEvents();
+    this.emitTelemetrySnapshot();
     this.lastTime = performance.now();
     this.scheduleNextFrame();
+  }
+
+  private async inspectAndRecordBackendDiagnostic(): Promise<void> {
+    const backendObj = this.renderer?.backend as
+      | {
+          isWebGPUBackend?: boolean;
+          isWebGLBackend?: boolean;
+          compatibilityMode?: boolean;
+          trackTimestamp?: boolean;
+          device?: {
+            adapterInfo?: {
+              vendor?: string;
+              architecture?: string;
+              device?: string;
+              description?: string;
+            };
+            limits?: { maxTextureDimension2D?: number };
+          };
+          gl?: WebGL2RenderingContext;
+        }
+      | undefined;
+
+    const isWebGPUBackend = Boolean(backendObj?.isWebGPUBackend);
+    const navGpu =
+      typeof navigator !== 'undefined'
+        ? (
+            navigator as Navigator & {
+              gpu?: {
+                requestAdapter?: (opts?: unknown) => Promise<{
+                  info?: {
+                    vendor?: string;
+                    architecture?: string;
+                    device?: string;
+                    description?: string;
+                    isFallbackAdapter?: boolean;
+                  };
+                } | null>;
+              };
+            }
+          ).gpu
+        : undefined;
+    const navigatorGpuAvailable = Boolean(navGpu);
+
+    let adapterLabel = '';
+    let adapterVendor = '';
+    let adapterArchitecture = '';
+    let fallbackProbeReason = '';
+    let maxTextureDim = 8192;
+    let isSoftwareAdapter = this.isSoftware;
+
+    if (isWebGPUBackend) {
+      const devInfo = backendObj?.device?.adapterInfo;
+      if (devInfo) {
+        adapterVendor = devInfo.vendor || '';
+        adapterArchitecture = devInfo.architecture || '';
+        adapterLabel = devInfo.description || devInfo.device || devInfo.vendor || 'WebGPU GPU';
+      }
+      if (backendObj?.device?.limits?.maxTextureDimension2D) {
+        maxTextureDim = backendObj.device.limits.maxTextureDimension2D;
+      }
+      if ((!devInfo || !adapterLabel) && navGpu?.requestAdapter) {
+        try {
+          const adapter = await navGpu.requestAdapter({ powerPreference: 'high-performance' });
+          if (adapter?.info) {
+            adapterVendor = adapter.info.vendor || adapterVendor;
+            adapterArchitecture = adapter.info.architecture || adapterArchitecture;
+            adapterLabel =
+              adapter.info.description || adapter.info.device || adapter.info.vendor || adapterLabel;
+            if (adapter.info.isFallbackAdapter) {
+              isSoftwareAdapter = true;
+            }
+          }
+        } catch {
+          // Safe optional metadata lookup
+        }
+      }
+    } else {
+      const gl = backendObj?.gl;
+      if (gl) {
+        try {
+          const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          adapterLabel = dbg
+            ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '')
+            : String(gl.getParameter(gl.RENDERER) || 'WebGL2');
+          adapterVendor = dbg
+            ? String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '')
+            : String(gl.getParameter(gl.VENDOR) || '');
+          const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+          if (typeof maxTex === 'number' && maxTex > 512) {
+            maxTextureDim = maxTex;
+          }
+        } catch {
+          adapterLabel = 'WebGL2 Context';
+        }
+      }
+
+      if (!navigatorGpuAvailable) {
+        fallbackProbeReason =
+          '浏览器或当前运行上下文未暴露 WebGPU (navigator.gpu 缺失)，已自动降级为 WebGL2 兼容渲染后端。';
+      } else if (navGpu?.requestAdapter) {
+        try {
+          const probeAdapter = await navGpu.requestAdapter({
+            powerPreference: 'high-performance',
+          });
+          if (!probeAdapter) {
+            fallbackProbeReason =
+              '无法获取可用的 WebGPU 硬件适配器 (requestAdapter 返回 null)，已自动降级为 WebGL2 渲染后端。';
+          } else if (probeAdapter.info?.isFallbackAdapter) {
+            isSoftwareAdapter = true;
+            fallbackProbeReason =
+              '浏览器仅提供了 WebGPU 回退/软件适配器且硬件初始化未通过，已自动降级为 WebGL2 后端。';
+          } else {
+            fallbackProbeReason =
+              'WebGPU 设备或着色器特性初始化失败，Three.js 已自动回退至 WebGL2 兼容后端。';
+          }
+        } catch {
+          fallbackProbeReason =
+            '请求 WebGPU 适配器时发生异常，已自动降级为 WebGL2 渲染后端。';
+        }
+      }
+    }
+
+    this.backendDiagnostic = classifyBackendDiagnostic({
+      isWebGPUBackend,
+      navigatorGpuAvailable,
+      webgpuAttempted: true,
+      isCompatibilityMode: Boolean(backendObj?.compatibilityMode),
+      isSoftwareRenderer: isSoftwareAdapter,
+      gpuTimestampSupported: Boolean(backendObj?.trackTimestamp),
+      adapterLabel,
+      adapterVendor,
+      adapterArchitecture,
+      fallbackProbeReason,
+      maxTextureDim,
+    });
+
+    if (this.backendDiagnostic.isDowngraded) {
+      console.warn(
+        `[TerraSphere] 渲染后端已降级 (${this.backendDiagnostic.backend}): ${this.backendDiagnostic.downgradeReason}`,
+      );
+    }
   }
 
   private getGravityParams(): PlanetaryGravityParams {
@@ -862,7 +1090,12 @@ export class PlanetarySandboxEngine {
 
     this.sunLight = new THREE.DirectionalLight(0xfff1d6, 3.25);
     this.sunLight.castShadow = true;
-    const mapSize = this.isSoftware ? 1024 : 2048;
+    const mapSize = resolveShadowMapSize(
+      this.config.renderQuality.shadowQuality,
+      this.backendDiagnostic.maxTextureDim,
+      this.isSoftware,
+    );
+    this.currentShadowMapSize = mapSize;
     this.sunLight.shadow.mapSize.set(mapSize, mapSize);
     this.sunLight.shadow.camera.near = 2;
     this.sunLight.shadow.camera.far = 88;
@@ -871,8 +1104,9 @@ export class PlanetarySandboxEngine {
     this.sunLight.shadow.camera.right = d;
     this.sunLight.shadow.camera.top = d;
     this.sunLight.shadow.camera.bottom = -d;
-    this.sunLight.shadow.bias = -0.0005;
-    this.sunLight.shadow.normalBias = 0.035;
+    this.sunLight.shadow.bias = -0.00045;
+    this.sunLight.shadow.normalBias = 0.03;
+    this.sunLight.shadow.radius = 2.2;
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
@@ -969,7 +1203,8 @@ export class PlanetarySandboxEngine {
       return fres
         .mul(smoothstep(0.12, 0.88, sunDot).mul(0.46).add(0.06))
         .mul(densScale)
-        .mul(atmoEnabledNode);
+        .mul(atmoEnabledNode)
+        .mul(this.legacyAtmoShellScaleNode);
     })();
     this.atmosphereMat.transparent = true;
     this.atmosphereMat.depthWrite = false;
@@ -996,7 +1231,8 @@ export class PlanetarySandboxEngine {
         .mul(sunVis)
         .mul(tslClamp(atmoDensityNode, 0.0, 2.5))
         .mul(0.22)
-        .mul(atmoEnabledNode);
+        .mul(atmoEnabledNode)
+        .mul(this.legacyAtmoShellScaleNode);
     })();
     atmoInnerMat.transparent = true;
     atmoInnerMat.depthWrite = false;
@@ -1094,8 +1330,8 @@ export class PlanetarySandboxEngine {
     this.scene.add(this.cloudPuffsMesh);
   }
 
-  private createTerrainMaterial(): THREE.MeshStandardNodeMaterial {
-    const mat = new THREE.MeshStandardNodeMaterial();
+  private createTerrainMaterial(): THREE.MeshPhysicalNodeMaterial {
+    const mat = new THREE.MeshPhysicalNodeMaterial();
     mat.vertexColors = true;
     mat.wireframe = this.config.wireframe;
 
@@ -1111,6 +1347,20 @@ export class PlanetarySandboxEngine {
     const lapseRateNode = this.lapseRateNode;
     const scaleHeightNode = this.scaleHeightNode;
     const greenhouseNode = this.greenhouseNode;
+    const pbrEnhancedNode = this.pbrEnhancedNode;
+    const pbrReliefDepthNode = this.pbrReliefDepthNode;
+    const nativeVoxelSizeNode = this.nativeVoxelSizeNode;
+    const bloomEnabledNode = this.bloomEnabledNode;
+
+    const pbrBundle = buildTerrainSubVoxelPbrBundle({
+      isBlockyNode,
+      voxelEdgesNode,
+      pbrEnhancedNode,
+      pbrReliefDepthNode,
+      nativeVoxelSizeNode,
+      sunDirNode,
+      matPropsNode: matPropsAttr,
+    });
 
     const computeThermalColor = Fn(() => {
       const p = positionWorld;
@@ -1181,6 +1431,7 @@ export class PlanetarySandboxEngine {
       const blockyCol = mix(blockBody, blockyEdgeCol, voxelEdgesNode);
 
       const materialStyled = mix(smoothCol, blockyCol, isBlockyNode);
+      const subVoxelPbrStyled = pbrBundle.applyAlbedoPbr(materialStyled.rgb);
 
       // Thermal & Strata Density Overlays
       const thermalCol = computeThermalColor();
@@ -1196,15 +1447,22 @@ export class PlanetarySandboxEngine {
         vec3(ringLine),
       );
 
-      let outCol = mix(materialStyled, thermalCol, isThermal);
+      let outCol = mix(subVoxelPbrStyled, thermalCol, isThermal);
       outCol = mix(outCol, densityCol, isDensity);
       return outCol.saturate();
     })();
 
-    mat.roughnessNode = matPropsAttr.x;
+    mat.normalNode = pbrBundle.normalNode;
+    mat.aoNode = pbrBundle.aoNode;
+    mat.roughnessNode = pbrBundle.roughnessNode;
     mat.metalnessNode = matPropsAttr.y;
+    mat.clearcoatNode = pbrBundle.clearcoatNode;
+    mat.clearcoatRoughnessNode = float(0.07);
     mat.emissiveNode = Fn(() => {
-      const crystalGlow = vertexColor().mul(matPropsAttr.z);
+      const crystalGlow = vertexColor()
+        .mul(matPropsAttr.z)
+        .mul(pbrBundle.emissiveBoostNode)
+        .mul(float(1.0).add(bloomEnabledNode.mul(0.8)));
       const isThermal = smoothstep(0.5, 1.0, overlayModeNode).mul(
         float(1.0).sub(smoothstep(1.5, 2.0, overlayModeNode)),
       );
@@ -1244,10 +1502,15 @@ export class PlanetarySandboxEngine {
         vec3(foam),
       );
     })();
-    this.waterMaterial.roughnessNode = float(0.08);
-    this.waterMaterial.metalnessNode = float(0.05);
-    this.waterMaterial.clearcoatNode = float(0.92);
-    this.waterMaterial.clearcoatRoughnessNode = float(0.06);
+    this.waterMaterial.normalNode = buildWaterWaveNormalNode({
+      simTimeNode: this.simTimeNode,
+      windSpeedNode: this.windSpeedNode,
+      pbrEnhancedNode: this.pbrEnhancedNode,
+    });
+    this.waterMaterial.roughnessNode = float(0.07);
+    this.waterMaterial.metalnessNode = float(0.08);
+    this.waterMaterial.clearcoatNode = float(0.95);
+    this.waterMaterial.clearcoatRoughnessNode = float(0.05);
     this.waterMaterial.opacityNode = Fn(() => {
       const viewDir = cameraPosition.sub(positionWorld).normalize();
       const fres = pow(
@@ -1708,7 +1971,7 @@ export class PlanetarySandboxEngine {
     }
   }
 
-  private updateChunksWithLod(budget = 14): void {
+  private updateChunksWithLod(budget = 14): number {
     const n = this.planet.chunksPerAxis;
     const total = this.planet.totalChunks;
     const nonUniform = this.planet.nonUniformChunks;
@@ -1738,7 +2001,7 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) return 0;
     if (candidates.length > budget) {
       candidates.sort((a, b) => a.prio - b.prio);
     }
@@ -1805,6 +2068,7 @@ export class PlanetarySandboxEngine {
     this.lodCounts = [c0, c1, c2, culled];
     this.activeChunks = c0 + c1 + c2;
     this.chunkBoundsDirty = true;
+    return limit;
   }
 
   private setupFluidMeshes(): void {
@@ -3053,8 +3317,10 @@ export class PlanetarySandboxEngine {
     if (vortexInstCount > 0) this.vortexMesh.instanceMatrix.needsUpdate = true;
 
     if (terrainDirty) {
-      this.updateChunksWithLod(36);
-      this.updateHighResStreaming(null, 44);
+      if (!this.isOfflineRendering) {
+        this.updateChunksWithLod(36);
+        this.updateHighResStreaming(null, 44);
+      }
       this.waterMeshDirty = true;
     }
     return { grabbedCount, beamForceN, gravityWeightN, loadRatioSum, peakSpeedMs };
@@ -3739,6 +4005,24 @@ export class PlanetarySandboxEngine {
     if (this.atmoInnerMesh) {
       this.atmoInnerMesh.visible = atmo.enabled && atmo.surfacePressureAtm > 0.005;
     }
+
+    const rq = this.config.renderQuality;
+    this.pbrEnhancedNode.value = rq.pbrEnhanced ? 1.0 : 0.0;
+    this.pbrReliefDepthNode.value = rq.pbrReliefDepth ?? (rq.pbrEnhanced ? 1.15 : 0.0);
+    this.nativeVoxelSizeNode.value = this.planet.nativeVoxelSize;
+    this.volFogEnabledNode.value = rq.volumetricFog ? 1.0 : 0.0;
+    this.atmoScatterEnabledNode.value = rq.atmoScattering ? 1.0 : 0.0;
+    this.volStepsNode.value = rq.volumetricSteps;
+    this.contactShadowNode.value = rq.contactShadows ? 1.0 : 0.0;
+    this.bloomEnabledNode.value = rq.bloomEnabled ? 1.0 : 0.0;
+    const volumetricActive =
+      Boolean(this.renderPipeline) &&
+      !this.pipelineFailed &&
+      (rq.atmoScattering || rq.volumetricFog);
+    this.legacyAtmoShellScaleNode.value = volumetricActive ? 0.34 : 1.0;
+    if (this.scene) {
+      this.scene.environmentIntensity = rq.pbrEnhanced ? 0.42 : 0.24;
+    }
   }
 
   private updateCloudPuffs(dt: number): void {
@@ -3850,6 +4134,9 @@ export class PlanetarySandboxEngine {
       thermal: partial.thermal
         ? { ...this.config.thermal, ...partial.thermal }
         : this.config.thermal,
+      renderQuality: partial.renderQuality
+        ? { ...this.config.renderQuality, ...partial.renderQuality }
+        : this.config.renderQuality,
     };
     this.sound.setMuted(this.config.muted);
 
@@ -3928,6 +4215,11 @@ export class PlanetarySandboxEngine {
       if (this.config.showChunkBounds) {
         this.chunkBoundsDirty = true;
       }
+    }
+
+    if (partial.renderQuality && this.renderer) {
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(this.isOfflineRendering);
     }
 
     this.syncEnvironmentUniforms();
@@ -4013,10 +4305,323 @@ export class PlanetarySandboxEngine {
 
     const scale = this.getPlanetScale();
     if (this.sunLight && this.sunOrbMesh) {
-      this.sunLight.position.copy(this.sunDirUniform).multiplyScalar(42 * scale);
-      this.sunLight.target.position.set(0, 0, 0);
+      this.sunLight.position
+        .copy(this.sunLight.target.position)
+        .addScaledVector(this.sunDirUniform, 42 * scale);
       this.sunOrbMesh.position.copy(this.sunDirUniform).multiplyScalar(115 * scale);
     }
+  }
+
+  private applyShadowQualitySettings(): void {
+    if (!this.sunLight) return;
+    const sq = this.config.renderQuality.shadowQuality;
+    const mapSize = resolveShadowMapSize(
+      sq,
+      this.backendDiagnostic.maxTextureDim,
+      this.isSoftware,
+    );
+    if (mapSize !== this.currentShadowMapSize) {
+      this.currentShadowMapSize = mapSize;
+      this.sunLight.shadow.mapSize.set(mapSize, mapSize);
+      if (this.sunLight.shadow.map) {
+        this.sunLight.shadow.map.dispose();
+        this.sunLight.shadow.map = null;
+      }
+    }
+    const scale = this.getPlanetScale();
+    if (sq === 'ultra') {
+      this.sunLight.shadow.bias = -0.00025;
+      this.sunLight.shadow.normalBias = 0.018 * scale;
+      this.sunLight.shadow.radius = 2.6;
+    } else if (sq === 'high') {
+      this.sunLight.shadow.bias = -0.00038;
+      this.sunLight.shadow.normalBias = 0.026 * scale;
+      this.sunLight.shadow.radius = 2.2;
+    } else {
+      this.sunLight.shadow.bias = -0.0005;
+      this.sunLight.shadow.normalBias = 0.035 * scale;
+      this.sunLight.shadow.radius = 1.5;
+    }
+  }
+
+  private updateDynamicShadowFrustum(
+    focusX: number,
+    focusY: number,
+    focusZ: number,
+    viewDistance: number,
+  ): void {
+    if (!this.sunLight) return;
+    const sol = computeTightShadowFrustum(
+      this.planet.baseRadius,
+      this.planet.nativeVoxelSize,
+      focusX,
+      focusY,
+      focusZ,
+      viewDistance,
+      this.config.renderQuality.shadowQuality,
+    );
+    const scale = this.getPlanetScale();
+    this.sunLight.target.position.set(sol.centerX, sol.centerY, sol.centerZ);
+    this.sunLight.target.updateMatrixWorld();
+    this.sunLight.position
+      .set(sol.centerX, sol.centerY, sol.centerZ)
+      .addScaledVector(this.sunDirUniform, 42 * scale);
+
+    const spanDelta = Math.abs(sol.halfSpan - this.lastShadowHalfSpan) / Math.max(sol.halfSpan, 1e-4);
+    const moveDelta = Math.hypot(
+      sol.centerX - this.lastShadowCenter.x,
+      sol.centerY - this.lastShadowCenter.y,
+      sol.centerZ - this.lastShadowCenter.z,
+    );
+    if (spanDelta > 0.03 || moveDelta > sol.halfSpan * 0.04) {
+      this.lastShadowHalfSpan = sol.halfSpan;
+      this.lastShadowCenter.set(sol.centerX, sol.centerY, sol.centerZ);
+      this.sunLight.shadow.camera.left = -sol.halfSpan;
+      this.sunLight.shadow.camera.right = sol.halfSpan;
+      this.sunLight.shadow.camera.top = sol.halfSpan;
+      this.sunLight.shadow.camera.bottom = -sol.halfSpan;
+      this.sunLight.shadow.camera.near = sol.near;
+      this.sunLight.shadow.camera.far = sol.far;
+      this.sunLight.shadow.camera.updateProjectionMatrix();
+    }
+  }
+
+  private disposeRenderPipeline(): void {
+    for (const n of this.pipelineDisposables) {
+      try {
+        n.dispose?.();
+      } catch {
+        // Ignore disposal error on already-freed nodes
+      }
+    }
+    this.pipelineDisposables = [];
+    if (this.renderPipeline) {
+      try {
+        this.renderPipeline.dispose();
+      } catch {
+        // Ignore
+      }
+      this.renderPipeline = null;
+    }
+    this.activeSsgiNode = null;
+    this.activeSsrNode = null;
+    this.activeAoNode = null;
+    this.activeDenoiseNodes = [];
+    this.activePipelineKey = '';
+  }
+
+  private syncRenderPipeline(isOffline: boolean, offlineRenderW = 1920): void {
+    if (!this.renderer || !this.scene || !this.camera) return;
+    const rq = this.config.renderQuality;
+    const hasVol = rq.volumetricFog || rq.atmoScattering || rq.contactShadows;
+    const hasAnyPost =
+      rq.rayTracingMode !== 'off' || rq.aoEnabled || hasVol || rq.bloomEnabled;
+
+    if (!hasAnyPost || this.pipelineFailed) {
+      this.disposeRenderPipeline();
+      this.syncEnvironmentUniforms();
+      return;
+    }
+
+    const resScaleCap = isOffline && offlineRenderW > 3840 ? 'hi6k' : isOffline ? 'hi' : 'live';
+    const desiredKey = [
+      rq.rayTracingMode,
+      rq.aoEnabled ? 'ao1' : 'ao0',
+      hasVol ? 'vol1' : 'vol0',
+      rq.bloomEnabled ? 'blm1' : 'blm0',
+      resScaleCap,
+    ].join('|');
+
+    // Update uniform-driven parameters if structural pipeline matches
+    if (this.renderPipeline && this.activePipelineKey === desiredKey) {
+      if (this.activeSsgiNode) {
+        const highSteps = rq.raySteps >= 0.9 || isOffline;
+        this.activeSsgiNode.sliceCount.value = highSteps ? 3 : 2;
+        this.activeSsgiNode.stepCount.value = highSteps ? 14 : 8;
+        this.activeSsgiNode.radius.value = Math.max(4, this.planet.baseRadius * 0.55);
+      }
+      if (this.activeSsrNode) {
+        this.activeSsrNode.quality.value = Math.max(0.35, Math.min(1.0, rq.raySteps));
+        this.activeSsrNode.maxDistance.value = Math.max(8, this.planet.baseRadius * 1.1);
+        this.activeSsrNode.thickness.value = Math.max(0.12, this.planet.nativeVoxelSize * 3.5);
+      }
+      if (this.activeAoNode) {
+        this.activeAoNode.samples.value = rq.raySteps >= 0.8 || isOffline ? 16 : 8;
+        this.activeAoNode.radius.value = Math.max(0.45, this.planet.baseRadius * 0.06);
+      }
+      this.syncEnvironmentUniforms();
+      return;
+    }
+
+    this.disposeRenderPipeline();
+
+    try {
+      const pipeline = new THREE.RenderPipeline(this.renderer);
+      const scenePass = pass(this.scene, this.camera);
+      this.pipelineDisposables.push(scenePass);
+
+      const needMrt = rq.rayTracingMode !== 'off' || rq.aoEnabled;
+      if (needMrt) {
+        scenePass.setMRT(
+          mrt({
+            output,
+            normal: normalView,
+            diffuseColor,
+            roughness,
+          }),
+        );
+      }
+
+      const scenePassColor = scenePass.getTextureNode('output');
+      const scenePassDepth = scenePass.getTextureNode('depth');
+
+      let composedNode: THREE.Node<'vec4'> = scenePassColor;
+
+      if (needMrt) {
+        const scenePassNormal = scenePass.getTextureNode('normal');
+        const scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
+        const scenePassRoughness = scenePass.getTextureNode('roughness');
+        const rtScale = resScaleCap === 'hi6k' ? 0.5 : resScaleCap === 'hi' ? 1.0 : 0.75;
+
+        if (rq.rayTracingMode === 'ssgi_ssr') {
+          const ssgiPass = ssgi(scenePassColor, scenePassDepth, scenePassNormal, this.camera);
+          ssgiPass.useTemporalFiltering = false;
+          ssgiPass.resolutionScale = rtScale;
+          const highSteps = rq.raySteps >= 0.9 || isOffline;
+          ssgiPass.sliceCount.value = highSteps ? 3 : 2;
+          ssgiPass.stepCount.value = highSteps ? 14 : 8;
+          ssgiPass.radius.value = Math.max(4, this.planet.baseRadius * 0.55);
+          ssgiPass.giIntensity.value = 6.2;
+          ssgiPass.aoIntensity.value = 1.15;
+          ssgiPass.useScreenSpaceSampling.value = true;
+          this.activeSsgiNode = ssgiPass;
+          this.pipelineDisposables.push(ssgiPass);
+
+          const denoisedGi = denoise(
+            ssgiPass.getGINode(),
+            scenePassDepth,
+            scenePassNormal,
+            this.camera,
+          );
+          this.pipelineDisposables.push(denoisedGi);
+          this.activeDenoiseNodes.push(denoisedGi);
+
+          let baseRgb: THREE.Node<'vec3'> = scenePassColor.rgb;
+          if (rq.aoEnabled) {
+            const denoisedAo = denoise(
+              ssgiPass.getAONode(),
+              scenePassDepth,
+              scenePassNormal,
+              this.camera,
+            );
+            this.pipelineDisposables.push(denoisedAo);
+            this.activeDenoiseNodes.push(denoisedAo);
+            const aoNode = denoisedAo as unknown as THREE.Node<'vec4'>;
+            baseRgb = baseRgb.mul(mix(float(1.0), aoNode.r, float(0.68)));
+          }
+
+          const giNode = denoisedGi as unknown as THREE.Node<'vec4'>;
+          const indirectGi = giNode.rgb.mul(scenePassDiffuse.rgb).mul(0.55);
+          composedNode = vec4(baseRgb.add(indirectGi), scenePassColor.a);
+        } else if (rq.aoEnabled) {
+          const aoPass = gtao(scenePassDepth, scenePassNormal, this.camera);
+          aoPass.resolutionScale = resScaleCap === 'hi6k' ? 0.5 : rq.raySteps >= 0.8 ? 1.0 : 0.68;
+          aoPass.samples.value = rq.raySteps >= 0.8 || isOffline ? 16 : 8;
+          aoPass.radius.value = Math.max(0.45, this.planet.baseRadius * 0.06);
+          this.activeAoNode = aoPass;
+          this.pipelineDisposables.push(aoPass);
+
+          const denoisedAo = denoise(
+            aoPass.getTextureNode(),
+            scenePassDepth,
+            scenePassNormal,
+            this.camera,
+          );
+          this.pipelineDisposables.push(denoisedAo);
+          this.activeDenoiseNodes.push(denoisedAo);
+
+          const aoNode = denoisedAo as unknown as THREE.Node<'vec4'>;
+          composedNode = vec4(
+            scenePassColor.rgb.mul(mix(float(1.0), aoNode.r, float(0.64))),
+            scenePassColor.a,
+          );
+        }
+
+        if (rq.rayTracingMode === 'ssr' || rq.rayTracingMode === 'ssgi_ssr') {
+          const ssrPass = ssr(composedNode, scenePassDepth, scenePassNormal.xyz, {
+            roughnessNode: scenePassRoughness.r,
+            diffuseNode: scenePassDiffuse,
+            binaryRefine: true,
+            reflectNonMetals: true,
+            camera: this.camera,
+          });
+          ssrPass.resolutionScale = resScaleCap === 'hi6k' ? 0.65 : isOffline ? 1.0 : 0.75;
+          ssrPass.quality.value = Math.max(0.35, Math.min(1.0, rq.raySteps));
+          ssrPass.maxDistance.value = Math.max(8, this.planet.baseRadius * 1.1);
+          ssrPass.thickness.value = Math.max(0.12, this.planet.nativeVoxelSize * 3.5);
+          ssrPass.intensity.value = 0.88;
+          this.activeSsrNode = ssrPass;
+          this.pipelineDisposables.push(ssrPass);
+
+          const specMask = float(1.0).sub(smoothstep(0.06, 0.52, scenePassRoughness.r));
+          const hasHit = ssrPass.a.greaterThan(0.001).select(float(1.0), float(0.0));
+          composedNode = vec4(
+            composedNode.rgb.add(ssrPass.rgb.mul(specMask).mul(hasHit).mul(0.85)),
+            composedNode.a,
+          );
+        }
+      }
+
+      if (hasVol) {
+        composedNode = buildVolumetricAtmoCompositeNode({
+          colorNode: composedNode,
+          depthNode: scenePassDepth,
+          sunDirNode: this.sunDirNode,
+          planetRadiusNode: this.planetRadiusNode,
+          atmoEnabledNode: this.atmoEnabledNode,
+          atmoDensityNode: this.atmoDensityNode,
+          rayleighNode: this.rayleighNode,
+          mieNode: this.mieNode,
+          scaleHeightNode: this.scaleHeightNode,
+          volFogEnabledNode: this.volFogEnabledNode,
+          atmoScatterEnabledNode: this.atmoScatterEnabledNode,
+          volStepsNode: this.volStepsNode,
+          contactShadowNode: this.contactShadowNode,
+        });
+      }
+
+      if (rq.bloomEnabled) {
+        const bloomPass = bloom(composedNode, 0.34, 0.45, 0.88);
+        this.pipelineDisposables.push(bloomPass);
+        composedNode = vec4(composedNode.rgb.add(bloomPass.rgb), composedNode.a);
+      }
+
+      pipeline.outputNode = composedNode;
+      pipeline.needsUpdate = true;
+      this.renderPipeline = pipeline;
+      this.activePipelineKey = desiredKey;
+    } catch (err) {
+      console.warn('[TerraSphere] 构建光追/体积后期管线失败，回退基础管线:', err);
+      this.pipelineFailed = true;
+      this.disposeRenderPipeline();
+    }
+
+    this.syncEnvironmentUniforms();
+  }
+
+  private renderActiveScene(): void {
+    if (this.renderPipeline && !this.pipelineFailed) {
+      try {
+        this.renderPipeline.render();
+        return;
+      } catch (err) {
+        console.warn('[TerraSphere] RenderPipeline 渲染异常，已回退基础管线:', err);
+        this.pipelineFailed = true;
+        this.disposeRenderPipeline();
+        this.syncEnvironmentUniforms();
+      }
+    }
+    this.renderer.render(this.scene, this.camera);
   }
 
   private bindEvents(): void {
@@ -4277,58 +4882,314 @@ export class PlanetarySandboxEngine {
     });
   }
 
+  private isUsingWebGLBackend(): boolean {
+    return Boolean(
+      (this.renderer?.backend as { isWebGLBackend?: boolean } | undefined)?.isWebGLBackend,
+    );
+  }
+
+  private syncLaserBeamVisuals(): void {
+    if (!this.laserBeamGroup) return;
+    const scale = this.getPlanetScale();
+    if (this.phase === 'playing' && this.simTimeSec < this.laserBeamActiveUntil) {
+      this.laserBeamGroup.visible = true;
+      this.laserImpactMesh.visible = true;
+
+      this._v1.copy(this.laserBeamEnd).sub(this.laserBeamStart);
+      const beamLen = Math.max(this._v1.length(), 0.01);
+      const beamMid = this._v2
+        .copy(this.laserBeamStart)
+        .add(this.laserBeamEnd)
+        .multiplyScalar(0.5);
+      this._v1.divideScalar(beamLen);
+      this._q1.setFromUnitVectors(this._v3.set(0, 1, 0), this._v1);
+
+      const pulse = 1 + 0.16 * Math.sin(this.simTimeSec * 42);
+      const rad = Math.max(this.config.brushRadius * this.laserBeamScaleRad * pulse, 0.06 * scale);
+      this.laserBeamGroup.position.copy(beamMid);
+      this.laserBeamGroup.quaternion.copy(this._q1);
+      this.laserBeamGroup.scale.set(rad, beamLen, rad);
+
+      this.laserImpactMesh.position.copy(this.laserImpactPos);
+      this.laserImpactMesh.scale.setScalar(
+        Math.max(this.config.brushRadius * this.laserBeamScaleRad * 1.9 * pulse, 0.14 * scale),
+      );
+    } else {
+      this.laserBeamGroup.visible = false;
+      this.laserImpactMesh.visible = false;
+    }
+  }
+
+  private stepOfflineSimulation(
+    simDt: number,
+    advanceClock: boolean,
+    includeEditorVisuals: boolean,
+  ): void {
+    const scale = this.getPlanetScale();
+    if (advanceClock && simDt > 0) {
+      const { subSteps, subDt } = computeOfflineSubsteps(simDt, 0.02);
+      const gravParams = this.getGravityParams();
+      for (let s = 0; s < subSteps; s++) {
+        this.simTimeSec += subDt;
+        this.simTimeNode.value = this.simTimeSec;
+        if (this.moonGroup) {
+          this.moonGroup.position.x = Math.cos(this.simTimeSec * 0.12) * -36 * scale;
+          this.moonGroup.position.z = Math.sin(this.simTimeSec * 0.12) * -36 * scale;
+        }
+        if (this.starPoints) {
+          this.starPoints.rotation.y += subDt * 0.008;
+        }
+        this.updateCloudPuffs(subDt);
+
+        if (this.phase === 'playing') {
+          if (this.tractorGrabbedPlayer || !this.playerGrounded) {
+            this.integrateSuspendedExplorerPhysics(subDt);
+          } else {
+            this.syncPlayerTransform();
+          }
+          const activeFluidTractor = this.updateTractorBeamSolver(subDt);
+          this.fluid.step(subDt, this.planet, gravParams, 2, activeFluidTractor);
+          if (this.isTractorDragging && this.fluid.tractorCapturedCount > 0) {
+            this.waterMeshDirty = true;
+          }
+          this.updateDebris(subDt);
+          this.updateDynamicEntities(subDt);
+        }
+      }
+    } else {
+      this.simTimeNode.value = this.simTimeSec;
+      if (this.moonGroup) {
+        this.moonGroup.position.x = Math.cos(this.simTimeSec * 0.12) * -36 * scale;
+        this.moonGroup.position.z = Math.sin(this.simTimeSec * 0.12) * -36 * scale;
+      }
+      this.updateCloudPuffs(0);
+      if (this.phase === 'playing') {
+        this.syncPlayerTransform();
+      }
+    }
+
+    this.updateSplashInstances();
+    if (this.fluid.activeCount > 0 || this.waterMeshDirty) {
+      this.rebuildWaterMesh();
+    }
+    this.syncLaserBeamVisuals();
+    if (includeEditorVisuals) {
+      this.updateTractorBeamVisuals();
+    }
+  }
+
+  private async convergeOfflineGeometryAndShaders(
+    forceCompile: boolean,
+    streamOverride?: {
+      focus: readonly [number, number, number];
+      dist: number;
+      lodModeOverride?: LodMode;
+    },
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    const rebuiltMacro = this.updateChunksWithLod(this.planet.totalChunks);
+    let rebuiltAny = forceCompile || rebuiltMacro > 0 || this.fluid.activeCount > 0;
+
+    if (this.planet.isHighResStreaming) {
+      for (let pass = 0; pass < 1200; pass++) {
+        if (abortSignal?.aborted) {
+          throw new DOMException('Director offline render aborted', 'AbortError');
+        }
+        const batch = this.updateHighResStreaming(null, 256, streamOverride);
+        if (batch && batch.rebuiltMeshes.length > 0) {
+          rebuiltAny = true;
+        }
+        if (!batch || batch.pendingTotal === 0) break;
+        if (pass % 10 === 9) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+    }
+
+    this.scene.updateMatrixWorld();
+    if (rebuiltAny) {
+      await this.renderer.compileAsync(this.scene, this.camera);
+    }
+  }
+
+  private createOfflineCaptureTarget(width: number, height: number): THREE.RenderTarget {
+    return new THREE.RenderTarget(width, height, {
+      type: THREE.UnsignedByteType,
+      format: THREE.RGBAFormat,
+      colorSpace: THREE.NoColorSpace,
+      depthBuffer: true,
+      stencilBuffer: false,
+      generateMipmaps: false,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      samples: 0,
+    });
+  }
+
+  private async renderTargetToRgbaTopDown(
+    captureRT: THREE.RenderTarget,
+    width: number,
+    height: number,
+    outRgba?: Uint8ClampedArray,
+  ): Promise<Uint8ClampedArray> {
+    this.renderer.setOutputRenderTarget(captureRT);
+    try {
+      this.renderActiveScene();
+    } finally {
+      this.renderer.setOutputRenderTarget(null);
+    }
+    const rawPixels = await this.renderer.readRenderTargetPixelsAsync(
+      captureRT,
+      0,
+      0,
+      width,
+      height,
+    );
+    const bytes =
+      rawPixels instanceof Uint8Array || rawPixels instanceof Uint8ClampedArray
+        ? rawPixels
+        : new Uint8Array(rawPixels.buffer, rawPixels.byteOffset, rawPixels.byteLength);
+    return normalizeReadbackRgbaToTopDown(
+      bytes,
+      width,
+      height,
+      this.isUsingWebGLBackend(),
+      outRgba,
+    );
+  }
+
+  private async renderTargetAccumulatedRgbaTopDown(
+    captureRT: THREE.RenderTarget,
+    width: number,
+    height: number,
+    accumSamples: OfflineAccumSamples,
+    outRgba?: Uint8ClampedArray,
+    abortSignal?: AbortSignal,
+  ): Promise<Uint8ClampedArray> {
+    const samples = Math.max(1, Math.min(8, Math.round(accumSamples)));
+    if (samples <= 1) {
+      this.camera.clearViewOffset();
+      return this.renderTargetToRgbaTopDown(captureRT, width, height, outRgba);
+    }
+
+    const accum = createRgbaAccumulator(width * height);
+    const scratch = new Uint8ClampedArray(width * height * 4);
+    try {
+      for (let s = 0; s < samples; s++) {
+        if (abortSignal?.aborted) {
+          throw new DOMException('Director offline render aborted', 'AbortError');
+        }
+        const { offsetX, offsetY } = computeSubpixelJitterOffset(s, samples);
+        this.camera.setViewOffset(width, height, offsetX, offsetY, width, height);
+        this.camera.updateProjectionMatrix();
+        for (const dn of this.activeDenoiseNodes) {
+          dn.index.value = s;
+        }
+        await this.renderTargetToRgbaTopDown(captureRT, width, height, scratch);
+        accumulateRgbaSample(accum, scratch);
+      }
+    } finally {
+      this.camera.clearViewOffset();
+      this.camera.updateProjectionMatrix();
+    }
+
+    return finalizeAccumulatedRgba(accum, samples, outRgba);
+  }
+
   public async captureDirectorScreenshot(options: {
     width: number;
     height: number;
     format: 'png' | 'webp' | 'jpeg';
     quality?: number;
     hideHelpers?: boolean;
+    qualityOverride?: OfflineQualityOverride;
+    accumSamples?: OfflineAccumSamples;
+    rayTracing?: boolean;
+    volumetrics?: boolean;
+    shadowQuality?: ShadowQualityLevel;
+    pbrEnhanced?: boolean;
   }): Promise<{
     blob: Blob;
     actualWidth: number;
     actualHeight: number;
     previewDataUrl: string;
   }> {
+    cancelAnimationFrame(this.frameHandle);
+    clearTimeout(this.timerHandle);
+
     const targetW = Math.max(16, Math.min(8192, Math.round(options.width)));
     const targetH = Math.max(16, Math.min(8192, Math.round(options.height)));
     const { renderW, renderH } = this.computeRenderBufferSize(targetW, targetH);
 
     const prevAspect = this.camera.aspect;
     const prevPixelRatio = this.renderer.getPixelRatio();
-    const prevW = Math.max(1, this.container.clientWidth);
-    const prevH = Math.max(1, this.container.clientHeight);
+    const prevCssW = Math.max(1, this.container.clientWidth);
+    const prevCssH = Math.max(1, this.container.clientHeight);
+    const savedQuality = { ...this.config.renderQuality };
     const prevHelpers = options.hideHelpers !== false ? this.setEditorHelpersVisible(false) : null;
+    const captureRT = this.createOfflineCaptureTarget(renderW, renderH);
 
     this.isOfflineRendering = true;
     try {
-      this.camera.aspect = targetW / targetH;
-      this.camera.updateProjectionMatrix();
+      const offlineQual = resolveDirectorOfflineQuality(savedQuality, {
+        overrideMode: options.qualityOverride ?? 'inherit',
+        accumSamples: options.accumSamples,
+        rayTracing: options.rayTracing,
+        volumetrics: options.volumetrics,
+        shadowQuality: options.shadowQuality,
+        pbrEnhanced: options.pbrEnhanced,
+      });
+      this.config.renderQuality = offlineQual;
       this.renderer.setPixelRatio(1);
       this.renderer.setSize(renderW, renderH, false);
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(true, renderW);
 
-      this.updateChunksWithLod(this.planet.totalChunks);
-      if (this.planet.isHighResStreaming) {
-        for (let pass = 0; pass < 24; pass++) {
-          const b = this.updateHighResStreaming(null, 80);
-          if (!b || b.pendingTotal === 0) break;
-        }
+      this.camera.aspect = targetW / targetH;
+      this.camera.updateProjectionMatrix();
+
+      this.stepOfflineSimulation(0, false, options.hideHelpers === false);
+      const focusDist = Math.max(
+        this.planet.nativeVoxelSize * 0.5,
+        this.camera.position.distanceTo(this.lastHighResFocus),
+      );
+      this.updateDynamicShadowFrustum(
+        this.lastHighResFocus.x,
+        this.lastHighResFocus.y,
+        this.lastHighResFocus.z,
+        focusDist,
+      );
+      await this.convergeOfflineGeometryAndShaders(true);
+
+      const rgbaTopDown = await this.renderTargetAccumulatedRgbaTopDown(
+        captureRT,
+        renderW,
+        renderH,
+        offlineQual.offlineAccumSamples,
+      );
+
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = renderW;
+      srcCanvas.height = renderH;
+      const srcCtx = srcCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+      if (!srcCtx) {
+        throw new Error('Failed to create 2D screenshot canvas context');
       }
 
-      this.renderer.render(this.scene, this.camera);
-
-      const glCanvas = this.renderer.domElement;
-      let outputCanvas: HTMLCanvasElement = glCanvas;
+      let outputCanvas: HTMLCanvasElement = srcCanvas;
       if (renderW !== targetW || renderH !== targetH) {
-        const scratch = document.createElement('canvas');
-        scratch.width = targetW;
-        scratch.height = targetH;
-        const ctx = scratch.getContext('2d');
-        if (ctx) {
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(glCanvas, 0, 0, targetW, targetH);
-          outputCanvas = scratch;
+        const dstCanvas = document.createElement('canvas');
+        dstCanvas.width = targetW;
+        dstCanvas.height = targetH;
+        const dstCtx = dstCanvas.getContext('2d', { alpha: false });
+        if (dstCtx) {
+          blitRgbaTopDownToCanvas2D(rgbaTopDown, renderW, renderH, srcCanvas, srcCtx, dstCanvas, dstCtx);
+          outputCanvas = dstCanvas;
+        } else {
+          blitRgbaTopDownToCanvas2D(rgbaTopDown, renderW, renderH, srcCanvas, srcCtx);
         }
+      } else {
+        blitRgbaTopDownToCanvas2D(rgbaTopDown, renderW, renderH, srcCanvas, srcCtx);
       }
 
       const mime =
@@ -4339,13 +5200,14 @@ export class PlanetarySandboxEngine {
             : 'image/png';
       const blob = await this.canvasToBlob(outputCanvas, mime, options.quality ?? 0.96);
 
-      // Small thumbnail for instant UI confirmation
       const thumbCanvas = document.createElement('canvas');
       thumbCanvas.width = 480;
       thumbCanvas.height = Math.max(120, Math.round((480 * targetH) / targetW));
-      const tctx = thumbCanvas.getContext('2d');
+      const tctx = thumbCanvas.getContext('2d', { alpha: false });
       let previewDataUrl = '';
       if (tctx) {
+        tctx.fillStyle = '#040711';
+        tctx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
         tctx.drawImage(outputCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
         previewDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.85);
       }
@@ -4357,12 +5219,21 @@ export class PlanetarySandboxEngine {
         previewDataUrl,
       };
     } finally {
+      this.renderer.setOutputRenderTarget(null);
+      this.renderer.setRenderTarget(null);
+      captureRT.dispose();
+      this.camera.clearViewOffset();
       this.camera.aspect = prevAspect;
       this.camera.updateProjectionMatrix();
+      this.config.renderQuality = savedQuality;
       this.renderer.setPixelRatio(prevPixelRatio);
-      this.renderer.setSize(prevW, prevH);
+      this.renderer.setSize(prevCssW, prevCssH, false);
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(false);
       if (prevHelpers) this.restoreEditorHelpersVisible(prevHelpers);
       this.isOfflineRendering = false;
+      this.lastTime = performance.now();
+      this.scheduleNextFrame();
     }
   }
 
@@ -4394,7 +5265,7 @@ export class PlanetarySandboxEngine {
     const anchor = this.buildDirectorAnchor();
     const { renderW, renderH } = this.computeRenderBufferSize(targetW, targetH);
 
-    // Snapshot live state to restore cleanly after offline export
+    // Snapshot live camera, sun, quality, viewport, and simulation clock to restore cleanly after offline export
     const savedPos = this.camera.position.clone();
     const savedQuat = this.camera.quaternion.clone();
     const savedUp = this.camera.up.clone();
@@ -4403,48 +5274,67 @@ export class PlanetarySandboxEngine {
     const savedFar = this.camera.far;
     const savedAspect = this.camera.aspect;
     const savedPixelRatio = this.renderer.getPixelRatio();
+    const savedCssW = Math.max(1, this.container.clientWidth);
+    const savedCssH = Math.max(1, this.container.clientHeight);
+    const savedQuality = { ...this.config.renderQuality };
     const savedSunAzimuth = this.config.sunAzimuthDeg;
     const savedSimTime = this.simTimeSec;
-    const savedContainerW = Math.max(1, this.container.clientWidth);
-    const savedContainerH = Math.max(1, this.container.clientHeight);
     const prevHelpers = plan.cleanFrame ? this.setEditorHelpersVisible(false) : null;
 
     this.isOfflineRendering = true;
     const renderT0 = performance.now();
 
-    // Scratch canvas for optional exact resampling OR preview thumbnail
-    let encodeCanvas: HTMLCanvasElement = this.renderer.domElement;
-    let encodeCtx: CanvasRenderingContext2D | null = null;
+    // Dedicated GPU RenderTarget & CPU 2D staging buffers (immune to WebGL/WebGPU swapchain clears & alpha YUV green-screen)
+    const captureRT = this.createOfflineCaptureTarget(renderW, renderH);
+    const rgbaBuf = new Uint8ClampedArray(renderW * renderH * 4);
+
+    const srcCanvas2D = document.createElement('canvas');
+    srcCanvas2D.width = renderW;
+    srcCanvas2D.height = renderH;
+    const srcCtx2D = srcCanvas2D.getContext('2d', { alpha: false, willReadFrequently: true });
+    if (!srcCtx2D) {
+      captureRT.dispose();
+      throw new Error('Failed to create offline staging 2D canvas context');
+    }
+
+    let encodeCanvas2D: HTMLCanvasElement = srcCanvas2D;
+    let encodeCtx2D: CanvasRenderingContext2D = srcCtx2D;
     if (renderW !== targetW || renderH !== targetH) {
-      encodeCanvas = document.createElement('canvas');
-      encodeCanvas.width = targetW;
-      encodeCanvas.height = targetH;
-      encodeCtx = encodeCanvas.getContext('2d');
-      if (encodeCtx) {
-        encodeCtx.imageSmoothingEnabled = true;
-        encodeCtx.imageSmoothingQuality = 'high';
-      }
+      encodeCanvas2D = document.createElement('canvas');
+      encodeCanvas2D.width = targetW;
+      encodeCanvas2D.height = targetH;
+      encodeCtx2D =
+        encodeCanvas2D.getContext('2d', { alpha: false, willReadFrequently: true }) ?? srcCtx2D;
     }
 
     const thumbCanvas = document.createElement('canvas');
     thumbCanvas.width = 360;
     thumbCanvas.height = Math.max(90, Math.round((360 * targetH) / targetW));
-    const thumbCtx = thumbCanvas.getContext('2d');
+    const thumbCtx = thumbCanvas.getContext('2d', { alpha: false });
+    let cachedImageData: ImageData | null = null;
+
+    type WebCodecsEnc = {
+      configure: (cfg: Record<string, unknown>) => void;
+      encode: (frame: unknown, opts?: { keyFrame?: boolean }) => void;
+      flush: () => Promise<void>;
+      close: () => void;
+      encodeQueueSize: number;
+    };
+
+    let encoder: WebCodecsEnc | null = null;
+    let encoderClosed = false;
 
     try {
+      const offlineQual = resolveDirectorOfflineQuality(savedQuality, plan.offlineQuality);
+      this.config.renderQuality = offlineQual;
       this.renderer.setPixelRatio(1);
       this.renderer.setSize(renderW, renderH, false);
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(true, renderW);
+
       this.camera.aspect = targetW / targetH;
       this.camera.updateProjectionMatrix();
 
-      // Negotiate WebCodecs VideoEncoder unless user explicitly selected lossless PNG TAR archive
-      type WebCodecsEnc = {
-        configure: (cfg: Record<string, unknown>) => void;
-        encode: (frame: unknown, opts?: { keyFrame?: boolean }) => void;
-        flush: () => Promise<void>;
-        close: () => void;
-        encodeQueueSize: number;
-      };
       type WebCodecsCtor = {
         new (init: {
           output: (chunk: {
@@ -4458,8 +5348,8 @@ export class PlanetarySandboxEngine {
         isConfigSupported: (cfg: Record<string, unknown>) => Promise<{ supported?: boolean }>;
       };
       type VideoFrameCtor = new (
-        source: HTMLCanvasElement,
-        init: { timestamp: number; duration: number },
+        source: BufferSource | HTMLCanvasElement,
+        init: Record<string, unknown>,
       ) => { close: () => void };
 
       const g = globalThis as unknown as {
@@ -4467,7 +5357,6 @@ export class PlanetarySandboxEngine {
         VideoFrame?: VideoFrameCtor;
       };
 
-      let encoder: WebCodecsEnc | null = null;
       let muxer: WebmMuxer | null = null;
       let encoderError: unknown = null;
       let encoderLabel = 'PNG 无损序列 (.tar)';
@@ -4502,7 +5391,6 @@ export class PlanetarySandboxEngine {
             candidates.push({ ...c, w: targetW, h: targetH, hintFps: 60 });
           }
         }
-        // Step-down encode dimensions if browser WebCodecs limits max VP9 frame dimensions
         if (targetW > 4096) {
           const capScale = 4096 / targetW;
           const capW = 4096;
@@ -4545,16 +5433,14 @@ export class PlanetarySandboxEngine {
           activeEncodeW = selected.w;
           activeEncodeH = selected.h;
           if (activeEncodeW !== renderW || activeEncodeH !== renderH) {
-            if (encodeCanvas === this.renderer.domElement) {
-              encodeCanvas = document.createElement('canvas');
-              encodeCtx = encodeCanvas.getContext('2d');
+            if (encodeCanvas2D === srcCanvas2D) {
+              encodeCanvas2D = document.createElement('canvas');
+              encodeCtx2D =
+                encodeCanvas2D.getContext('2d', { alpha: false, willReadFrequently: true }) ??
+                srcCtx2D;
             }
-            encodeCanvas.width = activeEncodeW;
-            encodeCanvas.height = activeEncodeH;
-            if (encodeCtx) {
-              encodeCtx.imageSmoothingEnabled = true;
-              encodeCtx.imageSmoothingQuality = 'high';
-            }
+            encodeCanvas2D.width = activeEncodeW;
+            encodeCanvas2D.height = activeEncodeH;
           }
 
           muxer = new WebmMuxer({
@@ -4590,9 +5476,9 @@ export class PlanetarySandboxEngine {
       }
 
       const tarEntries: Array<{ name: string; data: Uint8Array }> = [];
-      const keyframeInterval = Math.max(15, Math.min(180, fps));
+      const keyframeInterval = Math.max(12, Math.min(120, fps));
       const frameDurUs = Math.round(1_000_000 / fps);
-      let prevStreamDist = -1;
+      const needsResample = activeEncodeW !== renderW || activeEncodeH !== renderH;
 
       for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
         if (abortSignal?.aborted) {
@@ -4605,20 +5491,11 @@ export class PlanetarySandboxEngine {
         const u = totalFrames > 1 ? frameIdx / (totalFrames - 1) : 1;
         const pose = evaluateDirectorPose(plan, u, anchor);
 
-        // Advance simulation deterministically if timeScale > 0
-        if (plan.simTimeScale > 0 && frameIdx > 0) {
-          const simDt = dt * plan.simTimeScale;
-          this.simTimeSec += simDt;
-          this.simTimeNode.value = this.simTimeSec;
-          const scale = this.getPlanetScale();
-          this.moonGroup.position.x = Math.cos(this.simTimeSec * 0.12) * -36 * scale;
-          this.moonGroup.position.z = Math.sin(this.simTimeSec * 0.12) * -36 * scale;
-          this.updateCloudPuffs(simDt);
-          this.fluid.step(Math.min(simDt, 0.03), this.planet, this.getGravityParams(), 2);
-          this.updateSplashInstances();
-          this.rebuildWaterMesh();
-          this.updateDebris(simDt);
-          this.updateDynamicEntities(simDt);
+        // Deterministic substepped physics, fluid, entities, clouds, celestial sky & beam FX
+        if (frameIdx === 0) {
+          this.stepOfflineSimulation(0, false, !plan.cleanFrame);
+        } else if (plan.simTimeScale > 0) {
+          this.stepOfflineSimulation(dt * plan.simTimeScale, true, !plan.cleanFrame);
         }
 
         this.config.sunAzimuthDeg = savedSunAzimuth + pose.sunAzimuthDeltaDeg;
@@ -4652,29 +5529,55 @@ export class PlanetarySandboxEngine {
         this.camera.far = safeClips.far;
         this.camera.updateProjectionMatrix();
 
-        // Force voxel & SVO mesh convergence for the current frame's camera distance
-        this.updateChunksWithLod(this.planet.totalChunks);
-        if (this.planet.isHighResStreaming) {
-          const distJump =
-            prevStreamDist <= 0 ||
-            Math.abs(Math.log2(Math.max(pose.streamDist, 1e-8) / Math.max(prevStreamDist, 1e-8))) >
-              0.25;
-          const maxPasses = frameIdx === 0 ? 48 : distJump ? 12 : 4;
-          for (let pass = 0; pass < maxPasses; pass++) {
-            const b = this.updateHighResStreaming(null, 84, {
-              focus: pose.streamFocus,
-              dist: pose.streamDist,
-              lodModeOverride: plan.forceMaxVoxelDetail ? 0 : this.config.lodMode,
-            });
-            if (!b || b.pendingTotal === 0) break;
-          }
-          prevStreamDist = pose.streamDist;
-        }
+        // Tighten directional shadow frustum smoothly for sharp close-up voxel shadows
+        this.updateDynamicShadowFrustum(
+          pose.streamFocus[0],
+          pose.streamFocus[1],
+          pose.streamFocus[2],
+          focusDist,
+        );
 
-        this.renderer.render(this.scene, this.camera);
+        // Zero-budget-cap full convergence: wait until ALL pending macro & SVO chunks complete
+        await this.convergeOfflineGeometryAndShaders(
+          frameIdx === 0,
+          {
+            focus: pose.streamFocus,
+            dist: pose.streamDist,
+            lodModeOverride: plan.forceMaxVoxelDetail ? 0 : this.config.lodMode,
+          },
+          abortSignal,
+        );
 
-        if (encodeCtx && encodeCanvas !== this.renderer.domElement) {
-          encodeCtx.drawImage(this.renderer.domElement, 0, 0, activeEncodeW, activeEncodeH);
+        // GPU-synchronized offscreen render with optional subpixel Halton jitter accumulation & RGBA top-down readback
+        await this.renderTargetAccumulatedRgbaTopDown(
+          captureRT,
+          renderW,
+          renderH,
+          offlineQual.offlineAccumSamples,
+          rgbaBuf,
+          abortSignal,
+        );
+
+        const wantsCanvasFrame =
+          needsResample ||
+          !encoder ||
+          !muxer ||
+          !g.VideoFrame ||
+          frameIdx === 0 ||
+          frameIdx === totalFrames - 1 ||
+          frameIdx % Math.max(4, Math.floor(fps / 6)) === 0;
+
+        if (wantsCanvasFrame) {
+          cachedImageData = blitRgbaTopDownToCanvas2D(
+            rgbaBuf,
+            renderW,
+            renderH,
+            srcCanvas2D,
+            srcCtx2D,
+            needsResample ? encodeCanvas2D : undefined,
+            needsResample ? encodeCtx2D : null,
+            cachedImageData,
+          );
         }
 
         if (encoder && muxer && g.VideoFrame) {
@@ -4682,15 +5585,41 @@ export class PlanetarySandboxEngine {
             await new Promise((r) => setTimeout(r, 4));
           }
           const timestampUs = Math.round((frameIdx * 1_000_000) / fps);
-          const vf = new g.VideoFrame(encodeCanvas, {
-            timestamp: timestampUs,
-            duration: frameDurUs,
-          });
+          const framePixels = needsResample
+            ? encodeCtx2D.getImageData(0, 0, activeEncodeW, activeEncodeH).data
+            : rgbaBuf;
+
+          let vf: { close: () => void };
+          try {
+            vf = new g.VideoFrame(framePixels, {
+              format: 'RGBA',
+              codedWidth: activeEncodeW,
+              codedHeight: activeEncodeH,
+              timestamp: timestampUs,
+              duration: frameDurUs,
+            });
+          } catch {
+            if (!wantsCanvasFrame) {
+              cachedImageData = blitRgbaTopDownToCanvas2D(
+                rgbaBuf,
+                renderW,
+                renderH,
+                srcCanvas2D,
+                srcCtx2D,
+                needsResample ? encodeCanvas2D : undefined,
+                needsResample ? encodeCtx2D : null,
+                cachedImageData,
+              );
+            }
+            vf = new g.VideoFrame(encodeCanvas2D, {
+              timestamp: timestampUs,
+              duration: frameDurUs,
+            });
+          }
           encoder.encode(vf, { keyFrame: frameIdx % keyframeInterval === 0 });
           vf.close();
         } else {
-          // Lossless PNG frame archive fallback
-          const pngBlob = await this.canvasToBlob(encodeCanvas, 'image/png');
+          const pngBlob = await this.canvasToBlob(encodeCanvas2D, 'image/png');
           const ab = await pngBlob.arrayBuffer();
           const numStr = String(frameIdx).padStart(5, '0');
           tarEntries.push({
@@ -4707,15 +5636,13 @@ export class PlanetarySandboxEngine {
         let previewDataUrl: string | undefined;
         if (
           thumbCtx &&
-          (frameIdx === 0 || frameIdx === totalFrames - 1 || frameIdx % Math.max(4, Math.floor(fps / 6)) === 0)
+          (frameIdx === 0 ||
+            frameIdx === totalFrames - 1 ||
+            frameIdx % Math.max(4, Math.floor(fps / 6)) === 0)
         ) {
-          thumbCtx.drawImage(
-            this.renderer.domElement,
-            0,
-            0,
-            thumbCanvas.width,
-            thumbCanvas.height,
-          );
+          thumbCtx.fillStyle = '#040711';
+          thumbCtx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
+          thumbCtx.drawImage(srcCanvas2D, 0, 0, thumbCanvas.width, thumbCanvas.height);
           previewDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.72);
         }
 
@@ -4728,7 +5655,7 @@ export class PlanetarySandboxEngine {
           actualWidth: activeEncodeW,
           actualHeight: activeEncodeH,
           encoderLabel,
-          statusText: `离线渲染中 · 第 ${doneCount}/${totalFrames} 帧`,
+          statusText: `全量物理&体素逐帧渲染中 · 第 ${doneCount}/${totalFrames} 帧`,
           previewDataUrl,
         });
 
@@ -4752,6 +5679,7 @@ export class PlanetarySandboxEngine {
         });
         await encoder.flush();
         encoder.close();
+        encoderClosed = true;
         const webmBytes = muxer.finalize();
         const blob = new Blob([new Uint8Array(webmBytes)], { type: 'video/webm' });
         return {
@@ -4781,6 +5709,18 @@ export class PlanetarySandboxEngine {
         encoderLabel,
       };
     } finally {
+      if (encoder && !encoderClosed) {
+        try {
+          encoder.close();
+        } catch {
+          // ignore already-closed codec state
+        }
+      }
+      this.renderer.setOutputRenderTarget(null);
+      this.renderer.setRenderTarget(null);
+      captureRT.dispose();
+
+      this.camera.clearViewOffset();
       this.camera.position.copy(savedPos);
       this.camera.quaternion.copy(savedQuat);
       this.camera.up.copy(savedUp);
@@ -4790,13 +5730,17 @@ export class PlanetarySandboxEngine {
       this.camera.aspect = savedAspect;
       this.camera.updateProjectionMatrix();
 
+      this.config.renderQuality = savedQuality;
+      this.renderer.setPixelRatio(savedPixelRatio);
+      this.renderer.setSize(savedCssW, savedCssH, false);
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(false);
+
       this.config.sunAzimuthDeg = savedSunAzimuth;
       this.updateSunDirection();
       this.simTimeSec = savedSimTime;
       this.simTimeNode.value = savedSimTime;
 
-      this.renderer.setPixelRatio(savedPixelRatio);
-      this.renderer.setSize(savedContainerW, savedContainerH);
       if (prevHelpers) this.restoreEditorHelpersVisible(prevHelpers);
 
       this.isOfflineRendering = false;
@@ -7078,10 +8022,24 @@ export class PlanetarySandboxEngine {
       );
       this.camera.up.set(0, 1, 0);
       this.camera.lookAt(0, 0, 0);
-      this.renderer.render(this.scene, this.camera);
+      this.updateDynamicShadowFrustum(0, 0, 0, 35.5 * scale);
+      const renderT0 = performance.now();
+      this.renderActiveScene();
+      const renderSubmitMs = performance.now() - renderT0;
+      this.pollGpuTimestamps();
+      this.perfTracker.recordCpuFrame({
+        frameIntervalMs: rawDt > 0 ? rawDt * 1000 : 16.6,
+        cpuTickMs: performance.now() - frameStart,
+        simStepMs: 0,
+        meshBuildMs: 0,
+        renderSubmitMs,
+      });
       this.scheduleNextFrame();
       return;
     }
+
+    let simStepMsThisFrame = 0;
+    let meshBuildMsThisFrame = 0;
 
     const simActive = this.phase === 'playing' && !this.config.simPaused;
     if (simActive || this.phase === 'title') {
@@ -7156,7 +8114,9 @@ export class PlanetarySandboxEngine {
         this.waterRebuildCooldown -= dt;
         if (this.waterRebuildCooldown <= 0 || this.waterMeshDirty) {
           if (this.fluid.activeCount > 0 || this.waterMeshDirty) {
+            const wT0 = performance.now();
             this.rebuildWaterMesh();
+            meshBuildMsThisFrame += performance.now() - wT0;
           }
           this.waterRebuildCooldown = this.isSoftware ? 0.16 : 0.07;
         }
@@ -7220,9 +8180,12 @@ export class PlanetarySandboxEngine {
             escapeVelocityMs: computeEscapeVelocity(rCur, gravParams),
           };
         }
-        this.simStepMsSmooth = this.simStepMsSmooth * 0.85 + (performance.now() - simT0) * 0.15;
+        simStepMsThisFrame = performance.now() - simT0;
+        this.simStepMsSmooth = this.simStepMsSmooth * 0.85 + simStepMsThisFrame * 0.15;
       } else if (this.waterMeshDirty) {
+        const wT0 = performance.now();
         this.rebuildWaterMesh();
+        meshBuildMsThisFrame += performance.now() - wT0;
       }
 
       if (this.config.debugProbeEnabled && hoveredHit && hoveredHit.hit) {
@@ -7230,7 +8193,9 @@ export class PlanetarySandboxEngine {
       }
     } else if (this.phase === 'title') {
       if (this.waterMeshDirty) {
+        const wT0 = performance.now();
         this.rebuildWaterMesh();
+        meshBuildMsThisFrame += performance.now() - wT0;
       }
     }
 
@@ -7283,35 +8248,7 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    if (this.laserBeamGroup) {
-      if (this.phase === 'playing' && this.simTimeSec < this.laserBeamActiveUntil) {
-        this.laserBeamGroup.visible = true;
-        this.laserImpactMesh.visible = true;
-
-        this._v1.copy(this.laserBeamEnd).sub(this.laserBeamStart);
-        const beamLen = Math.max(this._v1.length(), 0.01);
-        const beamMid = this._v2
-          .copy(this.laserBeamStart)
-          .add(this.laserBeamEnd)
-          .multiplyScalar(0.5);
-        this._v1.divideScalar(beamLen);
-        this._q1.setFromUnitVectors(this._v3.set(0, 1, 0), this._v1);
-
-        const pulse = 1 + 0.16 * Math.sin(this.simTimeSec * 42);
-        const rad = Math.max(this.config.brushRadius * this.laserBeamScaleRad * pulse, 0.06 * scale);
-        this.laserBeamGroup.position.copy(beamMid);
-        this.laserBeamGroup.quaternion.copy(this._q1);
-        this.laserBeamGroup.scale.set(rad, beamLen, rad);
-
-        this.laserImpactMesh.position.copy(this.laserImpactPos);
-        this.laserImpactMesh.scale.setScalar(
-          Math.max(this.config.brushRadius * this.laserBeamScaleRad * 1.9 * pulse, 0.14 * scale),
-        );
-      } else {
-        this.laserBeamGroup.visible = false;
-        this.laserImpactMesh.visible = false;
-      }
-    }
+    this.syncLaserBeamVisuals();
 
     if (this.planet.isHighResStreaming || this.config.cameraMode === 'detail') {
       const camR = this.camera.position.length();
@@ -7341,6 +8278,7 @@ export class PlanetarySandboxEngine {
         this.camera.updateProjectionMatrix();
       }
     }
+    const meshT0 = performance.now();
     this.updateChunksWithLod(this.isSoftware ? 8 : 14);
     const streamBudget =
       this.config.lodMode === 0
@@ -7376,113 +8314,196 @@ export class PlanetarySandboxEngine {
     if (this.config.showChunkBounds && this.chunkBoundsDirty) {
       this.refreshChunkBoundsOverlay();
     }
+    meshBuildMsThisFrame += performance.now() - meshT0;
 
-    this.renderer.render(this.scene, this.camera);
+    const activeFocusDist = Math.max(
+      this.planet.nativeVoxelSize * 0.5,
+      this.camera.position.distanceTo(this.lastHighResFocus),
+    );
+    this.updateDynamicShadowFrustum(
+      this.lastHighResFocus.x,
+      this.lastHighResFocus.y,
+      this.lastHighResFocus.z,
+      activeFocusDist,
+    );
+
+    const renderT0 = performance.now();
+    this.renderActiveScene();
+    const renderSubmitMs = performance.now() - renderT0;
+    this.pollGpuTimestamps();
+
+    this.perfTracker.recordCpuFrame({
+      frameIntervalMs: rawDt > 0 ? rawDt * 1000 : 16.6,
+      cpuTickMs: performance.now() - frameStart,
+      simStepMs: simStepMsThisFrame,
+      meshBuildMs: meshBuildMsThisFrame,
+      renderSubmitMs,
+    });
 
     // Throttled telemetry emission (~8Hz)
     this.telemetryTimer += dt;
     if (this.telemetryTimer >= 0.12) {
       this.telemetryTimer = 0;
-      const refPos =
-        this.config.cameraMode === 'fps'
-          ? this.fpsPos
-          : this.config.cameraMode === 'landing' && this.landingStage === 'landed'
-            ? this.landingPos
-            : this.config.cameraMode === 'detail'
-              ? this.detailTarget
-              : this.config.cameraMode === 'perspective'
-                ? this.camera.position
-                : this.playerPos;
-      const r = refPos.length();
-      const params = this.getGravityParams();
-      const isWebGPU = Boolean(
-        (this.renderer.backend as { isWebGPUBackend?: boolean } | undefined)
-          ?.isWebGPUBackend,
-      );
-
-      const sunDirArr: [number, number, number] = [
-        this.sunDirUniform.x,
-        this.sunDirUniform.y,
-        this.sunDirUniform.z,
-      ];
-      const nearWater = clamp(
-        (this.fluid.sampleWaterAt(refPos.x, refPos.y, refPos.z) + 0.15) * 2.5,
-        0,
-        1,
-      );
-      const localMat = this.planet.sampleNearestMaterial(
-        refPos.x,
-        refPos.y,
-        refPos.z,
-      );
-      const atmoSample = sampleAtmosphereAtPoint(
-        refPos.x,
-        refPos.y,
-        refPos.z,
-        this.planet.baseRadius,
-        this.config.atmosphere,
-        this.simTimeSec,
-        nearWater,
-      );
-      const thermalSample = sampleThermalField(
-        refPos.x,
-        refPos.y,
-        refPos.z,
-        this.planet.baseRadius,
-        sunDirArr,
-        this.config.atmosphere,
-        this.config.thermal,
-        this.simTimeSec,
-        localMat,
-        nearWater,
-        computeHotspotDeltaC(refPos.x, refPos.y, refPos.z, this.thermalHotspots),
-      );
-      const sph = dirToLonLat(refPos.x, refPos.y, refPos.z);
-
-      this.onTelemetry({
-        altitude: r - this.planet.baseRadius,
-        localGravity: computeGravityMagnitude(r, params),
-        escapeVelocity: computeEscapeVelocity(r, params),
-        waterParticles: this.fluid.activeCount,
-        terrainVertices: this.totalTerrainVertices + this.highResVertices,
-        backend: isWebGPU ? 'WebGPU' : 'WebGL2',
-        grounded:
-          this.config.cameraMode === 'landing'
-            ? this.landingGrounded
-            : this.playerGrounded,
-        cameraMode: this.config.cameraMode,
-        fps: Math.round(this.fpsSmooth),
-        frameTimeMs: Number(this.frameTimeSmooth.toFixed(1)),
-        simStepMs: Number(this.simStepMsSmooth.toFixed(2)),
-        lodCounts: [...this.lodCounts] as [number, number, number, number],
-        activeChunks: this.activeChunks + this.highResActiveCount,
-        planetRadius: this.planet.baseRadius,
-        voxelRadius: this.planet.voxelRadius,
-        nativeVoxelSize: this.planet.nativeVoxelSize,
-        seed: this.planet.seedConfig.seed,
-        fpsSpeed: this.fpsSpeed,
-        hoveredProbe: this.lastProbe,
-        localTempC: thermalSample.tempC,
-        localTempK: thermalSample.tempK,
-        localPressureAtm: atmoSample.pressureAtm,
-        localHumidity: atmoSample.humidity,
-        windSpeedMs: atmoSample.windSpeedMs,
-        atmoLayer: atmoSample.layerName,
-        thermalRegime: thermalSample.regime,
-        playerLatDeg: (sph.latRad * 180) / Math.PI,
-        playerLonDeg: (sph.lonRad * 180) / Math.PI,
-        sunDir: sunDirArr,
-        simTimeSec: this.simTimeSec,
-        voxelRevision: this.planet.voxelRevision,
-        landingStage: this.landingStage,
-        detailZoomMag: Number(this.detailOptics.magnification.toFixed(1)),
-        perspectiveFov: this.config.perspectiveFov,
-        tractorBeam: { ...this.tractorTelemetry },
-      });
+      this.emitTelemetrySnapshot();
     }
 
     this.scheduleNextFrame();
   };
+
+  private pollGpuTimestamps(): void {
+    if (
+      !this.backendDiagnostic.gpuTimestampSupported ||
+      this.gpuTimestampInFlight ||
+      this.isOfflineRendering ||
+      this.isDisposed
+    ) {
+      return;
+    }
+    this.gpuTimestampInFlight = true;
+    void this.renderer
+      .resolveTimestampsAsync('render')
+      .then((gpuMs) => {
+        if (!this.isDisposed && typeof gpuMs === 'number' && Number.isFinite(gpuMs)) {
+          this.perfTracker.recordGpuTime(gpuMs);
+        }
+      })
+      .catch(() => {
+        // Ignore transient timestamp loss/disjoint query errors
+      })
+      .finally(() => {
+        this.gpuTimestampInFlight = false;
+      });
+  }
+
+  private emitTelemetrySnapshot(): void {
+    const refPos =
+      this.config.cameraMode === 'fps'
+        ? this.fpsPos
+        : this.config.cameraMode === 'landing' && this.landingStage === 'landed'
+          ? this.landingPos
+          : this.config.cameraMode === 'detail'
+            ? this.detailTarget
+            : this.config.cameraMode === 'perspective'
+              ? this.camera.position
+              : this.playerPos;
+    const r = refPos.length();
+    const params = this.getGravityParams();
+
+    const sunDirArr: [number, number, number] = [
+      this.sunDirUniform.x,
+      this.sunDirUniform.y,
+      this.sunDirUniform.z,
+    ];
+    const nearWater = clamp(
+      (this.fluid.sampleWaterAt(refPos.x, refPos.y, refPos.z) + 0.15) * 2.5,
+      0,
+      1,
+    );
+    const localMat = this.planet.sampleNearestMaterial(
+      refPos.x,
+      refPos.y,
+      refPos.z,
+    );
+    const atmoSample = sampleAtmosphereAtPoint(
+      refPos.x,
+      refPos.y,
+      refPos.z,
+      this.planet.baseRadius,
+      this.config.atmosphere,
+      this.simTimeSec,
+      nearWater,
+    );
+    const thermalSample = sampleThermalField(
+      refPos.x,
+      refPos.y,
+      refPos.z,
+      this.planet.baseRadius,
+      sunDirArr,
+      this.config.atmosphere,
+      this.config.thermal,
+      this.simTimeSec,
+      localMat,
+      nearWater,
+      computeHotspotDeltaC(refPos.x, refPos.y, refPos.z, this.thermalHotspots),
+    );
+    const sph = dirToLonLat(refPos.x, refPos.y, refPos.z);
+
+    const renderInfo = this.renderer?.info?.render;
+    const memInfo = this.renderer?.info?.memory;
+    const perfWithMem = performance as Performance & {
+      memory?: { usedJSHeapSize?: number; jsHeapSizeLimit?: number };
+    };
+    const jsHeapUsedMb =
+      typeof perfWithMem.memory?.usedJSHeapSize === 'number'
+        ? Number((perfWithMem.memory.usedJSHeapSize / (1024 * 1024)).toFixed(1))
+        : null;
+    const jsHeapLimitMb =
+      typeof perfWithMem.memory?.jsHeapSizeLimit === 'number'
+        ? Number((perfWithMem.memory.jsHeapSizeLimit / (1024 * 1024)).toFixed(0))
+        : null;
+    const dom = this.renderer?.domElement;
+
+    const perf = this.perfTracker.buildSnapshot({
+      backendInfo: this.backendDiagnostic,
+      drawCalls: renderInfo?.drawCalls ?? 0,
+      renderPasses: renderInfo?.frameCalls ?? 0,
+      triangles: renderInfo?.triangles ?? 0,
+      points: renderInfo?.points ?? 0,
+      lines: renderInfo?.lines ?? 0,
+      geometriesCount: memInfo?.geometries ?? 0,
+      texturesCount: memInfo?.textures ?? 0,
+      renderTargetsCount: memInfo?.renderTargets ?? 0,
+      gpuMemoryBytes: memInfo?.total ?? 0,
+      jsHeapUsedMb,
+      jsHeapLimitMb,
+      pixelRatio: this.renderer?.getPixelRatio?.() ?? 1,
+      canvasWidth: dom?.width ?? Math.max(1, this.container.clientWidth),
+      canvasHeight: dom?.height ?? Math.max(1, this.container.clientHeight),
+    });
+
+    this.onTelemetry({
+      altitude: r - this.planet.baseRadius,
+      localGravity: computeGravityMagnitude(r, params),
+      escapeVelocity: computeEscapeVelocity(r, params),
+      waterParticles: this.fluid.activeCount,
+      terrainVertices: this.totalTerrainVertices + this.highResVertices,
+      backend: this.backendDiagnostic.backend,
+      grounded:
+        this.config.cameraMode === 'landing'
+          ? this.landingGrounded
+          : this.playerGrounded,
+      cameraMode: this.config.cameraMode,
+      fps: perf.fps,
+      frameTimeMs: perf.frameTimeMs,
+      simStepMs: perf.simStepMs,
+      lodCounts: [...this.lodCounts] as [number, number, number, number],
+      activeChunks: this.activeChunks + this.highResActiveCount,
+      planetRadius: this.planet.baseRadius,
+      voxelRadius: this.planet.voxelRadius,
+      nativeVoxelSize: this.planet.nativeVoxelSize,
+      seed: this.planet.seedConfig.seed,
+      fpsSpeed: this.fpsSpeed,
+      hoveredProbe: this.lastProbe,
+      localTempC: thermalSample.tempC,
+      localTempK: thermalSample.tempK,
+      localPressureAtm: atmoSample.pressureAtm,
+      localHumidity: atmoSample.humidity,
+      windSpeedMs: atmoSample.windSpeedMs,
+      atmoLayer: atmoSample.layerName,
+      thermalRegime: thermalSample.regime,
+      playerLatDeg: (sph.latRad * 180) / Math.PI,
+      playerLonDeg: (sph.lonRad * 180) / Math.PI,
+      sunDir: sunDirArr,
+      simTimeSec: this.simTimeSec,
+      voxelRevision: this.planet.voxelRevision,
+      landingStage: this.landingStage,
+      detailZoomMag: Number(this.detailOptics.magnification.toFixed(1)),
+      perspectiveFov: this.config.perspectiveFov,
+      tractorBeam: { ...this.tractorTelemetry },
+      backendInfo: this.backendDiagnostic,
+      perf,
+    });
+  }
 
   public dispose(): void {
     this.isDisposed = true;
@@ -7497,6 +8518,7 @@ export class PlanetarySandboxEngine {
     window.removeEventListener('pointerup', this.handlePointerUp);
 
     if (this.renderer) {
+      this.disposeRenderPipeline();
       const dom = this.renderer.domElement;
       dom.removeEventListener('pointerdown', this.handlePointerDown);
       dom.removeEventListener('wheel', this.handleWheel);

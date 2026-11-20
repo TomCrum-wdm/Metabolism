@@ -7,6 +7,16 @@ import {
 } from '../engine/webgpuScene';
 import { NumericCadInput } from './NumericCadInput';
 import { MaterialDonutChart } from './MaterialDonutChart';
+import { PerformanceMonitorSection } from './PerformanceMonitorSection';
+import {
+  buildRenderQualityConfig,
+  DEFAULT_RENDER_QUALITY,
+  RayTracingMode,
+  RENDER_QUALITY_PRESETS,
+  RenderQualityConfig,
+  RenderQualityPreset,
+  ShadowQualityLevel,
+} from '../engine/renderQuality';
 
 interface DebugMenuProps {
   telemetry: SandboxTelemetry;
@@ -102,42 +112,235 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
       <div className="overflow-y-auto p-3 space-y-2.5 text-xs">
         {tab === 'lod' ? (
           <>
-            {/* Performance Metrics */}
-            <div className="grid grid-cols-3 gap-1.5 font-mono-tabular">
-              <div className="rounded-xs border border-slate-800 bg-[#0d1322] p-2">
-                <div className="text-[10px] text-slate-400">渲染帧率</div>
-                <div className="text-sm font-semibold text-emerald-300 mt-0.5">
-                  {telemetry.fps} FPS
+            {/* Comprehensive Backend & Hardware GPU/CPU Performance Monitor */}
+            <PerformanceMonitorSection
+              perf={telemetry.perf}
+              backendInfo={telemetry.backendInfo}
+              simPaused={config.simPaused}
+            />
+
+            {/* Render Quality, PBR, Ray Tracing, Volumetrics & Shadow Strategy */}
+            {(() => {
+              const rq: RenderQualityConfig = config.renderQuality ?? DEFAULT_RENDER_QUALITY;
+              const patchQuality = (partial: Partial<RenderQualityConfig>) =>
+                onUpdateConfig({
+                  renderQuality: { ...rq, ...partial },
+                });
+              const rtLabel: Record<RayTracingMode, string> = {
+                off: '关',
+                ssr: 'SSR 反射',
+                ssgi_ssr: 'SSGI+SSR 全追',
+              };
+              const shadowLabel: Record<ShadowQualityLevel, string> = {
+                standard: '标准 1K',
+                high: '高精 2K',
+                ultra: '极限 4K+接触',
+              };
+              return (
+                <div
+                  data-testid="render-quality-panel"
+                  className="rounded-xs border border-slate-800 bg-[#0d1322] p-2.5 space-y-2"
+                >
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-semibold text-white">
+                      画面质量与光线追踪策略
+                    </span>
+                    <span className="font-mono-tabular text-[10px] text-sky-300">
+                      {RENDER_QUALITY_PRESETS.find((p) => p.id === rq.preset)?.shortLabel ?? rq.preset}
+                    </span>
+                  </div>
+
+                  {/* Quality Presets */}
+                  <div className="grid grid-cols-4 gap-1">
+                    {RENDER_QUALITY_PRESETS.filter(
+                      (p): p is typeof p & { id: Exclude<RenderQualityPreset, 'offline_raytraced'> } =>
+                        p.id !== 'offline_raytraced',
+                    ).map((preset) => {
+                      const active = rq.preset === preset.id;
+                      return (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          tabIndex={-1}
+                          title={preset.desc}
+                          data-testid={`quality-preset-${preset.id}`}
+                          onClick={() =>
+                            onUpdateConfig({
+                              renderQuality: buildRenderQualityConfig(
+                                preset.id,
+                                telemetry.backendInfo.isSoftwareRenderer,
+                              ),
+                            })
+                          }
+                          className={`py-1 rounded-xs border text-[11px] font-medium cursor-pointer transition-colors ${
+                            active
+                              ? 'border-sky-400 bg-sky-900/50 text-white'
+                              : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {preset.shortLabel}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Ray Tracing Mode */}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[10px] text-slate-400">
+                      <span>屏幕空间光线追踪</span>
+                      <span className="font-mono-tabular text-cyan-300">
+                        {rtLabel[rq.rayTracingMode]}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(['off', 'ssr', 'ssgi_ssr'] as RayTracingMode[]).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          tabIndex={-1}
+                          onClick={() =>
+                            patchQuality({
+                              rayTracingMode: mode,
+                              aoEnabled: mode === 'ssgi_ssr' ? true : rq.aoEnabled,
+                            })
+                          }
+                          className={`py-1 rounded-xs border text-[10px] font-medium cursor-pointer transition-colors ${
+                            rq.rayTracingMode === mode
+                              ? 'border-cyan-400 bg-cyan-950/60 text-white'
+                              : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {rtLabel[mode]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Shadow Precision */}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[10px] text-slate-400">
+                      <span>阴影质量与动态聚焦视锥</span>
+                      <span className="font-mono-tabular text-amber-300">
+                        {shadowLabel[rq.shadowQuality]}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(['standard', 'high', 'ultra'] as ShadowQualityLevel[]).map((lvl) => (
+                        <button
+                          key={lvl}
+                          type="button"
+                          tabIndex={-1}
+                          onClick={() =>
+                            patchQuality({
+                              shadowQuality: lvl,
+                              contactShadows: lvl === 'ultra',
+                            })
+                          }
+                          className={`py-1 rounded-xs border text-[10px] font-medium cursor-pointer transition-colors ${
+                            rq.shadowQuality === lvl
+                              ? 'border-amber-400 bg-amber-950/60 text-white'
+                              : 'border-slate-800 bg-[#090d18] text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {shadowLabel[lvl]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Feature Toggles */}
+                  <div className="grid grid-cols-2 gap-1 pt-0.5 text-[10px]">
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onClick={() =>
+                        patchQuality({
+                          pbrEnhanced: !rq.pbrEnhanced,
+                          pbrReliefDepth: !rq.pbrEnhanced && (rq.pbrReliefDepth ?? 0) < 0.2 ? 1.15 : rq.pbrReliefDepth,
+                        })
+                      }
+                      className={`py-1 px-2 rounded-xs border text-left cursor-pointer transition-colors ${
+                        rq.pbrEnhanced
+                          ? 'border-emerald-500/70 bg-emerald-950/40 text-emerald-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      PBR 子体素凹凸: {rq.pbrEnhanced ? '开' : '关'}
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onClick={() =>
+                        patchQuality({
+                          volumetricFog: !(rq.volumetricFog && rq.atmoScattering),
+                          atmoScattering: !(rq.volumetricFog && rq.atmoScattering),
+                        })
+                      }
+                      className={`py-1 px-2 rounded-xs border text-left cursor-pointer transition-colors ${
+                        rq.volumetricFog || rq.atmoScattering
+                          ? 'border-sky-500/70 bg-sky-950/40 text-sky-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      体积雾 &amp; 散射: {rq.volumetricFog || rq.atmoScattering ? '开' : '关'}
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onClick={() => patchQuality({ aoEnabled: !rq.aoEnabled })}
+                      className={`py-1 px-2 rounded-xs border text-left cursor-pointer transition-colors ${
+                        rq.aoEnabled
+                          ? 'border-indigo-500/70 bg-indigo-950/40 text-indigo-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      GTAO 遮蔽: {rq.aoEnabled ? '开' : '关'}
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onClick={() => patchQuality({ bloomEnabled: !rq.bloomEnabled })}
+                      className={`py-1 px-2 rounded-xs border text-left cursor-pointer transition-colors ${
+                        rq.bloomEnabled
+                          ? 'border-amber-500/70 bg-amber-950/40 text-amber-200'
+                          : 'border-slate-800 bg-[#090d18] text-slate-400'
+                      }`}
+                    >
+                      HDR 泛光: {rq.bloomEnabled ? '开' : '关'}
+                    </button>
+                  </div>
+
+                  {/* Sub-Voxel Protrusion Relief Strength */}
+                  {rq.pbrEnhanced && (
+                    <label className="block space-y-0.5 pt-1 border-t border-slate-800/80 text-[10px]">
+                      <div className="flex justify-between text-slate-300">
+                        <span>子体素 3D 突起深度 (POM + 自阴影)</span>
+                        <span className="font-mono-tabular text-emerald-300">
+                          {(rq.pbrReliefDepth ?? 1.15).toFixed(2)}×
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0.2}
+                        max={2.0}
+                        step={0.05}
+                        value={rq.pbrReliefDepth ?? 1.15}
+                        onChange={(e) =>
+                          patchQuality({ pbrReliefDepth: Number(e.target.value) })
+                        }
+                        className="w-full accent-emerald-400 cursor-pointer"
+                      />
+                    </label>
+                  )}
                 </div>
-                <div className="text-[10px] text-slate-500">
-                  {telemetry.frameTimeMs.toFixed(1)} ms
-                </div>
-              </div>
-              <div className="rounded-xs border border-slate-800 bg-[#0d1322] p-2">
-                <div className="text-[10px] text-slate-400">地形三角面</div>
-                <div className="text-sm font-semibold text-white mt-0.5">
-                  {totalTriangles.toLocaleString()}
-                </div>
-                <div className="text-[10px] text-slate-500">
-                  {telemetry.activeChunks} 活跃分块
-                </div>
-              </div>
-              <div className="rounded-xs border border-slate-800 bg-[#0d1322] p-2">
-                <div className="text-[10px] text-slate-400">SPH 物理步</div>
-                <div className="text-sm font-semibold text-cyan-300 mt-0.5">
-                  {telemetry.simStepMs.toFixed(1)} ms
-                </div>
-                <div className="text-[10px] text-slate-500">
-                  {config.simPaused ? '已暂停' : telemetry.backend}
-                </div>
-              </div>
-            </div>
+              );
+            })()}
 
             {/* LOD Chunk Distribution */}
             <div className="rounded-xs border border-slate-800 bg-[#0d1322] p-2.5 space-y-2">
               <div className="flex items-center justify-between text-[11px]">
                 <span className="font-semibold text-slate-200">
-                  分块 LOD 分布 (共 {voxelStats.totalChunks} 块)
+                  分块 LOD (活跃 {telemetry.activeChunks} / {voxelStats.totalChunks} · {totalTriangles.toLocaleString()} 面)
                 </span>
                 <span className="font-mono-tabular text-slate-400">
                   {config.lodMode === 'auto'

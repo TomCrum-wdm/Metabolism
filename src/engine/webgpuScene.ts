@@ -102,8 +102,12 @@ import {
 } from './toolRegistry';
 import { dirToLonLat, lonLatToDir } from './cartography';
 import {
+  clampPlayerScale,
+  computeCharacterScaleMetrics,
   computeDetailCameraOptics,
+  computeFirstPersonEyePose,
   computeSafeClipPlanes,
+  DEFAULT_PLAYER_SCALE,
   DetailCameraOptics,
   evaluateLandingDescentPose,
   resolveSphericalCoreUp,
@@ -159,6 +163,7 @@ function clamp(v: number, lo: number, hi: number): number {
 
 export type CameraMode =
   | 'explorer'
+  | 'firstPerson'
   | 'orbit'
   | 'detail'
   | 'fps'
@@ -230,6 +235,7 @@ export interface SandboxConfig {
   showGravityVectors: boolean;
   cameraMode: CameraMode;
   perspectiveFov: number;
+  playerScale: number;
   muted: boolean;
   simPaused: boolean;
   lodMode: LodMode;
@@ -409,11 +415,12 @@ export class PlanetarySandboxEngine {
   private walkPhase = 0;
   private squashY = 1.0;
 
-  // Camera states (Explorer / Orbit / Detail / FPS / Landing / Perspective)
+  // Camera states (Explorer / First-Person / Orbit / Detail / FPS / Landing / Perspective)
   private explorerCamFwd = new THREE.Vector3(0, 0, -1);
   private explorerCamAnchor = new THREE.Vector3(0, DEFAULT_PLANET_RADIUS, 0);
   private camPitch = 0.36;
-  private camDistance = 9.0;
+  private firstPersonPitch = 0.08;
+  private camDistance = 9.0 * DEFAULT_PLAYER_SCALE;
   private orbitYaw = 0.52;
   private orbitPitch = 0.46;
   private orbitDistance = 30.5;
@@ -673,6 +680,7 @@ export class PlanetarySandboxEngine {
     showGravityVectors: false,
     cameraMode: 'explorer',
     perspectiveFov: 55,
+    playerScale: DEFAULT_PLAYER_SCALE,
     muted: false,
     simPaused: false,
     lodMode: 'auto',
@@ -746,6 +754,15 @@ export class PlanetarySandboxEngine {
 
   private getPlanetScale(): number {
     return Math.max(this.planet.baseRadius / 13.0, 0.005);
+  }
+
+  private getPlayerMetrics() {
+    return computeCharacterScaleMetrics(
+      this.getPlanetScale(),
+      this.config.playerScale,
+      this.config.gravityScale,
+      this.planet.nativeVoxelSize,
+    );
   }
 
   private ensureMacroChunkCapacity(): void {
@@ -833,7 +850,7 @@ export class PlanetarySandboxEngine {
       this.rimLight.position.set(-28 * scale, -12 * scale, -26 * scale);
     }
     this.orbitDistance = 30.5 * scale;
-    this.camDistance = 9.0 * scale;
+    this.camDistance = this.getPlayerMetrics().defaultExplorerCamDist;
     this.fpsSpeed = 12.0 * scale;
     this.detailViewDist = 14.0 * scale;
     this.landingOrbitDist = 30.5 * scale;
@@ -1692,6 +1709,31 @@ export class PlanetarySandboxEngine {
         fy = this.playerPos.y / pLen;
         fz = this.playerPos.z / pLen;
       }
+    } else if (this.config.cameraMode === 'firstPerson' && (this.phase === 'playing' || this.isGenerating)) {
+      if (this.camera) {
+        this.camera.getWorldDirection(this._v1);
+        const fpHit = this.planet.raycastTerrain(
+          this.camera.position.x,
+          this.camera.position.y,
+          this.camera.position.z,
+          this._v1.x,
+          this._v1.y,
+          this._v1.z,
+          this.planet.worldHalf * 3.0,
+        );
+        if (fpHit.hit) {
+          this.lastHighResFocus.set(fpHit.x, fpHit.y, fpHit.z);
+          useExplicitFocus = true;
+        }
+      }
+      if (!useExplicitFocus) {
+        const pLen = this.playerPos.length();
+        if (pLen > 1e-4) {
+          fx = this.playerPos.x / pLen;
+          fy = this.playerPos.y / pLen;
+          fz = this.playerPos.z / pLen;
+        }
+      }
     } else if (this.config.cameraMode === 'orbit' && (this.phase === 'playing' || this.isGenerating)) {
       const cosP = Math.cos(this.orbitPitch);
       fx = cosP * Math.cos(this.orbitYaw);
@@ -2206,7 +2248,8 @@ export class PlanetarySandboxEngine {
     this.playerRightArm.castShadow = true;
     this.playerGroup.add(this.playerRightArm);
 
-    this.playerGroup.visible = this.phase !== 'title';
+    this.playerGroup.visible =
+      this.hasWorld && this.phase !== 'title' && this.config.cameraMode !== 'firstPerson';
     this.scene.add(this.playerGroup);
   }
 
@@ -3345,9 +3388,10 @@ export class PlanetarySandboxEngine {
     this.playerFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
     this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
 
-    const scale = this.getPlanetScale();
-    this.camPitch = 0.36;
-    this.camDistance = 9.0 * scale;
+    const metrics = this.getPlayerMetrics();
+    this.camPitch = 0.24;
+    this.firstPersonPitch = 0.08;
+    this.camDistance = metrics.defaultExplorerCamDist;
     const initBasis = transportCameraForwardOnSphere(
       [this.playerUp.x, this.playerUp.y, this.playerUp.z],
       [this.playerFwd.x, this.playerFwd.y, this.playerFwd.z],
@@ -3361,12 +3405,12 @@ export class PlanetarySandboxEngine {
     this.explorerCamAnchor.copy(this.playerPos);
 
     const horiz = Math.cos(this.camPitch) * this.camDistance;
-    const vert = Math.sin(this.camPitch) * this.camDistance + 2.2 * scale;
+    const vert = Math.sin(this.camPitch) * this.camDistance + metrics.shoulderLift;
     this.camPosSmooth
       .copy(this.playerPos)
       .addScaledVector(this.playerUp, vert)
       .addScaledVector(this.explorerCamFwd, -horiz);
-    this.camLookSmooth.copy(this.playerPos).addScaledVector(this.playerUp, 1.25 * scale);
+    this.camLookSmooth.copy(this.playerPos).addScaledVector(this.playerUp, metrics.lookLift);
     if (this.camera) {
       this.camera.position.copy(this.camPosSmooth);
       this.camera.up.copy(this.playerUp);
@@ -3947,7 +3991,8 @@ export class PlanetarySandboxEngine {
   public setPhase(phase: GamePhase): void {
     this.phase = phase;
     if (this.playerGroup) {
-      this.playerGroup.visible = this.hasWorld && phase !== 'title';
+      this.playerGroup.visible =
+        this.hasWorld && phase !== 'title' && this.config.cameraMode !== 'firstPerson';
     }
     if (phase !== 'playing') {
       this.keys.clear();
@@ -4082,7 +4127,8 @@ export class PlanetarySandboxEngine {
       this.orbitPitch = clamp(latRad, -1.35, 1.35);
     }
 
-    const spawnR = surfR + 0.85 * scale;
+    const metrics = this.getPlayerMetrics();
+    const spawnR = surfR + Math.max(metrics.footRadius * 2.2, 0.25 * scale);
     this.playerPos.set(dx * spawnR, dy * spawnR, dz * spawnR);
     this.playerVel.set(0, 0, 0);
     parallelTransportTangentFrame(
@@ -4125,9 +4171,16 @@ export class PlanetarySandboxEngine {
     const prevLod0Dist = this.config.lod0Dist;
     const prevLod1Dist = this.config.lod1Dist;
 
+    const prevPlayerScale = clampPlayerScale(this.config.playerScale);
+    const nextPlayerScale =
+      partial.playerScale !== undefined
+        ? clampPlayerScale(partial.playerScale)
+        : prevPlayerScale;
+
     this.config = {
       ...this.config,
       ...partial,
+      playerScale: nextPlayerScale,
       atmosphere: partial.atmosphere
         ? { ...this.config.atmosphere, ...partial.atmosphere }
         : this.config.atmosphere,
@@ -4139,6 +4192,31 @@ export class PlanetarySandboxEngine {
         : this.config.renderQuality,
     };
     this.sound.setMuted(this.config.muted);
+
+    if (partial.playerScale !== undefined && Math.abs(nextPlayerScale - prevPlayerScale) > 1e-4) {
+      const nextMetrics = this.getPlayerMetrics();
+      const ratio = nextPlayerScale / Math.max(prevPlayerScale, 0.01);
+      this.camDistance = clamp(
+        this.camDistance * ratio,
+        nextMetrics.minExplorerCamDist,
+        nextMetrics.maxExplorerCamDist,
+      );
+      if (this.hasWorld) {
+        const dFoot = this.planet.sampleDensityAndNormal(
+          this.playerPos.x,
+          this.playerPos.y,
+          this.playerPos.z,
+          this._normalArr,
+        );
+        if (dFoot > -nextMetrics.footRadius) {
+          const pen = dFoot + nextMetrics.footRadius;
+          this.playerPos.x += this._normalArr[0] * pen;
+          this.playerPos.y += this._normalArr[1] * pen;
+          this.playerPos.z += this._normalArr[2] * pen;
+        }
+        this.syncPlayerTransform();
+      }
+    }
 
     if (prevCamMode !== this.config.cameraMode) {
       this.isSculpting = false;
@@ -4153,9 +4231,9 @@ export class PlanetarySandboxEngine {
         this.initLandingCamera();
       } else if (this.config.cameraMode === 'perspective') {
         this.initPerspectiveCamera();
-      } else if (this.config.cameraMode === 'explorer') {
+      } else if (this.config.cameraMode === 'explorer' || this.config.cameraMode === 'firstPerson') {
         this.explorerCamAnchor.copy(this.playerPos);
-        if (this.camera) {
+        if (prevCamMode !== 'explorer' && prevCamMode !== 'firstPerson' && this.camera) {
           this.camera.getWorldDirection(this._v1);
           const basis = transportCameraForwardOnSphere(
             [this.playerUp.x, this.playerUp.y, this.playerUp.z],
@@ -4163,7 +4241,20 @@ export class PlanetarySandboxEngine {
             0,
           );
           this.explorerCamFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
+          if (this.config.cameraMode === 'firstPerson') {
+            this.firstPersonPitch = clamp(
+              Math.asin(clamp(this._v1.dot(this.playerUp), -0.92, 0.96)),
+              -1.42,
+              1.48,
+            );
+          }
+        } else if (this.config.cameraMode === 'firstPerson' && prevCamMode === 'explorer') {
+          this.firstPersonPitch = 0.08;
         }
+      }
+      if (this.playerGroup) {
+        this.playerGroup.visible =
+          this.hasWorld && this.phase !== 'title' && this.config.cameraMode !== 'firstPerson';
       }
       if (this.camera && this.config.cameraMode !== 'detail' && this.config.cameraMode !== 'perspective') {
         this.camera.fov = 52;
@@ -4287,7 +4378,7 @@ export class PlanetarySandboxEngine {
 
   public triggerVirtualJump(): void {
     if (this.phase !== 'playing') return;
-    if (this.config.cameraMode === 'explorer') {
+    if (this.config.cameraMode === 'explorer' || this.config.cameraMode === 'firstPerson') {
       this.jumpQueued = true;
     } else if (this.config.cameraMode === 'landing' && this.landingStage === 'landed') {
       this.landingJumpQueued = true;
@@ -5757,7 +5848,7 @@ export class PlanetarySandboxEngine {
     const code = e.code;
     this.keys.add(code);
     if (code === 'Space' && !e.repeat) {
-      if (this.config.cameraMode === 'explorer') {
+      if (this.config.cameraMode === 'explorer' || this.config.cameraMode === 'firstPerson') {
         this.jumpQueued = true;
       } else if (this.config.cameraMode === 'landing' && this.landingStage === 'landed') {
         this.landingJumpQueued = true;
@@ -5795,9 +5886,16 @@ export class PlanetarySandboxEngine {
     const scale = this.getPlanetScale();
     const minBlockSpan = Math.max(1e-8 * scale, this.planet.nativeVoxelSize * 6);
     if (this.config.cameraMode === 'explorer') {
-      const minDist = Math.min(2.0 * scale, minBlockSpan);
+      const metrics = this.getPlayerMetrics();
       const factor = Math.exp(delta * 0.1);
-      this.camDistance = clamp(this.camDistance * factor, minDist, 45.0 * scale);
+      this.camDistance = clamp(
+        this.camDistance * factor,
+        metrics.minExplorerCamDist,
+        metrics.maxExplorerCamDist,
+      );
+    } else if (this.config.cameraMode === 'firstPerson') {
+      // Wheel pitch nudge or stride comfort in first-person
+      this.firstPersonPitch = clamp(this.firstPersonPitch - delta * 0.04, -1.42, 1.48);
     } else if (this.config.cameraMode === 'orbit') {
       const cosP = Math.cos(this.orbitPitch);
       const surfR = this.planet.findSurfaceRadiusAlongRay(
@@ -6040,7 +6138,15 @@ export class PlanetarySandboxEngine {
           -dx * 0.0055,
         );
         this.explorerCamFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
-        this.camPitch = clamp(this.camPitch + dy * 0.005, -0.35, 1.32);
+        this.camPitch = clamp(this.camPitch + dy * 0.005, -0.45, 1.32);
+      } else if (this.config.cameraMode === 'firstPerson') {
+        const rot = transportCameraForwardOnSphere(
+          [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+          [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+          -dx * 0.0046,
+        );
+        this.explorerCamFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
+        this.firstPersonPitch = clamp(this.firstPersonPitch - dy * 0.0046, -1.42, 1.48);
       } else if (this.config.cameraMode === 'orbit') {
         this.orbitYaw -= dx * 0.0055;
         this.orbitPitch = clamp(this.orbitPitch + dy * 0.005, -1.35, 1.35);
@@ -6215,7 +6321,11 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    if (this.config.cameraMode !== 'explorer' && this.playerGroup?.visible) {
+    if (
+      this.config.cameraMode !== 'explorer' &&
+      this.config.cameraMode !== 'firstPerson' &&
+      this.playerGroup?.visible
+    ) {
       computeRayPointDistanceSq(
         ox, oy, oz, dx, dy, dz,
         this.playerPos.x, this.playerPos.y, this.playerPos.z,
@@ -6314,7 +6424,11 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    if (this.config.cameraMode !== 'explorer' && this.playerGroup?.visible) {
+    if (
+      this.config.cameraMode !== 'explorer' &&
+      this.config.cameraMode !== 'firstPerson' &&
+      this.playerGroup?.visible
+    ) {
       const pDist = Math.hypot(
         this.playerPos.x - pickX,
         this.playerPos.y - pickY,
@@ -7243,6 +7357,7 @@ export class PlanetarySandboxEngine {
   private updateExplorerPhysics(dt: number): void {
     const params = this.getGravityParams();
     const scale = this.getPlanetScale();
+    const metrics = this.getPlayerMetrics();
     const coreGuardR = this.planet.baseRadius * 0.08;
 
     const guardedUp = resolveSphericalCoreUp(
@@ -7292,6 +7407,8 @@ export class PlanetarySandboxEngine {
       const len = this._v3.length();
       if (len > 1) this._v3.divideScalar(len);
       this.playerFwd.lerp(this._v3, 1 - Math.exp(-12 * dt)).normalize();
+    } else if (this.config.cameraMode === 'firstPerson') {
+      this.playerFwd.copy(this._v1);
     }
 
     computeGravityVector(
@@ -7306,8 +7423,7 @@ export class PlanetarySandboxEngine {
     this.playerVel.z += this._grav.z * dt;
 
     if (this.jumpQueued && this.playerGrounded) {
-      const jumpSpeed = 7.4 * Math.sqrt(Math.max(0.05, this.config.gravityScale * scale));
-      this.playerVel.addScaledVector(this.playerUp, jumpSpeed);
+      this.playerVel.addScaledVector(this.playerUp, metrics.jumpSpeed);
       this.playerGrounded = false;
       this.squashY = 1.24;
       this.sound.playJump();
@@ -7315,20 +7431,19 @@ export class PlanetarySandboxEngine {
     this.jumpQueued = false;
 
     if (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') || this.virtualUp) {
-      const thrust = (EARTH_SURFACE_GRAVITY * this.config.gravityScale + 7.5) * scale * dt;
-      this.playerVel.addScaledVector(this.playerUp, thrust);
+      this.playerVel.addScaledVector(this.playerUp, metrics.jetpackThrust * dt);
       this.playerGrounded = false;
     }
 
     const radialSpeed = this.playerVel.dot(this.playerUp);
     this._v4.copy(this.playerVel).addScaledVector(this.playerUp, -radialSpeed);
-    const maxWalkSpeed = 6.2 * scale;
+    const maxWalkSpeed = metrics.walkSpeed;
     if (hasMove) {
       this._v4.lerp(
         this._v3.multiplyScalar(maxWalkSpeed),
         1 - Math.exp(-(this.playerGrounded ? 14 : 5) * dt),
       );
-      this.walkPhase += (this._v4.length() / Math.max(scale, 0.05)) * dt * 2.2;
+      this.walkPhase += (this._v4.length() / Math.max(metrics.charScale, 0.02)) * dt * 2.2;
     } else if (this.playerGrounded) {
       this._v4.multiplyScalar(Math.exp(-12 * dt));
     }
@@ -7350,7 +7465,7 @@ export class PlanetarySandboxEngine {
 
     const wasGrounded = this.playerGrounded;
     this.playerGrounded = false;
-    const footRadius = 0.36 * scale;
+    const footRadius = metrics.footRadius;
     const dFoot = this.planet.sampleDensityAndNormal(
       this.playerPos.x,
       this.playerPos.y,
@@ -7370,7 +7485,7 @@ export class PlanetarySandboxEngine {
       const vn = this.playerVel.dot(this._v1);
       if (vn < 0) {
         this.playerVel.addScaledVector(this._v1, -vn);
-        if (!wasGrounded && vn < -2.2 * Math.sqrt(scale)) {
+        if (!wasGrounded && vn < -2.2 * Math.sqrt(Math.max(metrics.charScale, 0.05))) {
           this.squashY = 0.78;
         }
       }
@@ -7384,8 +7499,11 @@ export class PlanetarySandboxEngine {
   }
 
   private syncPlayerTransform(): void {
-    const scale = this.getPlanetScale();
+    const metrics = this.getPlayerMetrics();
+    const charScale = metrics.charScale;
     this.playerGroup.position.copy(this.playerPos);
+    this.playerGroup.visible =
+      this.hasWorld && this.phase !== 'title' && this.config.cameraMode !== 'firstPerson';
 
     this._v1.crossVectors(this.playerFwd, this.playerUp).normalize();
     this._v2.crossVectors(this.playerUp, this._v1).normalize();
@@ -7393,7 +7511,11 @@ export class PlanetarySandboxEngine {
     this.playerGroup.quaternion.setFromRotationMatrix(this._m4);
 
     const invSq = 1 / Math.sqrt(Math.max(0.5, this.squashY));
-    this.playerGroup.scale.set(invSq * scale, this.squashY * scale, invSq * scale);
+    this.playerGroup.scale.set(
+      invSq * charScale,
+      this.squashY * charScale,
+      invSq * charScale,
+    );
 
     const swing = this.playerGrounded ? Math.sin(this.walkPhase) * 0.45 : 0.2;
     this.playerLeftLeg.rotation.x = swing;
@@ -7894,6 +8016,13 @@ export class PlanetarySandboxEngine {
       return;
     }
 
+    if (this.config.cameraMode === 'firstPerson') {
+      this.updateFirstPersonCamera(dt);
+      return;
+    }
+
+    const metrics = this.getPlayerMetrics();
+    const charScale = metrics.charScale;
     const up = this.playerUp;
     const radAlpha = 1 - Math.exp(-9.5 * dt);
     const tanAlpha = 1 - Math.exp(-22 * dt);
@@ -7913,18 +8042,18 @@ export class PlanetarySandboxEngine {
     );
     this.explorerCamFwd.set(expBasis.forward[0], expBasis.forward[1], expBasis.forward[2]);
 
-    const lookLift = Math.min(
-      1.25 * scale,
-      Math.max(this.planet.nativeVoxelSize * 2.0, this.camDistance * 0.2),
+    const lookLift = Math.max(
+      this.planet.nativeVoxelSize * 1.4,
+      Math.min(metrics.lookLift, this.camDistance * 0.24),
     );
     const desiredLook = this._v1
       .copy(this.explorerCamAnchor)
       .addScaledVector(up, lookLift);
 
     const cosP = Math.cos(this.camPitch);
-    const shoulderLift = Math.min(
-      1.4 * scale,
-      Math.max(this.planet.nativeVoxelSize * 1.2, this.camDistance * 0.14),
+    const shoulderLift = Math.max(
+      this.planet.nativeVoxelSize * 1.0,
+      Math.min(metrics.shoulderLift, this.camDistance * 0.16),
     );
     const camOffsetDir = this._v2
       .copy(this.explorerCamFwd)
@@ -7944,7 +8073,7 @@ export class PlanetarySandboxEngine {
     );
     if (occHit.hit && occHit.distance < safeCamDist) {
       safeCamDist = Math.max(
-        Math.min(1.8 * scale, this.camDistance * 0.45),
+        Math.min(1.5 * charScale, this.camDistance * 0.45),
         occHit.distance * 0.84,
       );
     }
@@ -7954,7 +8083,7 @@ export class PlanetarySandboxEngine {
       .addScaledVector(camOffsetDir, safeCamDist)
       .addScaledVector(up, shoulderLift);
 
-    const minClear = Math.max(this.planet.nativeVoxelSize * 2.5, 0.28 * scale);
+    const minClear = Math.max(this.planet.nativeVoxelSize * 1.8, 0.16 * charScale);
     const dCam = this.planet.sampleDensityAndNormal(
       desiredPos.x,
       desiredPos.y,
@@ -7974,6 +8103,63 @@ export class PlanetarySandboxEngine {
 
     this.camera.position.copy(this.camPosSmooth);
     this.camera.up.lerp(up, 1 - Math.exp(-11 * dt)).normalize();
+    this.camera.lookAt(this.camLookSmooth);
+  }
+
+  private updateFirstPersonCamera(dt: number): void {
+    const metrics = this.getPlayerMetrics();
+    const up = this.playerUp;
+    const radAlpha = 1 - Math.exp(-14 * dt);
+    const tanAlpha = 1 - Math.exp(-28 * dt);
+    const stabilized = stabilizeRadialAnchor(
+      [this.explorerCamAnchor.x, this.explorerCamAnchor.y, this.explorerCamAnchor.z],
+      [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+      [up.x, up.y, up.z],
+      radAlpha,
+      tanAlpha,
+    );
+    this.explorerCamAnchor.set(stabilized[0], stabilized[1], stabilized[2]);
+
+    const expBasis = transportCameraForwardOnSphere(
+      [up.x, up.y, up.z],
+      [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+      0,
+    );
+    this.explorerCamFwd.set(expBasis.forward[0], expBasis.forward[1], expBasis.forward[2]);
+
+    const eyePose = computeFirstPersonEyePose(
+      [this.explorerCamAnchor.x, this.explorerCamAnchor.y, this.explorerCamAnchor.z],
+      [up.x, up.y, up.z],
+      [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+      this.firstPersonPitch,
+      metrics.eyeHeight,
+    );
+
+    const desiredEye = this._v4.set(eyePose.eyePos[0], eyePose.eyePos[1], eyePose.eyePos[2]);
+    const minClear = Math.max(this.planet.nativeVoxelSize * 0.9, 0.08 * metrics.charScale);
+    const dCam = this.planet.sampleDensityAndNormal(
+      desiredEye.x,
+      desiredEye.y,
+      desiredEye.z,
+      this._normalArr,
+    );
+    if (dCam > -minClear) {
+      const push = dCam + minClear;
+      desiredEye.x += this._normalArr[0] * push;
+      desiredEye.y += this._normalArr[1] * push;
+      desiredEye.z += this._normalArr[2] * push;
+    }
+
+    const posDamp = 1 - Math.exp(-26 * dt);
+    const lookDamp = 1 - Math.exp(-28 * dt);
+    this.camPosSmooth.lerp(desiredEye, posDamp);
+    this._v1
+      .copy(desiredEye)
+      .add(this._v2.set(eyePose.lookDir[0], eyePose.lookDir[1], eyePose.lookDir[2]));
+    this.camLookSmooth.lerp(this._v1, lookDamp);
+
+    this.camera.position.copy(this.camPosSmooth);
+    this.camera.up.lerp(up, 1 - Math.exp(-14 * dt)).normalize();
     this.camera.lookAt(this.camLookSmooth);
   }
 
@@ -8059,7 +8245,10 @@ export class PlanetarySandboxEngine {
         loadRatioSum: 0,
         peakSpeedMs: 0,
       };
-      if (simActive && this.config.cameraMode === 'explorer') {
+      if (
+        simActive &&
+        (this.config.cameraMode === 'explorer' || this.config.cameraMode === 'firstPerson')
+      ) {
         this.updateExplorerPhysics(dt);
       } else if (
         simActive &&
@@ -8250,16 +8439,27 @@ export class PlanetarySandboxEngine {
 
     this.syncLaserBeamVisuals();
 
-    if (this.planet.isHighResStreaming || this.config.cameraMode === 'detail') {
+    if (
+      this.planet.isHighResStreaming ||
+      this.config.cameraMode === 'detail' ||
+      this.config.cameraMode === 'firstPerson' ||
+      this.config.cameraMode === 'explorer'
+    ) {
       const camR = this.camera.position.length();
       const surfDist = Math.max(
         this.planet.nativeVoxelSize * 0.25,
         Math.abs(camR - this.planet.baseRadius),
       );
-      const focusDist = Math.max(
-        this.planet.nativeVoxelSize * 0.5,
-        this.camera.position.distanceTo(this.lastHighResFocus),
-      );
+      const focusDist =
+        this.config.cameraMode === 'firstPerson'
+          ? Math.max(
+              this.planet.nativeVoxelSize * 0.5,
+              this.getPlayerMetrics().eyeHeight * 0.65,
+            )
+          : Math.max(
+              this.planet.nativeVoxelSize * 0.5,
+              this.camera.position.distanceTo(this.lastHighResFocus),
+            );
       const safeClips = computeSafeClipPlanes(
         surfDist,
         focusDist,

@@ -41,6 +41,7 @@ export interface StoredUserPrefs {
   lod1Dist?: number;
   touchEnabled?: boolean;
   perspectiveFov?: number;
+  playerScale?: number;
 }
 
 function openDb(): Promise<IDBDatabase> {

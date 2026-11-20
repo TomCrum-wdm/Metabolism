@@ -70,9 +70,11 @@ import {
   OfflineQualityOverride,
   ShadowQualityLevel,
 } from './engine/renderQuality';
+import { clampPlayerScale, DEFAULT_PLAYER_SCALE } from './engine/cameraMath';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
-  explorer: 'orbit',
+  explorer: 'firstPerson',
+  firstPerson: 'orbit',
   orbit: 'detail',
   detail: 'fps',
   fps: 'landing',
@@ -130,6 +132,7 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     showGravityVectors: false,
     cameraMode: 'explorer',
     perspectiveFov: prefs.perspectiveFov ?? 55,
+    playerScale: clampPlayerScale(prefs.playerScale ?? DEFAULT_PLAYER_SCALE),
     muted: false,
     simPaused: false,
     lodMode: prefs.lodMode ?? 'auto',
@@ -403,6 +406,7 @@ export default function App() {
       lod1Dist: config.lod1Dist,
       touchEnabled,
       perspectiveFov: config.perspectiveFov,
+      playerScale: config.playerScale,
     });
   }, [
     autoSaveEnabled,
@@ -414,6 +418,7 @@ export default function App() {
     config.lod0Dist,
     config.lod1Dist,
     config.perspectiveFov,
+    config.playerScale,
   ]);
 
   // Periodic IndexedDB autosave + tab-handoff snapshot refresh during active gameplay

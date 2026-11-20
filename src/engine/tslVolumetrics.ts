@@ -11,7 +11,6 @@ import {
   cameraWorldMatrix,
   clamp as tslClamp,
   cos,
-  cross,
   dot,
   exp,
   float,
@@ -26,12 +25,13 @@ import {
   max,
   min,
   mix,
-  normalLocal,
   normalWorld,
+  normalWorldGeometry,
   normalize,
   pow,
   positionWorld,
   screenUV,
+  select,
   sin,
   smoothstep,
   sqrt,
@@ -65,145 +65,158 @@ export interface TerrainSubVoxelPbrBundle {
 }
 
 /**
- * Deterministic multi-tiered sub-voxel heightfield generator in [0, 1].
- * Combines bold raised sub-voxel pillars/blocks with deep chamfered crevices,
- * nested 2x2 micro-studs, and material-aware morphology (crystalline facets vs stone masonry vs organic clods).
+ * Reusable TSL function: deterministic sub-voxel heightfield generator in [0, 1].
+ * Strictly hashes integer cell IDs (zero intra-cell hash chatter) and uses smoothstep chamfered
+ * block bevels plus closeup-only 2x2 micro-caps gated by analytical footprint detailFade.
  */
-function sampleSubVoxelHeightfield(
-  coord: THREE.Node<'vec2'>,
-  worldSeed: THREE.Node<'float'>,
-  roughMat: THREE.Node<'float'>,
-  glowMat: THREE.Node<'float'>,
-): THREE.Node<'float'> {
-  // Tier 1: Primary protruding sub-voxel blocks
-  const id1 = floor(coord);
-  const f1 = fract(coord);
-  const h1 = fract(
-    sin(dot(id1, vec2(127.1, 311.7)).add(worldSeed.mul(17.3))).mul(43758.5453),
-  );
-  const h2 = fract(
-    sin(dot(id1, vec2(269.5, 183.3)).add(worldSeed.mul(9.1))).mul(29431.71),
-  );
+const sampleSubVoxelHeightfieldFn = Fn(
+  ([coord, tileShift, roughMat, glowMat, detailFade]: [
+    THREE.Node<'vec2'>,
+    THREE.Node<'vec2'>,
+    THREE.Node<'float'>,
+    THREE.Node<'float'>,
+    THREE.Node<'float'>,
+  ]) => {
+    // Tier 1: Primary protruding sub-voxel blocks (strictly constant height per integer cell)
+    const id1 = floor(coord).add(tileShift);
+    const f1 = fract(coord);
+    const h1 = fract(sin(dot(id1, vec2(127.1, 311.7))).mul(43758.5453));
+    const h2 = fract(sin(dot(id1, vec2(269.5, 183.3))).mul(29431.71));
 
-  // Strong binary terrace separation so protruding sub-voxels stand out boldly above recessed seams
-  const isProtruding = step(0.36, h1);
-  const pillarTop = mix(
-    float(0.10).add(h2.mul(0.24)),
-    float(0.58).add(h1.mul(0.42)),
-    isProtruding,
-  );
+    // Crisp terrace separation so protruding blocks stand cleanly above recessed seams
+    const isProtruding = step(0.38, h1);
+    const pillarTop = mix(
+      float(0.14).add(h2.mul(0.20)),
+      float(0.62).add(h1.mul(0.38)),
+      isProtruding,
+    );
 
-  const dEdge = min(
-    min(f1.x, float(1.0).sub(f1.x)),
-    min(f1.y, float(1.0).sub(f1.y)),
-  );
-  // Crystal uses steeper faceted pyramid bevels; stone/basalt uses sharp chamfered block steps
-  const crystalFactor = smoothstep(0.2, 0.55, glowMat);
-  const organicFactor = smoothstep(0.85, 0.90, roughMat).mul(float(1.0).sub(crystalFactor));
-  const bevelW = mix(float(0.13), float(0.34), crystalFactor).add(organicFactor.mul(0.08));
+    const dEdge = min(
+      min(f1.x, float(1.0).sub(f1.x)),
+      min(f1.y, float(1.0).sub(f1.y)),
+    );
+    // Crystal uses faceted pyramid bevels; stone/basalt uses clean chamfered architectural steps
+    const crystalFactor = smoothstep(0.2, 0.55, glowMat);
+    const organicFactor = smoothstep(0.85, 0.90, roughMat).mul(float(1.0).sub(crystalFactor));
+    const bevelW = mix(float(0.17), float(0.34), crystalFactor).add(organicFactor.mul(0.07));
 
-  const rimMask = smoothstep(0.032, bevelW, dEdge);
-  const crown = smoothstep(0.10, 0.48, dEdge).mul(
-    mix(float(0.07), float(0.26), crystalFactor),
-  );
-  const tier1 = pillarTop.mul(rimMask).add(crown.mul(isProtruding));
+    const rimMask = smoothstep(0.045, bevelW, dEdge);
+    const crown = smoothstep(0.14, 0.48, dEdge).mul(
+      mix(float(0.05), float(0.22), crystalFactor),
+    );
+    const tier1 = pillarTop.mul(rimMask).add(crown.mul(isProtruding));
 
-  // Tier 2: Nested 2x2 micro sub-voxel studs on top of blocks
-  const coord2 = coord.mul(2.0).add(vec2(3.17, 7.43));
-  const id2 = floor(coord2);
-  const f2 = fract(coord2);
-  const hMicro = fract(
-    sin(dot(id2, vec2(113.5, 271.9)).add(worldSeed.mul(5.7))).mul(19384.23),
-  );
-  const dEdge2 = min(
-    min(f2.x, float(1.0).sub(f2.x)),
-    min(f2.y, float(1.0).sub(f2.y)),
-  );
-  const studMask = smoothstep(0.055, 0.21, dEdge2);
-  const tier2 = studMask.mul(step(0.44, hMicro)).mul(0.22).add(studMask.mul(hMicro).mul(0.08));
+    // Tier 2: Closeup-only nested 2x2 micro-caps (faded smoothly before Nyquist aliasing)
+    const coord2 = coord.mul(2.0).add(vec2(3.0, 7.0));
+    const id2 = floor(coord2).add(tileShift.mul(2.0));
+    const f2 = fract(coord2);
+    const hMicro = fract(sin(dot(id2, vec2(113.5, 271.9))).mul(19384.23));
+    const dEdge2 = min(
+      min(f2.x, float(1.0).sub(f2.x)),
+      min(f2.y, float(1.0).sub(f2.y)),
+    );
+    const studMask = smoothstep(0.075, 0.24, dEdge2);
+    const tier2 = studMask.mul(step(0.48, hMicro)).mul(0.16).mul(detailFade);
 
-  // Tier 3: Fine rocky grain on plateaus
-  const grain = sin(coord.x.mul(18.85)).mul(cos(coord.y.mul(18.85))).mul(0.025).mul(rimMask);
-
-  return tslClamp(tier1.mul(0.80).add(tier2).add(grain), 0.0, 1.0);
-}
+    return tslClamp(tier1.mul(0.84).add(tier2), 0.0, 1.0);
+  },
+);
 
 /**
- * Computes consistent tangent axes (T, B) and dual-mode (blocky face UV vs distance-adaptive triplanar)
- * sub-voxel projection for the fragment.
+ * Reusable TSL function: evaluates height at deltaCoord in either blocky 4x4 mode or
+ * dual-octave distance-adaptive triplanar mode.
  */
-function buildSubVoxelBasis(
-  baseN: THREE.Node<'vec3'>,
-  isBlockyNode: THREE.UniformNode<'float'>,
-  nativeVoxelSizeNode: THREE.UniformNode<'float'>,
-) {
-  const absN = abs(baseN);
-  const useX = absN.x.greaterThan(absN.y).and(absN.x.greaterThan(absN.z));
-  const useY = absN.y.greaterThan(absN.x).and(absN.y.greaterThan(absN.z));
-
-  const sx = baseN.x.greaterThan(0.0).select(float(1.0), float(-1.0));
-  const sy = baseN.y.greaterThan(0.0).select(float(1.0), float(-1.0));
-  const sz = baseN.z.greaterThan(0.0).select(float(1.0), float(-1.0));
-
-  // Exact tangent directions matching voxelPlanet.ts blocky face UVs
-  const T_blocky = useX.select(
-    vec3(0.0, 0.0, sx.negate()),
-    useY.select(vec3(1.0, 0.0, 0.0), vec3(sz, 0.0, 0.0)),
-  );
-  const B_blocky = useX.select(
-    vec3(0.0, 1.0, 0.0),
-    useY.select(vec3(0.0, 0.0, sy.negate()), vec3(0.0, 1.0, 0.0)),
-  );
-
-  // Pole-free triplanar tangent axes for smooth Marching Cubes terrain
-  const T_axis = useX.select(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0));
-  const B_axis = useY.select(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0));
-  const T_smooth = normalize(T_axis.sub(baseN.mul(dot(T_axis, baseN))));
-  const B_smooth = normalize(B_axis.sub(baseN.mul(dot(B_axis, baseN))));
-
-  const isBlocky = isBlockyNode.greaterThan(0.5);
-  const T = isBlocky.select(T_blocky, T_smooth);
-  const B = isBlocky.select(B_blocky, B_smooth);
-
-  // Sub-voxel grid density: 6x6 primary sub-voxels (+12x12 nested studs) per blocky face,
-  // or continuous distance-adaptive octaves on smooth terrain
-  const p = positionWorld;
-  const camDist = length(cameraPosition.sub(p));
-  const baseSubSize = max(nativeVoxelSizeNode.mul(0.20), float(1e-5));
-  const targetCell = max(baseSubSize, camDist.mul(0.015));
-  const octF = log2(max(targetCell.div(baseSubSize), 1.0));
-  const oct0 = floor(octF);
-  const octBlend = smoothstep(0.2, 0.8, fract(octF));
-  const cellSize0 = baseSubSize.mul(pow(float(2.0), oct0));
-
-  const proj2D = vec2(dot(p, T_axis), dot(p, B_axis));
-  const smoothCoord0 = proj2D.div(cellSize0);
-  const smoothCoord1 = smoothCoord0.mul(0.5);
-
-  // Per-face UV (6x6 sub-voxels per displayed voxel face) + slow world modulation so cubes vary naturally
-  const blockCoord = uv().mul(6.0);
-  const worldMod = sin(
-    dot(p, vec3(0.73, 1.13, 0.91)).div(max(nativeVoxelSizeNode.mul(3.2), float(0.02))),
-  ).mul(0.35);
-
-  return {
-    isBlocky,
-    T,
-    B,
+const sampleReliefHeightFn = Fn(
+  ([
+    deltaCoord,
     blockCoord,
     smoothCoord0,
     smoothCoord1,
     octBlend,
-    worldMod,
-  };
+    isBlockyF,
+    roughMat,
+    glowMat,
+    detailFade,
+  ]: [
+    THREE.Node<'vec2'>,
+    THREE.Node<'vec2'>,
+    THREE.Node<'vec2'>,
+    THREE.Node<'vec2'>,
+    THREE.Node<'float'>,
+    THREE.Node<'float'>,
+    THREE.Node<'float'>,
+    THREE.Node<'float'>,
+    THREE.Node<'float'>,
+  ]) => {
+    const outH = float(0.0).toVar();
+    If(isBlockyF.greaterThan(0.5), () => {
+      const cB = tslClamp(blockCoord.add(deltaCoord), vec2(0.015), vec2(3.985));
+      outH.assign(
+        sampleSubVoxelHeightfieldFn(cB, vec2(0.0, 0.0), roughMat, glowMat, detailFade),
+      );
+    }).Else(() => {
+      const hS0 = sampleSubVoxelHeightfieldFn(
+        smoothCoord0.add(deltaCoord),
+        vec2(0.0, 0.0),
+        roughMat,
+        glowMat,
+        detailFade,
+      );
+      const hS1 = sampleSubVoxelHeightfieldFn(
+        smoothCoord1.add(deltaCoord.mul(0.5)),
+        vec2(17.0, 29.0),
+        roughMat,
+        glowMat,
+        detailFade,
+      );
+      outH.assign(mix(hS0, hS1, octBlend));
+    });
+    return outH;
+  },
+);
+
+/**
+ * Computes tangent axes (T, B) and dual-mode (blocky 4x4 face UV vs distance-adaptive
+ * triplanar) sub-voxel basis using unperturbed geometry world normals.
+ */
+function computeTangentBasis(baseN: THREE.Node<'vec3'>, isBlockyF: THREE.Node<'float'>) {
+  const absN = abs(baseN);
+  const useX = absN.x.greaterThan(absN.y).and(absN.x.greaterThan(absN.z));
+  const useY = absN.y.greaterThan(absN.x).and(absN.y.greaterThan(absN.z));
+
+  const sx = select(baseN.x.greaterThan(0.0), float(1.0), float(-1.0));
+  const sy = select(baseN.y.greaterThan(0.0), float(1.0), float(-1.0));
+  const sz = select(baseN.z.greaterThan(0.0), float(1.0), float(-1.0));
+
+  const T_blocky = select(
+    useX,
+    vec3(0.0, 0.0, sx.negate()),
+    select(useY, vec3(1.0, 0.0, 0.0), vec3(sz, 0.0, 0.0)),
+  );
+  const B_blocky = select(
+    useX,
+    vec3(0.0, 1.0, 0.0),
+    select(useY, vec3(0.0, 0.0, sy.negate()), vec3(0.0, 1.0, 0.0)),
+  );
+
+  const T_axis = select(useX, vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0));
+  const B_axis = select(useY, vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 0.0));
+  const T_smooth = normalize(T_axis.sub(baseN.mul(dot(T_axis, baseN))));
+  const B_smooth = normalize(B_axis.sub(baseN.mul(dot(B_axis, baseN))));
+
+  const isBlocky = isBlockyF.greaterThan(0.5);
+  const T = select(isBlocky, T_blocky, T_smooth);
+  const B = select(isBlocky, B_blocky, B_smooth);
+
+  return { T, B, T_axis, B_axis, isBlocky };
 }
 
 /**
- * Full Sub-Voxel Relief PBR system:
- * - 8-step Parallax Occlusion Mapping (POM) with secant refinement (visible 3D sub-voxel extrusion)
- * - 4-step tangent-space directional sun self-shadowing across raised sub-voxel blocks
- * - High-contrast central-difference heightfield slope normals + blocky face perimeter bevels
- * - Coupled Cavity AO, plateau-vs-crevice albedo contrast, roughness break-up, and crystal/ice clearcoat
+ * Clean Denoised Sub-Voxel Relief PBR system:
+ * - Analytical world-space + view-angle Nyquist anti-aliasing (zero dFdx/dFdy uniformity hazards)
+ * - 8-step Parallax Occlusion Mapping (POM) with secant refinement for crisp 3D protrusion
+ * - 4-step directional sun self-shadowing across raised sub-voxel blocks
+ * - Wide-stencil bevel slope normals + coupled Cavity AO & plateau specular polish
  */
 export function buildTerrainSubVoxelPbrBundle(
   params: TerrainSubVoxelPbrParams,
@@ -220,67 +233,100 @@ export function buildTerrainSubVoxelPbrBundle(
 
   // Shared fragment evaluation returning vec4(gradU, gradV, heightHit, selfShadow)
   const reliefNode = Fn(() => {
-    const baseN = normalize(normalWorld);
-    const roughMat = matPropsNode.x;
-    const glowMat = matPropsNode.z;
-    const activeRelief = tslClamp(pbrReliefDepthNode, 0.0, 2.2).mul(
-      tslClamp(pbrEnhancedNode, 0.0, 1.0),
+    const baseN = normalize(normalWorldGeometry).toVar();
+    const roughMat = matPropsNode.x.toVar();
+    const glowMat = matPropsNode.z.toVar();
+    const isBlockyF = isBlockyNode.toVar();
+    const basis = computeTangentBasis(baseN, isBlockyF);
+    const T = basis.T.toVar();
+    const B = basis.B.toVar();
+
+    const p = positionWorld;
+    const viewVec = cameraPosition.sub(p);
+    const camDist = length(viewVec).toVar();
+    const viewDir = viewVec.div(max(camDist, float(1e-5))).toVar();
+    const nDotV = dot(viewDir, baseN).toVar();
+
+    // Distance-adaptive triplanar octave selection
+    const baseSubSize = max(nativeVoxelSizeNode.mul(0.25), float(1e-5)).toVar();
+    const targetCell = max(baseSubSize, camDist.mul(0.022));
+    const octF = log2(max(targetCell.div(baseSubSize), 1.0));
+    const oct0 = floor(octF);
+    const octBlend = smoothstep(0.2, 0.8, fract(octF)).toVar();
+    const cellSize0 = baseSubSize.mul(pow(float(2.0), oct0)).toVar();
+
+    const proj2D = vec2(dot(p, basis.T_axis), dot(p, basis.B_axis));
+    const smoothCoord0 = proj2D.div(cellSize0).toVar();
+    const smoothCoord1 = smoothCoord0.mul(0.5).toVar();
+    const blockCoord = uv().mul(4.0).toVar();
+
+    // Analytical Nyquist anti-aliasing (stage-safe & uniform-safe across WebGPU & WebGL2)
+    const activeCellSize = select(basis.isBlocky, baseSubSize, cellSize0);
+    const pixelWorld = camDist.mul(0.00135);
+    const cellFootprint = pixelWorld.div(
+      max(activeCellSize.mul(max(abs(nDotV), 0.25)), float(1e-5)),
     );
+    const reliefAa = smoothstep(0.75, 0.16, cellFootprint).toVar();
+    const tier2Aa = smoothstep(0.30, 0.08, cellFootprint).toVar();
 
-    const outResult = vec4(0.0, 0.0, 0.72, 1.0).toVar();
+    const activeRelief = tslClamp(pbrReliefDepthNode, 0.0, 2.2)
+      .mul(tslClamp(pbrEnhancedNode, 0.0, 1.0))
+      .mul(reliefAa)
+      .toVar();
 
-    If(activeRelief.greaterThan(0.01), () => {
-      const basis = buildSubVoxelBasis(baseN, isBlockyNode, nativeVoxelSizeNode);
+    const outResult = vec4(0.0, 0.0, 0.76, 1.0).toVar();
 
-      const sampleHeight = (deltaCoord: THREE.Node<'vec2'>): THREE.Node<'float'> => {
-        const cB = tslClamp(basis.blockCoord.add(deltaCoord), vec2(0.015), vec2(5.985));
-        const hB = sampleSubVoxelHeightfield(cB, basis.worldMod, roughMat, glowMat);
-        const hS0 = sampleSubVoxelHeightfield(
-          basis.smoothCoord0.add(deltaCoord),
-          float(0.0),
-          roughMat,
-          glowMat,
-        );
-        const hS1 = sampleSubVoxelHeightfield(
-          basis.smoothCoord1.add(deltaCoord.mul(0.5)),
-          float(1.73),
-          roughMat,
-          glowMat,
-        );
-        const hS = mix(hS0, hS1, basis.octBlend);
-        return basis.isBlocky.select(hB, hS);
-      };
+    If(activeRelief.greaterThan(0.015), () => {
+      const vz = max(nDotV, 0.30);
+      const grazingFade = smoothstep(0.08, 0.28, nDotV);
+      const pomDepth = activeRelief.mul(0.19).mul(grazingFade).toVar();
 
-      const viewDir = normalize(cameraPosition.sub(positionWorld));
-      const nDotV = dot(viewDir, baseN);
-      const vz = max(nDotV, 0.28);
-      const grazingFade = smoothstep(0.06, 0.26, nDotV);
-      const pomDepth = activeRelief.mul(0.28).mul(grazingFade);
+      const vTan = vec2(dot(viewDir, T), dot(viewDir, B));
+      const maxOffset = vTan.negate().div(vz).mul(pomDepth).toVar();
 
-      const vTan = vec2(dot(viewDir, basis.T), dot(viewDir, basis.B));
-      const maxOffset = vTan.negate().div(vz).mul(pomDepth);
+      const h0 = sampleReliefHeightFn(
+        vec2(0.0, 0.0),
+        blockCoord,
+        smoothCoord0,
+        smoothCoord1,
+        octBlend,
+        isBlockyF,
+        roughMat,
+        glowMat,
+        tier2Aa,
+      ).toVar();
 
-      // 8-step Parallax Occlusion Ray-March with secant hit interpolation
-      const h0 = sampleHeight(vec2(0.0, 0.0));
-      const prevH = h0.toVar();
+      const prevH = float(0.0).toVar();
+      prevH.assign(h0);
       const prevRayH = float(1.0).toVar();
-      const currH = h0.toVar();
+      const currH = float(0.0).toVar();
+      currH.assign(h0);
       const currRayH = float(1.0).toVar();
       const hitStep = float(0.0).toVar();
       const found = float(0.0).toVar();
 
+      // 8-step Parallax Occlusion Ray-March with secant hit interpolation
       Loop(8, ({ i }) => {
         If(found.lessThan(0.5), () => {
           const tFrac = float(i).add(1.0).mul(0.125);
           const rayNext = float(1.0).sub(tFrac);
-          const sampleH = sampleHeight(maxOffset.mul(tFrac));
+          const sampleH = sampleReliefHeightFn(
+            maxOffset.mul(tFrac),
+            blockCoord,
+            smoothCoord0,
+            smoothCoord1,
+            octBlend,
+            isBlockyF,
+            roughMat,
+            glowMat,
+            tier2Aa,
+          );
           If(sampleH.greaterThanEqual(rayNext), () => {
             currH.assign(sampleH);
             currRayH.assign(rayNext);
             hitStep.assign(tFrac);
             found.assign(1.0);
-          });
-          If(found.lessThan(0.5), () => {
+          }).Else(() => {
             prevH.assign(sampleH);
             prevRayH.assign(rayNext);
           });
@@ -291,43 +337,105 @@ export function buildTerrainSubVoxelPbrBundle(
       const beforeDepth = max(prevRayH.sub(prevH), 0.0);
       const denom = max(afterDepth.add(beforeDepth), 0.0002);
       const secantWeight = tslClamp(afterDepth.div(denom), 0.0, 1.0);
-      const refinedFrac = found.greaterThan(0.5).select(
+      const refinedFrac = select(
+        found.greaterThan(0.5),
         hitStep.sub(float(0.125).mul(secantWeight)),
         float(0.0),
       );
 
-      const pomDelta = maxOffset.mul(refinedFrac);
-      const hHit = sampleHeight(pomDelta);
+      const pomDelta = maxOffset.mul(refinedFrac).toVar();
+      const hRawHit = sampleReliefHeightFn(
+        pomDelta,
+        blockCoord,
+        smoothCoord0,
+        smoothCoord1,
+        octBlend,
+        isBlockyF,
+        roughMat,
+        glowMat,
+        tier2Aa,
+      );
+      const hHit = mix(float(0.76), hRawHit, reliefAa).toVar();
 
-      // Steep central-difference gradients on parallax-hit heightfield
-      const eps = float(0.022);
-      const hR = sampleHeight(pomDelta.add(vec2(eps, 0.0)));
-      const hL = sampleHeight(pomDelta.sub(vec2(eps, 0.0)));
-      const hU = sampleHeight(pomDelta.add(vec2(0.0, eps)));
-      const hD = sampleHeight(pomDelta.sub(vec2(0.0, eps)));
+      // Clean beveled central-difference gradients on parallax-hit heightfield
+      const eps = float(0.032);
+      const hR = sampleReliefHeightFn(
+        pomDelta.add(vec2(eps, 0.0)),
+        blockCoord,
+        smoothCoord0,
+        smoothCoord1,
+        octBlend,
+        isBlockyF,
+        roughMat,
+        glowMat,
+        tier2Aa,
+      );
+      const hL = sampleReliefHeightFn(
+        pomDelta.sub(vec2(eps, 0.0)),
+        blockCoord,
+        smoothCoord0,
+        smoothCoord1,
+        octBlend,
+        isBlockyF,
+        roughMat,
+        glowMat,
+        tier2Aa,
+      );
+      const hU = sampleReliefHeightFn(
+        pomDelta.add(vec2(0.0, eps)),
+        blockCoord,
+        smoothCoord0,
+        smoothCoord1,
+        octBlend,
+        isBlockyF,
+        roughMat,
+        glowMat,
+        tier2Aa,
+      );
+      const hD = sampleReliefHeightFn(
+        pomDelta.sub(vec2(0.0, eps)),
+        blockCoord,
+        smoothCoord0,
+        smoothCoord1,
+        octBlend,
+        isBlockyF,
+        roughMat,
+        glowMat,
+        tier2Aa,
+      );
 
-      const slopeGain = activeRelief.mul(3.4);
-      const gradU = tslClamp(hR.sub(hL).div(eps.mul(2.0)).mul(slopeGain), -4.5, 4.5);
-      const gradV = tslClamp(hU.sub(hD).div(eps.mul(2.0)).mul(slopeGain), -4.5, 4.5);
+      const slopeGain = activeRelief.mul(1.9);
+      const gradU = tslClamp(hR.sub(hL).div(eps.mul(2.0)).mul(slopeGain), -2.6, 2.6);
+      const gradV = tslClamp(hU.sub(hD).div(eps.mul(2.0)).mul(slopeGain), -2.6, 2.6);
 
       // 4-step tangent-space directional sun self-shadowing across raised sub-voxel pillars
       const lz = dot(sunDirNode, baseN);
       const shadowOcc = float(0.0).toVar();
       If(lz.greaterThan(0.02), () => {
-        const lTan = vec2(dot(sunDirNode, basis.T), dot(sunDirNode, basis.B));
-        const shadowDir = lTan.div(max(lz, 0.25)).mul(pomDepth);
+        const lTan = vec2(dot(sunDirNode, T), dot(sunDirNode, B));
+        const shadowDir = lTan.div(max(lz, 0.25)).mul(pomDepth).toVar();
         Loop(4, ({ i }) => {
           const k = float(i).add(1.0).mul(0.24);
-          const sH = sampleHeight(pomDelta.add(shadowDir.mul(k)));
-          const rayMinH = hHit.add(k.mul(0.85));
-          const occ = max(sH.sub(rayMinH), 0.0).mul(float(1.15).sub(k.mul(0.65)));
+          const sH = sampleReliefHeightFn(
+            pomDelta.add(shadowDir.mul(k)),
+            blockCoord,
+            smoothCoord0,
+            smoothCoord1,
+            octBlend,
+            isBlockyF,
+            roughMat,
+            glowMat,
+            tier2Aa,
+          );
+          const rayMinH = hHit.add(k.mul(0.88));
+          const occ = max(sH.sub(rayMinH), 0.0).mul(float(1.1).sub(k.mul(0.6)));
           shadowOcc.assign(max(shadowOcc, occ));
         });
       });
 
       const sunFacing = smoothstep(-0.04, 0.22, lz);
       const selfShadow = float(1.0).sub(
-        tslClamp(shadowOcc.mul(2.5), 0.0, 0.68).mul(sunFacing),
+        tslClamp(shadowOcc.mul(1.85), 0.0, 0.48).mul(sunFacing).mul(reliefAa),
       );
 
       outResult.assign(vec4(gradU, gradV, hHit, selfShadow));
@@ -336,15 +444,14 @@ export function buildTerrainSubVoxelPbrBundle(
     return outResult;
   })();
 
-  // Perturbed view-space normal combining steep sub-voxel relief slopes + voxel quad rim bevel
+  // Perturbed view-space normal combining sub-voxel bevel slopes + outer voxel quad bevel
   const normalNode = Fn(() => {
-    const baseN = normalize(normalWorld);
-    const basis = buildSubVoxelBasis(baseN, isBlockyNode, nativeVoxelSizeNode);
+    const baseN = normalize(normalWorldGeometry);
+    const basis = computeTangentBasis(baseN, isBlockyNode);
 
     const rel = reliefNode;
     const relievedWorld = baseN.sub(basis.T.mul(rel.x)).sub(basis.B.mul(rel.y));
 
-    // Outer voxel quad bevel in blocky mode so voxel borders catch crisp rim highlights
     const blockUv = uv();
     const uCentered = blockUv.x.sub(0.5);
     const vCentered = blockUv.y.sub(0.5);
@@ -353,7 +460,7 @@ export function buildTerrainSubVoxelPbrBundle(
       min(blockUv.y, float(1.0).sub(blockUv.y)),
     );
     const bevelWeight = float(1.0)
-      .sub(smoothstep(0.0, 0.095, edgeDist))
+      .sub(smoothstep(0.0, 0.09, edgeDist))
       .mul(voxelEdgesNode)
       .mul(isBlockyNode)
       .mul(tslClamp(pbrEnhancedNode, 0.0, 1.0));
@@ -361,23 +468,24 @@ export function buildTerrainSubVoxelPbrBundle(
       .mul(uCentered)
       .add(basis.B.mul(vCentered))
       .mul(bevelWeight)
-      .mul(0.65);
+      .mul(0.45);
 
     const finalWorldN = normalize(relievedWorld.add(bevelPerturb));
     return normalize(transformNormalToView(finalWorldN));
   })();
 
-  // Ambient occlusion tied directly to sub-voxel recess depth
+  // Clean Ambient occlusion tied smoothly to sub-voxel recess depth
   const aoNode = Fn(() => {
-    const active = tslClamp(pbrEnhancedNode, 0.0, 1.0).mul(
-      tslClamp(pbrReliefDepthNode, 0.0, 1.5),
+    const active = min(
+      tslClamp(pbrEnhancedNode, 0.0, 1.0),
+      tslClamp(pbrReliefDepthNode, 0.0, 1.2),
     );
     const hHit = reliefNode.z;
-    const cavityAo = tslClamp(mix(float(0.24), float(1.04), pow(hHit, float(0.82))), 0.22, 1.0);
-    return mix(float(1.0), cavityAo, min(active, 1.0));
+    const cavityAo = tslClamp(mix(float(0.46), float(1.02), pow(hHit, float(0.75))), 0.44, 1.0);
+    return mix(float(1.0), cavityAo, active);
   })();
 
-  // Albedo modulation: crisp bright tops, warm bevel rims, darkened mortar channels & sun shadows
+  // Balanced Albedo modulation: tactile raised caps, soft crevices & directional sun self-shadow
   const applyAlbedoPbr = (baseColor: THREE.Node<'vec3'>): THREE.Node<'vec3'> => {
     const active = min(
       tslClamp(pbrEnhancedNode, 0.0, 1.0),
@@ -387,23 +495,19 @@ export function buildTerrainSubVoxelPbrBundle(
     const hHit = rel.z;
     const selfShadow = rel.w;
 
-    // Raised sub-voxel caps pop slightly brighter; recessed grooves deepen cleanly
-    const heightTone = mix(float(0.66), float(1.13), smoothstep(0.08, 0.92, hHit));
-    // Steep slope rims catch a crisp micro-edge sheen
-    const slopeMag = tslClamp(length(vec2(rel.x, rel.y)).mul(0.22), 0.0, 0.16);
+    const heightTone = mix(float(0.80), float(1.08), smoothstep(0.10, 0.90, hHit));
+    const slopeMag = tslClamp(length(vec2(rel.x, rel.y)).mul(0.09), 0.0, 0.08);
     const toned = baseColor.mul(heightTone.add(slopeMag)).mul(selfShadow);
     return mix(baseColor, toned, active).saturate();
   };
 
-  // Burnished plateau tops vs matte rough crevices
+  // Smooth plateau polish vs matte crevices (free of high-freq world-space trig grain)
   const roughnessNode = Fn(() => {
-    const p = positionWorld;
-    const microVar = sin(p.x.mul(11.3)).mul(cos(p.y.mul(9.7))).mul(sin(p.z.mul(10.9))).mul(0.05);
     const active = tslClamp(pbrEnhancedNode, 0.0, 1.0);
     const hHit = reliefNode.z;
-    const reliefRoughShift = mix(float(0.14), float(-0.15), smoothstep(0.2, 0.85, hHit));
+    const reliefRoughShift = mix(float(0.12), float(-0.12), smoothstep(0.25, 0.85, hHit));
     return tslClamp(
-      matPropsNode.x.add(microVar.add(reliefRoughShift).mul(active)),
+      matPropsNode.x.add(reliefRoughShift.mul(active)),
       0.04,
       0.98,
     );
@@ -412,15 +516,15 @@ export function buildTerrainSubVoxelPbrBundle(
   // Crystal & ice glassy clearcoat + subtle mineral specular glaze on raised stone tops
   const clearcoatNode = Fn(() => {
     const glassCoat = float(1.0).sub(smoothstep(0.18, 0.28, matPropsNode.x)).mul(0.92);
-    const mineralCapCoat = smoothstep(0.62, 0.92, reliefNode.z).mul(0.22);
+    const mineralCapCoat = smoothstep(0.66, 0.94, reliefNode.z).mul(0.18);
     return tslClamp(max(glassCoat, mineralCapCoat).mul(pbrEnhancedNode), 0.0, 1.0);
   })();
 
   // Emissive crystal vein boost inside sub-voxel ridges & crevices
   const emissiveBoostNode = Fn(() => {
     const hHit = reliefNode.z;
-    const slope = tslClamp(length(vec2(reliefNode.x, reliefNode.y)).mul(0.28), 0.0, 0.65);
-    return float(1.0).add(hHit.mul(0.45)).add(slope);
+    const slope = tslClamp(length(vec2(reliefNode.x, reliefNode.y)).mul(0.18), 0.0, 0.42);
+    return float(1.0).add(hHit.mul(0.32)).add(slope);
   })();
 
   return {

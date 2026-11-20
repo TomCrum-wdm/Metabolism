@@ -84,6 +84,7 @@ interface GameHudProps {
 
 const CAMERA_LABEL: Record<CameraMode, string> = {
   explorer: '探索',
+  firstPerson: '第一人称',
   orbit: '轨道',
   detail: '细节放大',
   fps: 'FPS自由',
@@ -97,6 +98,7 @@ const CAMERA_MODES: ReadonlyArray<{
   desc: string;
 }> = [
   { id: 'explorer', label: '探索视角', desc: '地表第三人称角色跟随' },
+  { id: 'firstPerson', label: '第一人称视角', desc: '角色眼睛地表漫游 · 仰望天空大气散射' },
   { id: 'orbit', label: '轨道视角', desc: '环绕行星全局俯瞰' },
   { id: 'detail', label: '细节摄像机', desc: '射线锁定体素区域安全放大' },
   { id: 'fps', label: '自由 FPS 摄像机', desc: '无约束 6DoF 自由飞行' },
@@ -105,7 +107,8 @@ const CAMERA_MODES: ReadonlyArray<{
 ];
 
 const NEXT_CAMERA_MODE: Record<CameraMode, CameraMode> = {
-  explorer: 'orbit',
+  explorer: 'firstPerson',
+  firstPerson: 'orbit',
   orbit: 'detail',
   detail: 'fps',
   fps: 'landing',
@@ -797,7 +800,8 @@ export const GameHud: React.FC<GameHudProps> = ({
 
       {/* Mode-Specific Compact Camera Strip */}
       {!directorPreviewing &&
-        (config.cameraMode === 'detail' ||
+        (config.cameraMode === 'firstPerson' ||
+          config.cameraMode === 'detail' ||
           config.cameraMode === 'landing' ||
           config.cameraMode === 'perspective') && (
         <div className="pointer-events-none flex justify-center pt-1.5 px-2">
@@ -805,6 +809,30 @@ export const GameHud: React.FC<GameHudProps> = ({
             data-testid="camera-mode-context-bar"
             className="pointer-events-auto h-7 px-2.5 rounded-xs border border-slate-700/80 bg-[#090d18]/90 text-[11px] text-slate-200 flex items-center gap-2.5 shadow-md"
           >
+            {config.cameraMode === 'firstPerson' && (
+              <>
+                <span className="flex items-center gap-1 text-sky-300 font-medium">
+                  <Camera className="w-3.5 h-3.5" />
+                  <span>第一人称</span>
+                </span>
+                <span className="hidden sm:inline text-slate-400 text-[10px]">
+                  拖拽天空或右键环视仰望大气 · WASD/空格/Shift漫游 · 体型 {config.playerScale.toFixed(2)}×
+                </span>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  data-testid="fp-to-explorer-btn"
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    onUpdateConfig({ cameraMode: 'explorer' });
+                  }}
+                  className="h-5 px-2 rounded-xs border border-sky-500/60 bg-sky-950/60 hover:bg-sky-900/70 text-[10px] text-sky-200 cursor-pointer"
+                >
+                  切回第三人称
+                </button>
+              </>
+            )}
+
             {config.cameraMode === 'detail' && (
               <>
                 <span className="flex items-center gap-1 text-cyan-300 font-medium">
@@ -1133,6 +1161,27 @@ export const GameHud: React.FC<GameHudProps> = ({
                     className="w-20"
                     onChangeValue={(v) =>
                       onUpdateConfig({ sunElevationDeg: v })
+                    }
+                  />
+                </label>
+
+                <label className="flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="text-slate-400">角色大小</span>
+                  <NumericCadInput
+                    value={config.playerScale}
+                    minValid={0.05}
+                    unit="×"
+                    ariaLabel="角色大小"
+                    testId="hud-player-scale-input"
+                    sliderScale="log"
+                    sliderMin={0.05}
+                    sliderMax={3.0}
+                    sliderStep={0.05}
+                    className="w-20"
+                    onChangeValue={(v) =>
+                      onUpdateConfig({
+                        playerScale: Math.min(3.0, Math.max(0.05, v)),
+                      })
                     }
                   />
                 </label>

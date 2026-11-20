@@ -17,9 +17,15 @@ import {
 } from './voxelPlanet';
 import { FluidSim } from './fluidSim';
 import {
+  clampPlayerScale,
+  computeCharacterScaleMetrics,
   computeDetailCameraOptics,
+  computeFirstPersonEyePose,
   computeSafeClipPlanes,
+  DEFAULT_PLAYER_SCALE,
   evaluateLandingDescentPose,
+  MAX_PLAYER_SCALE,
+  MIN_PLAYER_SCALE,
   resolveSphericalCoreUp,
   stabilizeRadialAnchor,
   transportCameraForwardOnSphere,
@@ -1834,6 +1840,52 @@ test('RenderQuality Halton subpixel jittering and RGBA accumulator produce clean
   const finalRgba = finalizeAccumulatedRgba(acc, 2);
   assert.deepEqual(Array.from(finalRgba), [15, 30, 40, 255, 110, 160, 210, 255]);
 });
+
+test('Character size controller keeps default eye well under atmosphere shell and scales monotonically', () => {
+  assert.equal(clampPlayerScale(undefined), DEFAULT_PLAYER_SCALE);
+  assert.equal(clampPlayerScale(0.001), MIN_PLAYER_SCALE);
+  assert.equal(clampPlayerScale(99), MAX_PLAYER_SCALE);
+
+  const planetR = 13.0;
+  const atmoScaleHeight = planetR * DEFAULT_ATMOS_CONFIG.scaleHeightRatio;
+  const defM = computeCharacterScaleMetrics(1.0, DEFAULT_PLAYER_SCALE, 1.0, 0.02);
+  assert.ok(
+    defM.eyeHeight + defM.footRadius < atmoScaleHeight * 0.4,
+    `Expected default player standing eye (${defM.eyeHeight + defM.footRadius}m) well under atmosphere scale height (${atmoScaleHeight}m)`,
+  );
+
+  const tinyM = computeCharacterScaleMetrics(1.0, 0.1, 1.0, 0.02);
+  const giantM = computeCharacterScaleMetrics(1.0, 2.0, 1.0, 0.02);
+  assert.ok(tinyM.charScale < defM.charScale && defM.charScale < giantM.charScale);
+  assert.ok(tinyM.footRadius < defM.footRadius && defM.footRadius < giantM.footRadius);
+  assert.ok(
+    tinyM.defaultExplorerCamDist < defM.defaultExplorerCamDist &&
+      defM.defaultExplorerCamDist < giantM.defaultExplorerCamDist,
+  );
+  assert.ok(tinyM.walkSpeed < defM.walkSpeed && defM.walkSpeed < giantM.walkSpeed);
+});
+
+test('First-person eye pose aligns with local gravity normal and supports upward sky pitch', () => {
+  const pose = computeFirstPersonEyePose([0, 13, 0], [0, 1, 0], [0, 0, -1], 0.65, 0.42);
+  assert.ok(Math.abs(pose.eyePos[0]) < 1e-9);
+  assert.ok(Math.abs(pose.eyePos[1] - 13.42) < 1e-6);
+  assert.ok(Math.abs(pose.eyePos[2]) < 1e-9);
+
+  // Looking upward into atmosphere: positive dot with up vector & unit direction
+  const mag = Math.hypot(pose.lookDir[0], pose.lookDir[1], pose.lookDir[2]);
+  assert.ok(Math.abs(mag - 1.0) < 1e-6);
+  assert.ok(pose.lookDir[1] > 0.55, 'Upward first-person pitch should gaze cleanly into sky');
+  assert.ok(pose.lookDir[2] < -0.5);
+
+  // Works identically at tilted arbitrary sphere coordinate (non-Y-up)
+  const nLen = Math.hypot(1, 1, 1);
+  const up: [number, number, number] = [1 / nLen, 1 / nLen, 1 / nLen];
+  const tilted = computeFirstPersonEyePose([10, 10, 10], up, [1, 0, -1], 0.0, 0.5);
+  const dotUp =
+    tilted.lookDir[0] * up[0] + tilted.lookDir[1] * up[1] + tilted.lookDir[2] * up[2];
+  assert.ok(Math.abs(dotUp) < 1e-5, 'Horizon first-person look should remain perpendicular to radial up');
+});
+
 
 
 

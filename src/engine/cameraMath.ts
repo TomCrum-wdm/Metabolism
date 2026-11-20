@@ -252,3 +252,128 @@ export function resolveSphericalCoreUp(
   return [pos[0] / r, pos[1] / r, pos[2] / r];
 }
 
+export const MIN_PLAYER_SCALE = 0.05;
+export const MAX_PLAYER_SCALE = 3.0;
+export const DEFAULT_PLAYER_SCALE = 0.35;
+
+export interface CharacterScaleMetrics {
+  playerScale: number;
+  charScale: number;
+  footRadius: number;
+  eyeHeight: number;
+  lookLift: number;
+  shoulderLift: number;
+  walkSpeed: number;
+  jumpSpeed: number;
+  jetpackThrust: number;
+  defaultExplorerCamDist: number;
+  minExplorerCamDist: number;
+  maxExplorerCamDist: number;
+}
+
+export function clampPlayerScale(scale: number | undefined): number {
+  if (typeof scale !== 'number' || !Number.isFinite(scale)) {
+    return DEFAULT_PLAYER_SCALE;
+  }
+  return clamp(scale, MIN_PLAYER_SCALE, MAX_PLAYER_SCALE);
+}
+
+/**
+ * Computes grounded astronaut physical dimensions, explorer camera framing, first-person
+ * eye height, and locomotion speeds scaled proportionately with `playerScale` so the character
+ * remains well below the planetary atmosphere shell and balanced against the globe.
+ */
+export function computeCharacterScaleMetrics(
+  planetScale: number,
+  playerScale: number,
+  gravityScale = 1.0,
+  nativeVoxelSize = 0.02,
+): CharacterScaleMetrics {
+  const safePlanetScale = Math.max(planetScale, 0.002);
+  const clampedScale = clampPlayerScale(playerScale);
+  const charScale = safePlanetScale * clampedScale;
+  const footRadius = 0.36 * charScale;
+  const eyeHeight = Math.max(nativeVoxelSize * 1.4, 1.22 * charScale);
+
+  const defaultExplorerCamDist = clamp(
+    6.6 * charScale,
+    Math.max(nativeVoxelSize * 4, 0.12 * safePlanetScale),
+    36.0 * safePlanetScale,
+  );
+  const minExplorerCamDist = clamp(
+    Math.min(1.6 * charScale, Math.max(1e-7 * safePlanetScale, nativeVoxelSize * 4)),
+    1e-6,
+    defaultExplorerCamDist,
+  );
+  const maxExplorerCamDist = Math.max(24.0 * charScale, 42.0 * safePlanetScale);
+
+  const motionScale = safePlanetScale * (0.35 + 0.65 * clampedScale);
+  const walkSpeed = 5.4 * motionScale;
+  const jumpSpeed = 5.8 * Math.sqrt(Math.max(0.05, gravityScale * motionScale));
+  const jetpackThrust = (9.81 * gravityScale + 7.5) * motionScale;
+
+  return {
+    playerScale: clampedScale,
+    charScale,
+    footRadius,
+    eyeHeight,
+    lookLift: 1.05 * charScale,
+    shoulderLift: 0.92 * charScale,
+    walkSpeed,
+    jumpSpeed,
+    jetpackThrust,
+    defaultExplorerCamDist,
+    minExplorerCamDist,
+    maxExplorerCamDist,
+  };
+}
+
+/**
+ * Computes first-person camera eye position, forward-tilted look vector, and look-at target
+ * aligned to the local spherical gravity normal.
+ */
+export function computeFirstPersonEyePose(
+  playerPos: readonly [number, number, number],
+  playerUp: readonly [number, number, number],
+  forwardTangent: readonly [number, number, number],
+  pitchRad: number,
+  eyeHeight: number,
+): {
+  eyePos: [number, number, number];
+  lookDir: [number, number, number];
+  lookTarget: [number, number, number];
+} {
+  const uLen = Math.hypot(playerUp[0], playerUp[1], playerUp[2]) || 1;
+  const ux = playerUp[0] / uLen;
+  const uy = playerUp[1] / uLen;
+  const uz = playerUp[2] / uLen;
+
+  const basis = transportCameraForwardOnSphere([ux, uy, uz], forwardTangent, 0);
+  const fx = basis.forward[0];
+  const fy = basis.forward[1];
+  const fz = basis.forward[2];
+
+  const p = clamp(pitchRad, -1.42, 1.48);
+  const cosP = Math.cos(p);
+  const sinP = Math.sin(p);
+
+  const lx = fx * cosP + ux * sinP;
+  const ly = fy * cosP + uy * sinP;
+  const lz = fz * cosP + uz * sinP;
+  const lLen = Math.hypot(lx, ly, lz) || 1;
+  const nlx = lx / lLen;
+  const nly = ly / lLen;
+  const nlz = lz / lLen;
+
+  const ex = playerPos[0] + ux * eyeHeight;
+  const ey = playerPos[1] + uy * eyeHeight;
+  const ez = playerPos[2] + uz * eyeHeight;
+
+  return {
+    eyePos: [ex, ey, ez],
+    lookDir: [nlx, nly, nlz],
+    lookTarget: [ex + nlx, ey + nly, ez + nlz],
+  };
+}
+
+

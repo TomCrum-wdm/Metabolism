@@ -11,6 +11,10 @@ export type ToolGroup =
 export type ToolBehavior =
   | 'probe'
   | 'seismicProbe'
+  | 'surveyPin'
+  | 'surveyTransect'
+  | 'surveyBorehole'
+  | 'surveyClinometer'
   | 'carve'
   | 'pierce'
   | 'continuousLaser'
@@ -74,6 +78,10 @@ export type ToolIconName =
   | 'sparkles'
   | 'eraser'
   | 'magnet'
+  | 'map-pin'
+  | 'ruler'
+  | 'layers'
+  | 'compass'
   | 'wand';
 
 export interface ToolAttributes {
@@ -765,6 +773,90 @@ export const TOOL_BEHAVIOR_PRESETS: ReadonlyArray<BehaviorPresetMeta> = [
       continuousBeam: false,
     },
   },
+  {
+    behavior: 'surveyPin',
+    label: '测量控制点',
+    desc: '在行星表面布设编号水准控制点，记录全坐标系坐标、高程与岩性',
+    defaultIcon: 'map-pin',
+    defaultColor: '#38bdf8',
+    defaults: {
+      radiusMult: 0.85,
+      strengthMult: 1.0,
+      cooldownSec: 0.25,
+      pierceDepthRatio: 0,
+      debrisCount: 0,
+      thermalDeltaC: 0,
+      entitySpeed: 1.0,
+      entityCount: 1,
+      depositMaterial: 'active',
+      rimMaterial: 'none',
+      leaveRim: false,
+      continuousBeam: false,
+    },
+  },
+  {
+    behavior: 'surveyTransect',
+    label: '测地剖面仪',
+    desc: '点选A/B两点沿大圆测地线采样高程地形、地层岩性与温度剖面',
+    defaultIcon: 'ruler',
+    defaultColor: '#2dd4bf',
+    defaults: {
+      radiusMult: 0.85,
+      strengthMult: 1.0,
+      cooldownSec: 0.25,
+      pierceDepthRatio: 0,
+      debrisCount: 0,
+      thermalDeltaC: 0,
+      entitySpeed: 1.0,
+      entityCount: 1,
+      depositMaterial: 'active',
+      rimMaterial: 'none',
+      leaveRim: false,
+      continuousBeam: false,
+    },
+  },
+  {
+    behavior: 'surveyBorehole',
+    label: '地质钻孔取芯',
+    desc: '沿径向垂直下钻采样地下地层序列，绘制柱状岩芯与地温梯度曲线',
+    defaultIcon: 'layers',
+    defaultColor: '#a78bfa',
+    defaults: {
+      radiusMult: 0.85,
+      strengthMult: 1.0,
+      cooldownSec: 0.3,
+      pierceDepthRatio: 0,
+      debrisCount: 0,
+      thermalDeltaC: 0,
+      entitySpeed: 1.0,
+      entityCount: 1,
+      depositMaterial: 'active',
+      rimMaterial: 'none',
+      leaveRim: false,
+      continuousBeam: false,
+    },
+  },
+  {
+    behavior: 'surveyClinometer',
+    label: '地质罗盘仪',
+    desc: '测定岩层面走向(Strike)、倾向(Dip Dir)与倾角(Dip°)，支持区域面积圈定',
+    defaultIcon: 'compass',
+    defaultColor: '#fbbf24',
+    defaults: {
+      radiusMult: 0.9,
+      strengthMult: 1.0,
+      cooldownSec: 0.25,
+      pierceDepthRatio: 0,
+      debrisCount: 0,
+      thermalDeltaC: 0,
+      entitySpeed: 1.0,
+      entityCount: 1,
+      depositMaterial: 'active',
+      rimMaterial: 'none',
+      leaveRim: false,
+      continuousBeam: false,
+    },
+  },
 ];
 
 function makeBuiltin(
@@ -798,9 +890,13 @@ function makeBuiltin(
 }
 
 export const BUILTIN_TOOLS: ReadonlyArray<PlanetToolDef> = [
-  // Inspect
+  // Inspect & Geological Survey
   makeBuiltin('probe', '吸管探针', '吸取点击处矿物材质并探查体素格数据', 'inspect', 'probe', 'I', 'pipette', '#38bdf8'),
   makeBuiltin('seismicProbe', '震波雷达', '向星核发射纵波雷达脉冲探测矿脉与震荡圈', 'inspect', 'seismicProbe', undefined, 'radar', '#22d3ee'),
+  makeBuiltin('surveyPin', '测量控制点', '在地表布设水准控制点并记录多坐标系坐标、高程与岩性', 'inspect', 'surveyPin', undefined, 'map-pin', '#38bdf8'),
+  makeBuiltin('surveyTransect', '测地剖面线', '先后点击A/B两点测定大圆弧长与高程-岩性-温度剖面', 'inspect', 'surveyTransect', undefined, 'ruler', '#2dd4bf'),
+  makeBuiltin('surveyBorehole', '钻孔岩芯仪', '沿径向垂直钻探采样地下地层岩性序列与地温梯度', 'inspect', 'surveyBorehole', undefined, 'layers', '#a78bfa'),
+  makeBuiltin('surveyClinometer', '地质产状仪', '测定岩层走向/倾向/倾角与局部坡度，同步纳入区域测算', 'inspect', 'surveyClinometer', undefined, 'compass', '#fbbf24'),
 
   // Pierce & Lasers
   makeBuiltin('carve', '挖矿雕刻', '球形切削岩石、雕刻峡谷与地下洞窟', 'pierce', 'carve', '1', 'pickaxe', '#f97316'),

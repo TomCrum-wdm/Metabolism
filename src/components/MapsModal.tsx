@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
   Compass,
   Crosshair,
+  Download,
   Globe2,
   Layers,
   Map as MapIcon,
@@ -14,6 +16,7 @@ import {
 import {
   buildPlanetarySurfaceAtlas,
   CrossSectionPlane,
+  dirToLonLat,
   MapMode,
   MapProbeResult,
   MapProjection,
@@ -24,6 +27,14 @@ import {
   renderPlanarMapImageData,
   unprojectUVToLonLat,
 } from '../engine/cartography';
+import {
+  CoordDatum,
+  worldToCoord,
+} from '../engine/coordinates';
+import {
+  GeologicalTransectReport,
+  SurveyBenchmark,
+} from '../engine/geologySurvey';
 import { FluidSim } from '../engine/fluidSim';
 import { MATERIAL_PALETTE, MaterialId, VoxelPlanet } from '../engine/voxelPlanet';
 import { SandboxConfig, SandboxTelemetry } from '../engine/webgpuScene';
@@ -34,6 +45,9 @@ interface MapsModalProps {
   fluid: FluidSim;
   telemetry: SandboxTelemetry;
   config: SandboxConfig;
+  datum?: CoordDatum;
+  benchmarks?: ReadonlyArray<SurveyBenchmark>;
+  transect?: GeologicalTransectReport | null;
   onTeleport: (latDeg: number, lonDeg: number) => void;
   onClose: () => void;
 }
@@ -46,6 +60,7 @@ const MAP_MODE_TABS: ReadonlyArray<{
   { id: 'globe3d', label: '三维星球', icon: <Globe2 className="w-3.5 h-3.5" /> },
   { id: 'topographic', label: '地形高程', icon: <Mountain className="w-3.5 h-3.5" /> },
   { id: 'geology', label: '地质岩性', icon: <Layers className="w-3.5 h-3.5" /> },
+  { id: 'slope', label: '地形坡度', icon: <Activity className="w-3.5 h-3.5" /> },
   { id: 'contour', label: '等高线图', icon: <MapIcon className="w-3.5 h-3.5" /> },
   { id: 'thermal', label: '三维温度', icon: <Thermometer className="w-3.5 h-3.5" /> },
   { id: 'crossSection', label: '星球剖面', icon: <Scissors className="w-3.5 h-3.5" /> },
@@ -54,6 +69,9 @@ const MAP_MODE_TABS: ReadonlyArray<{
 const PROJECTIONS: ReadonlyArray<{ id: MapProjection; label: string }> = [
   { id: 'equirectangular', label: '等距圆柱' },
   { id: 'mollweide', label: '摩尔魏德' },
+  { id: 'sinusoidal', label: '正弦等面积' },
+  { id: 'robinson', label: '罗宾逊' },
+  { id: 'lambertAzimuthal', label: '兰伯特等面积' },
   { id: 'mercator', label: '墨卡托' },
   { id: 'polar', label: '极地双半球' },
   { id: 'orthographic', label: '正射半球' },
@@ -78,11 +96,14 @@ export const MapsModal: React.FC<MapsModalProps> = ({
   fluid,
   telemetry,
   config,
+  datum,
+  benchmarks = [],
+  transect = null,
   onTeleport,
   onClose,
 }) => {
   const [mapMode, setMapMode] = useState<MapMode>('globe3d');
-  const [projection, setProjection] = useState<MapProjection>('mollweide');
+  const [projection, setProjection] = useState<MapProjection>('robinson');
   const [centerLonDeg, setCenterLonDeg] = useState<number>(() =>
     Math.round(telemetry.playerLonDeg),
   );
@@ -90,6 +111,7 @@ export const MapsModal: React.FC<MapsModalProps> = ({
     Math.round(telemetry.playerLatDeg),
   );
   const [contourLevels, setContourLevels] = useState<number>(12);
+  const [gridStepDeg, setGridStepDeg] = useState<15 | 30 | 45>(30);
 
   // Cross-section parameters
   const [sectionPlane, setSectionPlane] = useState<CrossSectionPlane>('xy');
@@ -103,6 +125,16 @@ export const MapsModal: React.FC<MapsModalProps> = ({
     elev: Float32Array;
     temp: Float32Array;
   } | null>(null);
+
+  const effDatum: CoordDatum = useMemo(
+    () =>
+      datum ?? {
+        planetRadius: planet.baseRadius,
+        nativeVoxelSize: planet.nativeVoxelSize,
+        enuOrigin: config.enuOrigin,
+      },
+    [config.enuOrigin, datum, planet.baseRadius, planet.nativeVoxelSize],
+  );
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const dragStateRef = useRef<{
@@ -166,6 +198,75 @@ export const MapsModal: React.FC<MapsModalProps> = ({
         ctx.restore();
       }
 
+      // Active Geodesic Transect polyline overlay
+      if (transect && transect.samples.length >= 2) {
+        ctx.save();
+        ctx.strokeStyle = '#2dd4bf';
+        ctx.lineWidth = 1.8;
+        let prevPx: number | null = null;
+        let prevPy: number | null = null;
+        for (const s of transect.samples) {
+          const uv = projectLonLatToUV(
+            (s.lonDeg * Math.PI) / 180,
+            (s.latDeg * Math.PI) / 180,
+            effProj,
+            centerLonRad,
+            centerLatRad,
+          );
+          if (!uv) {
+            prevPx = null;
+            prevPy = null;
+            continue;
+          }
+          const px = uv.u * width;
+          const py = uv.v * height;
+          if (
+            prevPx !== null &&
+            prevPy !== null &&
+            Math.hypot(px - prevPx, py - prevPy) < width * 0.35
+          ) {
+            ctx.beginPath();
+            ctx.moveTo(prevPx, prevPy);
+            ctx.lineTo(px, py);
+            ctx.stroke();
+          }
+          prevPx = px;
+          prevPy = py;
+        }
+        ctx.restore();
+      }
+
+      // Recorded Survey Benchmark Pins overlay
+      for (const bm of benchmarks) {
+        const sph = dirToLonLat(bm.worldPos[0], bm.worldPos[1], bm.worldPos[2]);
+        const bUv = projectLonLatToUV(
+          sph.lonRad,
+          sph.latRad,
+          effProj,
+          centerLonRad,
+          centerLatRad,
+        );
+        if (!bUv) continue;
+        const bx = bUv.u * width;
+        const by = bUv.v * height;
+        ctx.save();
+        ctx.fillStyle = '#38bdf8';
+        ctx.strokeStyle = '#090d18';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(bx, by - 4.5);
+        ctx.lineTo(bx + 4, by);
+        ctx.lineTo(bx, by + 4.5);
+        ctx.lineTo(bx - 4, by);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.font = 'bold 9px monospace';
+        ctx.fillStyle = '#e0f2fe';
+        ctx.fillText(bm.code, bx + 5, by + 3);
+        ctx.restore();
+      }
+
       // Player current position reticle
       const pLon = (telemetry.playerLonDeg * Math.PI) / 180;
       const pLat = (telemetry.playerLatDeg * Math.PI) / 180;
@@ -199,11 +300,13 @@ export const MapsModal: React.FC<MapsModalProps> = ({
       }
     },
     [
+      benchmarks,
       centerLatDeg,
       centerLonDeg,
       telemetry.playerLatDeg,
       telemetry.playerLonDeg,
       telemetry.sunDir,
+      transect,
     ],
   );
 
@@ -277,6 +380,7 @@ export const MapsModal: React.FC<MapsModalProps> = ({
       centerLonDeg,
       centerLatDeg,
       contourLevels,
+      gridStepDeg,
     });
     const img = ctx.createImageData(PLANAR_W, PLANAR_H);
     img.data.set(pixels);
@@ -295,6 +399,7 @@ export const MapsModal: React.FC<MapsModalProps> = ({
     contourLevels,
     drawOverlayMarkers,
     fluid,
+    gridStepDeg,
     mapMode,
     offsetRatio,
     planet,
@@ -411,6 +516,24 @@ export const MapsModal: React.FC<MapsModalProps> = ({
           <div className="flex items-center gap-1.5">
             <button
               type="button"
+              data-testid="maps-export-png-btn"
+              onClick={() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const a = document.createElement('a');
+                a.href = canvas.toDataURL('image/png');
+                a.download = `terrasphere_map_${mapMode}_${projection}_seed${telemetry.seed}.png`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+              }}
+              className="h-7 px-2 rounded-xs border border-slate-700 bg-[#0d1322] hover:border-emerald-400 text-[11px] text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+              <span>导出地图 PNG</span>
+            </button>
+            <button
+              type="button"
               data-testid="maps-refresh-btn"
               onClick={() => setSampleRevision((v) => v + 1)}
               className="h-7 px-2 rounded-xs border border-slate-700 bg-[#0d1322] hover:border-sky-400 text-[11px] text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap"
@@ -478,6 +601,21 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                   </button>
                 );
               })}
+              <span className="text-[10px] text-slate-500 ml-1">经纬网</span>
+              {([15, 30, 45] as const).map((deg) => (
+                <button
+                  key={deg}
+                  type="button"
+                  onClick={() => setGridStepDeg(deg)}
+                  className={`h-6 px-1.5 rounded-xs border text-[10px] font-mono-tabular cursor-pointer ${
+                    gridStepDeg === deg
+                      ? 'border-cyan-400 bg-cyan-950/60 text-cyan-200'
+                      : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {deg}°
+                </button>
+              ))}
             </div>
           )}
         </div>
@@ -652,6 +790,23 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                     }}
                   />
                 </div>
+              ) : mapMode === 'slope' ? (
+                <div className="flex flex-col gap-1">
+                  <div className="flex justify-between text-slate-400">
+                    <span>0° 平原</span>
+                    <span>15° 缓坡</span>
+                    <span>30° 中陡坡</span>
+                    <span>45° 陡崖</span>
+                    <span>60°+ 绝壁</span>
+                  </div>
+                  <div
+                    className="h-2 w-full rounded-xs border border-slate-800"
+                    style={{
+                      background:
+                        'linear-gradient(90deg, #1a6e59 0%, #5cb85c 25%, #e6c229 50%, #e06324 75%, #b8293d 100%)',
+                    }}
+                  />
+                </div>
               ) : (
                 <div className="flex flex-col gap-1">
                   <div className="flex justify-between text-slate-400">
@@ -793,6 +948,16 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                         {activeProbe.hasWater ? ' · 含水' : ''}
                       </span>
 
+                      <span className="text-slate-400">行星 UTM 网格</span>
+                      <span className="text-right text-cyan-200">
+                        {worldToCoord(activeProbe.worldPos, 'utm_tm', effDatum).compact}
+                      </span>
+
+                      <span className="text-slate-400">星心 ECEF XYZ</span>
+                      <span className="text-right text-slate-300 text-[10px]">
+                        {worldToCoord(activeProbe.worldPos, 'ecef_xyz', effDatum).compact}
+                      </span>
+
                       <span className="text-slate-400">太阳辐照度</span>
                       <span className="text-right text-yellow-300">
                         {activeProbe.insolationWm2.toFixed(0)} W/m²
@@ -800,6 +965,11 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                     </>
                   ) : (
                     <>
+                      <span className="text-slate-400">活动坐标系</span>
+                      <span className="text-right text-cyan-200 text-[10px]">
+                        {telemetry.playerCoord.compact}
+                      </span>
+
                       <span className="text-slate-400">所在气候带</span>
                       <span className="text-right text-slate-100">
                         {telemetry.thermalRegime}

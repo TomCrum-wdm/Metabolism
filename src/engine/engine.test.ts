@@ -45,17 +45,30 @@ import {
 } from './tractorBeam';
 import { computeHotspotDeltaC } from './thermal';
 import {
+  bakeShotActionIntoProject,
   computePlanFrameCount,
+  computeProjectFrameRange,
   createDefaultDirectorPlan,
+  createDefaultDirectorProject,
   DirectorSceneAnchor,
+  evaluateCameraTrackPose,
+  evaluateCubicBezierEasing,
   evaluateDirectorPose,
+  evaluateEnvironmentTrack,
+  evaluatePostFxTrack,
+  formatSmpteTimecode,
   FPS_PRESETS,
+  getLutColorMatrixParams,
+  parseDirectorProjectJson,
   RESOLUTION_PRESETS,
+  serializeDirectorProjectJson,
 } from './director';
 import { buildTarArchive, WebmMuxer } from './webmMuxer';
 import {
   analyzeRgbaFrameLuma,
+  computeCheckpointResumeStartFrame,
   computeOfflineSubsteps,
+  computeRgbHistogram,
   normalizeReadbackRgbaToTopDown,
 } from './directorCapture';
 import {
@@ -74,6 +87,28 @@ import {
   resolveDirectorOfflineQuality,
   resolveShadowMapSize,
 } from './renderQuality';
+import {
+  computeSphericalSurveyMetrics,
+  CoordDatum,
+  coordToWorld,
+  dmsToDecimal,
+  formatDms,
+  lonLatRadiusToWorld,
+  planetaryUtmToWorld,
+  worldToAllCoords,
+  worldToCoord,
+  worldToPlanetaryUtm,
+} from './coordinates';
+import {
+  exportBenchmarksToCsv,
+  exportBoreholeToCsv,
+  exportSurveyGeoJson,
+  exportTransectToCsv,
+  measureGeologicalAttitude,
+  measureSurveyPolygonArea,
+  sampleBoreholeColumn,
+  sampleGeologicalTransect,
+} from './geologySurvey';
 
 const GRAVITY_PARAMS = {
   referenceRadius: DEFAULT_PLANET_RADIUS,
@@ -494,10 +529,13 @@ test('3D Thermal field couples solar incidence, latitude, lapse rate, and geothe
   assert.ok(rgbHot[0] > rgbHot[2], 'Geothermal core temperatures map to warm red/yellow');
 });
 
-test('Cartographic projections round-trip cleanly and planetary atlas / cross-section render valid RGBA buffers', () => {
+test('Cartographic projections round-trip cleanly and planetary atlas / slope / cross-section render valid RGBA buffers', () => {
   const projections: MapProjection[] = [
     'equirectangular',
     'mollweide',
+    'sinusoidal',
+    'robinson',
+    'lambertAzimuthal',
     'mercator',
     'polar',
     'orthographic',
@@ -524,7 +562,21 @@ test('Cartographic projections round-trip cleanly and planetary atlas / cross-se
 
   const mapPixels = renderPlanarMapImageData(80, 40, {
     mode: 'geology',
-    projection: 'mollweide',
+    projection: 'robinson',
+    atlas,
+    sunDir: [1, 0, 0],
+    atmosCfg: DEFAULT_ATMOS_CONFIG,
+    thermalCfg: DEFAULT_THERMAL_CONFIG,
+    simTimeSec: 0,
+    centerLonDeg: 0,
+    centerLatDeg: 0,
+    gridStepDeg: 15,
+  });
+  assert.equal(mapPixels.length, 80 * 40 * 4);
+
+  const slopePixels = renderPlanarMapImageData(80, 40, {
+    mode: 'slope',
+    projection: 'sinusoidal',
     atlas,
     sunDir: [1, 0, 0],
     atmosCfg: DEFAULT_ATMOS_CONFIG,
@@ -533,7 +585,7 @@ test('Cartographic projections round-trip cleanly and planetary atlas / cross-se
     centerLonDeg: 0,
     centerLatDeg: 0,
   });
-  assert.equal(mapPixels.length, 80 * 40 * 4);
+  assert.equal(slopePixels.length, 80 * 40 * 4);
 
   const section = renderCrossSectionImageData(64, 64, {
     plane: 'xy',
@@ -1886,6 +1938,372 @@ test('First-person eye pose aligns with local gravity normal and supports upward
   assert.ok(Math.abs(dotUp) < 1e-5, 'Horizon first-person look should remain perpendicular to radial up');
 });
 
+test('All 7 Planetary Coordinate Systems convert forward & inverse accurately including UTM zones and ENU frames', () => {
+  const datum: CoordDatum = {
+    planetRadius: 13.0,
+    nativeVoxelSize: 13.0 / 18,
+    enuOrigin: lonLatRadiusToWorld(35, 110, 13.0),
+  };
 
+  const samples: Array<[number, number, number]> = [
+    lonLatRadiusToWorld(35.6895, 139.6917, 13.42), // Northern East
+    lonLatRadiusToWorld(-33.8688, -70.6693, 12.65), // Southern West
+    lonLatRadiusToWorld(0.0, 0.0, 13.0), // Prime meridian equator
+    lonLatRadiusToWorld(78.2, -175.4, 14.1), // High latitude antimeridian
+  ];
 
+  for (const wp of samples) {
+    const all = worldToAllCoords(wp, datum);
+
+    for (const sys of ['geo_dd', 'ecef_xyz', 'spherical_rtp', 'local_enu'] as const) {
+      const r = all[sys];
+      const back = coordToWorld(
+        sys,
+        r.components[0].numericValue,
+        r.components[1].numericValue,
+        r.components[2].numericValue,
+        datum,
+      );
+      const err = Math.hypot(back[0] - wp[0], back[1] - wp[1], back[2] - wp[2]);
+      assert.ok(err < 1e-3, `CRS ${sys} round-trip error too large: ${err}`);
+    }
+
+    // Planetary UTM exact spherical TM forward/inverse round-trip
+    const utm = worldToPlanetaryUtm(wp[0], wp[1], wp[2], datum.planetRadius);
+    const utmBack = planetaryUtmToWorld(
+      utm.zoneNumber,
+      utm.hemisphere,
+      utm.eastingM,
+      utm.northingM,
+      utm.elevationM,
+      datum.planetRadius,
+    );
+    const utmErr = Math.hypot(utmBack[0] - wp[0], utmBack[1] - wp[1], utmBack[2] - wp[2]);
+    assert.ok(utmErr < 1e-3, `Planetary UTM round-trip error ${utmErr}`);
+    assert.ok(utm.scaleFactor >= 0.9996 && utm.scaleFactor < 1.05);
+
+    // Voxel IJK lattice within +/- 0.51 voxel radius
+    const vox = worldToCoord(wp, 'voxel_ijk', datum);
+    const voxBack = coordToWorld(
+      'voxel_ijk',
+      vox.components[0].numericValue,
+      vox.components[1].numericValue,
+      vox.components[2].numericValue,
+      datum,
+    );
+    const voxErr = Math.hypot(voxBack[0] - wp[0], voxBack[1] - wp[1], voxBack[2] - wp[2]);
+    assert.ok(voxErr <= datum.nativeVoxelSize * 0.9);
+  }
+
+  // DMS format & parse check
+  const dmsStr = formatDms(31.2304, 'N', 'S');
+  assert.ok(dmsStr.startsWith('31°13\'') && dmsStr.endsWith('N'));
+  assert.ok(Math.abs(dmsToDecimal(31, 13, 49.4, 1) - 31.2303889) < 1e-4);
+
+  // Geodesic quarter-globe arc = (pi / 2) * R0
+  const eq0: [number, number, number] = [13.0, 0, 0];
+  const eq90: [number, number, number] = [0, 0, 13.0];
+  const metrics = computeSphericalSurveyMetrics(eq0, eq90, 13.0);
+  assert.ok(Math.abs(metrics.geodesicArcM - (Math.PI / 2) * 13.0) < 1e-5);
+  assert.ok(Math.abs(metrics.centralAngleDeg - 90) < 1e-5);
+  assert.ok(Math.abs(metrics.forwardAzimuthDeg - 90) < 1e-3);
+});
+
+test('Geological attitude, geodesic transect, radial borehole column, spherical polygon area, and CSV/GeoJSON exports work coherently', () => {
+  const planet = new VoxelPlanet(202611);
+  const fluid = new FluidSim();
+  fluid.seedInitialLakes(planet);
+  const gravParams = { referenceRadius: planet.baseRadius, surfaceGravity: EARTH_SURFACE_GRAVITY };
+  const sunDir: [number, number, number] = [0.6, 0.7, 0.4];
+
+  const [sx, sy, sz] = planet.spawnPosition;
+  const sLen = Math.hypot(sx, sy, sz);
+  const surfR = planet.findSurfaceRadiusAlongRay(sx / sLen, sy / sLen, sz / sLen);
+  const pA: [number, number, number] = [(sx / sLen) * surfR, (sy / sLen) * surfR, (sz / sLen) * surfR];
+
+  // Clinometer attitude
+  const att = measureGeologicalAttitude(
+    planet,
+    fluid,
+    gravParams,
+    DEFAULT_ATMOS_CONFIG,
+    DEFAULT_THERMAL_CONFIG,
+    sunDir,
+    0,
+    pA[0],
+    pA[1],
+    pA[2],
+  );
+  assert.ok(att.slopeDeg >= 0 && att.slopeDeg <= 90);
+  assert.ok(att.strikeDeg >= 0 && att.strikeDeg < 360);
+  assert.ok(att.dipDirectionDeg >= 0 && att.dipDirectionDeg < 360);
+  assert.ok(att.gravityMs2 > 5);
+
+  // Transect profile
+  const pBDir = lonLatRadiusToWorld(25, 45, planet.baseRadius);
+  const transect = sampleGeologicalTransect(
+    planet,
+    fluid,
+    pA,
+    pBDir,
+    DEFAULT_ATMOS_CONFIG,
+    DEFAULT_THERMAL_CONFIG,
+    sunDir,
+    0,
+    40,
+  );
+  assert.equal(transect.samples.length, 40);
+  assert.ok(transect.surfacePathLengthM >= transect.spherical.geodesicArcM * 0.99);
+  assert.ok(transect.maxElevM >= transect.minElevM);
+
+  // Borehole column
+  const borehole = sampleBoreholeColumn(
+    planet,
+    pA[0],
+    pA[1],
+    pA[2],
+    DEFAULT_ATMOS_CONFIG,
+    DEFAULT_THERMAL_CONFIG,
+    sunDir,
+    0,
+    planet.baseRadius * 0.55,
+  );
+  assert.ok(borehole.strata.length >= 1);
+  assert.ok(borehole.coreRecoveryPct >= 0 && borehole.coreRecoveryPct <= 100);
+  assert.ok(borehole.bottomTempC >= borehole.surfaceTempC);
+
+  // Girard spherical excess area: octant triangle on sphere R0 has area = (4*pi*R0^2)/8 = 0.5*pi*R0^2
+  const R = planet.baseRadius;
+  const poly = measureSurveyPolygonArea(R, [
+    [R, 0, 0],
+    [0, 0, R],
+    [0, R, 0],
+  ]);
+  assert.ok(poly !== null);
+  assert.ok(
+    Math.abs(poly.sphericalAreaM2 - 0.5 * Math.PI * R * R) < 1e-3,
+    `Expected octant spherical area ${(0.5 * Math.PI * R * R).toFixed(4)}, got ${poly.sphericalAreaM2.toFixed(4)}`,
+  );
+
+  // Export serializers
+  const datum: CoordDatum = {
+    planetRadius: R,
+    nativeVoxelSize: planet.nativeVoxelSize,
+    enuOrigin: pA,
+  };
+  const bm = {
+    id: 'bm_1',
+    code: 'BM-01',
+    name: '控制点 BM-01',
+    createdAt: 0,
+    worldPos: pA,
+    normal: att.normal,
+    elevationM: att.elevationM,
+    material: att.material,
+    slopeDeg: att.slopeDeg,
+    dipDirectionDeg: att.dipDirectionDeg,
+    strikeDeg: att.strikeDeg,
+    gravityMs2: att.gravityMs2,
+    tempC: att.tempC,
+    hasWater: false,
+  };
+  const csvBm = exportBenchmarksToCsv([bm], datum);
+  assert.ok(csvBm.includes('BM-01') && csvBm.includes('UTM_Zone'));
+  const csvTr = exportTransectToCsv(transect);
+  assert.ok(csvTr.split('\n').length === 41);
+  const csvBh = exportBoreholeToCsv(borehole);
+  assert.ok(csvBh.includes('Stratum_No'));
+  const geoJson = JSON.parse(exportSurveyGeoJson([bm], transect, datum)) as {
+    type: string;
+    features: unknown[];
+  };
+  assert.equal(geoJson.type, 'FeatureCollection');
+  assert.equal(geoJson.features.length, 2);
+});
+
+test('Director NLE Multi-Track Engine: Cubic-Bezier easing, Camera/Env/PostFX tracks, shot baking, JSON round-trip, RGB histogram & checkpoint resume', () => {
+  // 1. Cubic-Bezier easing (linear identity, ease-in-out monotonic, overshoot > 1)
+  assert.equal(evaluateCubicBezierEasing([0, 0, 1, 1], 0), 0);
+  assert.equal(evaluateCubicBezierEasing([0, 0, 1, 1], 1), 1);
+  assert.ok(Math.abs(evaluateCubicBezierEasing([0, 0, 1, 1], 0.37) - 0.37) < 1e-4);
+
+  const overshootMid = evaluateCubicBezierEasing([0.34, 1.38, 0.64, 1.0], 0.55);
+  assert.ok(overshootMid > 1.0, `Expected overshoot bezier > 1.0 near t=0.55, got ${overshootMid}`);
+
+  // 2. Default project & frame range + SMPTE timecodes
+  const anchor: DirectorSceneAnchor = {
+    baseRadius: 13,
+    nativeVoxelSize: 13 / 128,
+    targetPoint: [0, 13, 0],
+    targetNormal: [0, 1, 0],
+    currentPos: [0, 26, 20],
+    currentLookAt: [0, 0, 0],
+    currentUp: [0, 1, 0],
+    currentFovDeg: 50,
+  };
+  const proj = createDefaultDirectorProject(anchor, 2026);
+  proj.fps = 60;
+  proj.durationSec = 4;
+  proj.inTimeSec = 1;
+  proj.outTimeSec = 3;
+  const range = computeProjectFrameRange(proj);
+  assert.equal(range.totalFrames, 240);
+  assert.equal(range.startFrame, 60);
+  assert.equal(range.endFrame, 179);
+  assert.equal(formatSmpteTimecode(1.5, 60), '00:00:01:30');
+  assert.equal(formatSmpteTimecode(1.0, 165), '00:00:01:000');
+
+  // 3. Camera track: linear, catmull_rom, hold, and roll rotation
+  const camTrack = [
+    {
+      ...proj.cameraTrack[0],
+      timeSec: 0,
+      position: [0, 20, 0] as [number, number, number],
+      lookAt: [0, 0, 0] as [number, number, number],
+      up: [0, 0, -1] as [number, number, number],
+      fovDeg: 40,
+      rollDeg: 0,
+      shakeAmp: 0,
+      interpMode: 'hold' as const,
+      easing: [0, 0, 1, 1] as [number, number, number, number],
+    },
+    {
+      ...proj.cameraTrack[1],
+      timeSec: 2,
+      position: [20, 20, 0] as [number, number, number],
+      lookAt: [0, 0, 0] as [number, number, number],
+      up: [0, 0, -1] as [number, number, number],
+      fovDeg: 60,
+      rollDeg: 30,
+      shakeAmp: 0,
+      interpMode: 'linear' as const,
+      easing: [0, 0, 1, 1] as [number, number, number, number],
+    },
+  ];
+  const heldPose = evaluateCameraTrackPose(camTrack, 1.5, anchor);
+  assert.ok(Math.hypot(heldPose.position[0] - 0, heldPose.position[1] - 20) < 1e-4);
+  assert.equal(heldPose.fovDeg, 40);
+
+  // Switch first keyframe to linear and evaluate midpoint
+  camTrack[0] = { ...camTrack[0], interpMode: 'linear' as const };
+  const linPose = evaluateCameraTrackPose(camTrack, 1.0, anchor);
+  assert.ok(Math.abs(linPose.position[0] - 10) < 1e-4);
+  assert.ok(Math.abs(linPose.fovDeg - 50) < 1e-4);
+  assert.ok(Math.abs((linPose.rollDeg ?? 0) - 15) < 1e-4);
+
+  // 4. Environment & Post-FX keyframe interpolation + LUT matrix
+  const envState = evaluateEnvironmentTrack(
+    [
+      {
+        id: 'e0',
+        timeSec: 0,
+        sunElevationDeg: 10,
+        sunAzimuthDeg: 0,
+        atmoDensity: 0.8,
+        scatterStrength: 1.0,
+        cloudCoverage: 0.2,
+        cloudAltitudeRatio: 0.14,
+        windSpeed: 1.0,
+        tempOffsetC: -5,
+        easing: [0, 0, 1, 1],
+      },
+      {
+        id: 'e1',
+        timeSec: 4,
+        sunElevationDeg: 50,
+        sunAzimuthDeg: 120,
+        atmoDensity: 1.6,
+        scatterStrength: 1.4,
+        cloudCoverage: 0.8,
+        cloudAltitudeRatio: 0.22,
+        windSpeed: 2.0,
+        tempOffsetC: 15,
+        easing: [0, 0, 1, 1],
+      },
+    ],
+    2.0,
+  );
+  assert.ok(Math.abs(envState.sunElevationDeg - 30) < 1e-3);
+  assert.ok(Math.abs(envState.sunAzimuthDeg - 60) < 1e-3);
+  assert.ok(Math.abs(envState.cloudCoverage - 0.5) < 1e-3);
+  assert.ok(Math.abs(envState.tempOffsetC - 5) < 1e-3);
+
+  const pfxState = evaluatePostFxTrack(
+    [
+      {
+        id: 'p0',
+        timeSec: 0,
+        lutPreset: 'natural',
+        lutIntensity: 0.2,
+        exposure: 1.0,
+        contrast: 1.0,
+        saturation: 1.0,
+        bloomStrength: 0.2,
+        vignette: 0.1,
+        filmGrain: 0.0,
+        chromaticAberration: 0,
+        aspectMask: 'none',
+        easing: [0, 0, 1, 1],
+      },
+      {
+        id: 'p1',
+        timeSec: 2,
+        lutPreset: 'cinema_teal_orange',
+        lutIntensity: 1.0,
+        exposure: 1.4,
+        contrast: 1.2,
+        saturation: 1.2,
+        bloomStrength: 0.6,
+        vignette: 0.5,
+        filmGrain: 0.1,
+        chromaticAberration: 0,
+        aspectMask: '2.39:1',
+        easing: [0, 0, 1, 1],
+      },
+    ],
+    1.5,
+  );
+  assert.equal(pfxState.lutPreset, 'cinema_teal_orange');
+  assert.equal(pfxState.aspectMask, '2.39:1');
+  assert.ok(Math.abs(pfxState.exposure - 1.3) < 1e-3);
+
+  const lutMat = getLutColorMatrixParams('cinema_teal_orange');
+  assert.ok(lutMat.shadowTint[2] > lutMat.shadowTint[0], 'Teal shadows have stronger B than R');
+  assert.ok(lutMat.highlightTint[0] > lutMat.highlightTint[2], 'Orange highlights have stronger R than B');
+
+  // 5. Bake procedural action into NLE keyframes + serialize/parse round-trip
+  const plan = createDefaultDirectorPlan();
+  plan.durationSec = 5;
+  plan.fps = 30;
+  const baked = bakeShotActionIntoProject(proj, 'orbit_360', plan, anchor, envState, 7);
+  assert.equal(baked.cameraTrack.length, 7);
+  assert.equal(baked.envTrack.length, 2);
+  const serialized = serializeDirectorProjectJson(baked);
+  const restored = parseDirectorProjectJson(serialized);
+  assert.ok(restored !== null);
+  assert.equal(restored!.cameraTrack.length, 7);
+  assert.equal(restored!.fps, 30);
+
+  // 6. RGB Histogram & Checkpoint Resume Alignment
+  const rgba = new Uint8ClampedArray(64 * 4);
+  for (let i = 0; i < 64; i++) {
+    rgba[i * 4] = i % 2 === 0 ? 250 : 20;
+    rgba[i * 4 + 1] = 120;
+    rgba[i * 4 + 2] = 60;
+    rgba[i * 4 + 3] = 255;
+  }
+  const hist = computeRgbHistogram(rgba, 32, 1);
+  assert.equal(hist.bins, 32);
+  assert.equal(hist.alphaMin, 255);
+  assert.ok(hist.meanLuma > 80 && hist.meanLuma < 200);
+
+  assert.equal(
+    computeCheckpointResumeStartFrame({ startFrame: 0, endFrame: 120, latestCheckpointFrame: 48 }),
+    48,
+  );
+  assert.equal(
+    computeCheckpointResumeStartFrame({ startFrame: 20, endFrame: 120, latestCheckpointFrame: 5 }),
+    20,
+  );
+});
 

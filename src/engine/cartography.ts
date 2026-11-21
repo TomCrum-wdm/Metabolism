@@ -7,6 +7,7 @@ export type MapMode =
   | 'globe3d'
   | 'topographic'
   | 'geology'
+  | 'slope'
   | 'contour'
   | 'thermal'
   | 'crossSection';
@@ -14,6 +15,9 @@ export type MapMode =
 export type MapProjection =
   | 'equirectangular'
   | 'mollweide'
+  | 'sinusoidal'
+  | 'robinson'
+  | 'lambertAzimuthal'
   | 'mercator'
   | 'polar'
   | 'orthographic';
@@ -137,6 +141,52 @@ export function unprojectUVToLonLat(
     }
   }
 
+  if (projection === 'sinusoidal') {
+    const latRad = (0.5 - v) * Math.PI;
+    const cosLat = Math.cos(latRad);
+    if (cosLat < 1e-4) return null;
+    const nx = (u - 0.5) * 2;
+    if (Math.abs(nx) > cosLat) return null;
+    const lonRad = wrapLon((nx * Math.PI) / cosLat + centerLonRad);
+    return { lonRad, latRad };
+  }
+
+  if (projection === 'robinson') {
+    const ny = (0.5 - v) * 2; // [-1, 1]
+    if (Math.abs(ny) > 1) return null;
+    const latRad = robinsonInverseY(ny);
+    const plen = robinsonXScale(latRad);
+    const nx = (u - 0.5) * 2;
+    if (Math.abs(nx) > plen) return null;
+    const lonRad = wrapLon((nx * Math.PI) / Math.max(1e-4, plen) + centerLonRad);
+    return { lonRad, latRad };
+  }
+
+  if (projection === 'lambertAzimuthal') {
+    // Aspect 2:1 -> dual hemisphere or full sphere inside circle of radius 2 centered at u=0.5, v=0.5
+    // Map full sphere into central disk (circle radius 0.25 in u -> 0.5 in v, representing rho in [0, 2])
+    const dx = (u - 0.5) * 4.0; // [-2, 2], circle disk rho <= 1 => rhoAngle up to sqrt(2)*2? Wait:
+    const dy = (0.5 - v) * 2.0; // [-1, 1]
+    const rho = Math.hypot(dx, dy);
+    if (rho > 1.0) return null;
+    if (rho < 1e-6) {
+      return { lonRad: centerLonRad, latRad: centerLatRad };
+    }
+    // Scale disk rho=1 to cover full globe (c = pi -> sin(c/2) = 1 -> scaled rho*2 / 2 => c = 2*asin(rho))
+    const c = 2 * Math.asin(clamp(rho, 0, 1));
+    const cosC = Math.cos(c);
+    const sinC = Math.sin(c);
+    const cosP = Math.cos(centerLatRad);
+    const sinP = Math.sin(centerLatRad);
+
+    const latRad = Math.asin(clamp(cosC * sinP + (dy * sinC * cosP) / rho, -1, 1));
+    const lonRad = wrapLon(
+      centerLonRad +
+        Math.atan2(dx * sinC, rho * cosP * cosC - dy * sinP * sinC),
+    );
+    return { lonRad, latRad };
+  }
+
   // Orthographic globe hemisphere centered at (centerLonRad, centerLatRad)
   const dx = (u - 0.5) * 4.0; // assuming 2:1 canvas aspect, circle radius = 0.25 in u -> 0.5 in v
   const dy = (0.5 - v) * 2.0;
@@ -159,6 +209,47 @@ export function unprojectUVToLonLat(
   const wz = rz * sinL + rx * cosL;
 
   return dirToLonLat(wx, wy, wz);
+}
+
+// Standard Robinson projection 5-degree lookup table (PLEN = x scale, PDFE = y scale)
+const ROBINSON_PLEN = [
+  1.0000, 0.9986, 0.9954, 0.9900, 0.9822, 0.9730, 0.9600, 0.9427, 0.9216,
+  0.8962, 0.8679, 0.8350, 0.7986, 0.7597, 0.7186, 0.6732, 0.6213, 0.5722, 0.5322,
+];
+const ROBINSON_PDFE = [
+  0.0000, 0.0620, 0.1240, 0.1860, 0.2480, 0.3100, 0.3720, 0.4340, 0.4958,
+  0.5571, 0.6176, 0.6769, 0.7346, 0.7903, 0.8435, 0.8936, 0.9394, 0.9761, 1.0000,
+];
+
+function robinsonXScale(latRad: number): number {
+  const absDeg = clamp((Math.abs(latRad) * 180) / Math.PI, 0, 90);
+  const f = absDeg / 5;
+  const i = Math.min(17, Math.floor(f));
+  const t = f - i;
+  return ROBINSON_PLEN[i] + (ROBINSON_PLEN[i + 1] - ROBINSON_PLEN[i]) * t;
+}
+
+function robinsonYNorm(latRad: number): number {
+  const sign = latRad < 0 ? -1 : 1;
+  const absDeg = clamp((Math.abs(latRad) * 180) / Math.PI, 0, 90);
+  const f = absDeg / 5;
+  const i = Math.min(17, Math.floor(f));
+  const t = f - i;
+  return sign * (ROBINSON_PDFE[i] + (ROBINSON_PDFE[i + 1] - ROBINSON_PDFE[i]) * t);
+}
+
+function robinsonInverseY(ny: number): number {
+  const sign = ny < 0 ? -1 : 1;
+  const absY = clamp(Math.abs(ny), 0, 1);
+  for (let i = 0; i < 18; i++) {
+    if (absY <= ROBINSON_PDFE[i + 1] || i === 17) {
+      const span = Math.max(1e-6, ROBINSON_PDFE[i + 1] - ROBINSON_PDFE[i]);
+      const t = clamp((absY - ROBINSON_PDFE[i]) / span, 0, 1);
+      const deg = (i + t) * 5;
+      return sign * ((deg * Math.PI) / 180);
+    }
+  }
+  return sign * (Math.PI / 2);
 }
 
 /**
@@ -205,6 +296,42 @@ export function projectLonLatToUV(
     return {
       u: 0.5 + nx * 0.5,
       v: 0.5 - ny * 0.5,
+    };
+  }
+
+  if (projection === 'sinusoidal') {
+    const nx = (relLon / Math.PI) * Math.cos(latRad);
+    return {
+      u: 0.5 + nx * 0.5,
+      v: 0.5 - latRad / Math.PI,
+    };
+  }
+
+  if (projection === 'robinson') {
+    const plen = robinsonXScale(latRad);
+    const ny = robinsonYNorm(latRad);
+    const nx = (relLon / Math.PI) * plen;
+    return {
+      u: 0.5 + nx * 0.5,
+      v: 0.5 - ny * 0.5,
+    };
+  }
+
+  if (projection === 'lambertAzimuthal') {
+    const cosP = Math.cos(centerLatRad);
+    const sinP = Math.sin(centerLatRad);
+    const cosLat = Math.cos(latRad);
+    const sinLat = Math.sin(latRad);
+    const cosDLon = Math.cos(relLon);
+    const denom = 1 + sinP * sinLat + cosP * cosLat * cosDLon;
+    if (denom <= 1e-6) return null;
+    const kPrime = Math.sqrt(2 / denom);
+    // Normalize radius 2 -> disk radius 1 (to match 2:1 aspect disk)
+    const dx = (kPrime * cosLat * Math.sin(relLon)) * 0.5;
+    const dy = (kPrime * (cosP * sinLat - sinP * cosLat * cosDLon)) * 0.5;
+    return {
+      u: 0.5 + dx * 0.25,
+      v: 0.5 - dy * 0.5,
     };
   }
 
@@ -424,10 +551,11 @@ export interface PlanarMapRenderParams {
   centerLonDeg: number;
   centerLatDeg: number;
   contourLevels?: number;
+  gridStepDeg?: 15 | 30 | 45;
 }
 
 /**
- * Renders any projected 2D map layer (Topographic, Geology, Contour, Thermal, or Orthographic Globe)
+ * Renders any projected 2D map layer (Topographic, Geology, Slope, Contour, Thermal, or Orthographic Globe)
  * into a crisp RGBA buffer ready for Canvas2D ImageData.
  */
 export function renderPlanarMapImageData(
@@ -452,6 +580,7 @@ export function renderPlanarMapImageData(
   const effProj: MapProjection = mode === 'globe3d' ? 'orthographic' : projection;
   const elevSpan = Math.max(atlas.maxElev - atlas.minElev, 0.1);
   const contourSteps = params.contourLevels ?? 12;
+  const gridStepDeg = params.gridStepDeg ?? 30;
 
   // Store elevations/temps for isoline boundary detection on contour/thermal maps
   const scalarField = new Float32Array(width * height);
@@ -505,6 +634,33 @@ export function renderPlanarMapImageData(
         r *= shade * rimBoost;
         g *= shade * rimBoost;
         b *= shade * rimBoost;
+      } else if (mode === 'slope') {
+        // Geological Slope Angle Heat-Map (0° Flat -> 15° Gentle -> 35° Steep -> 60°+ Cliff)
+        const slopeDeg = (Math.acos(clamp(sample.slope, 0, 1)) * 180) / Math.PI;
+        const sNorm = clamp(slopeDeg / 60, 0, 1);
+        if (hasWater && slopeDeg < 8) {
+          r = 0.08;
+          g = 0.34;
+          b = 0.62;
+        } else if (sNorm < 0.35) {
+          const t = sNorm / 0.35;
+          r = 0.12 + t * 0.35;
+          g = 0.56 + t * 0.24;
+          b = 0.34 - t * 0.18;
+        } else if (sNorm < 0.7) {
+          const t = (sNorm - 0.35) / 0.35;
+          r = 0.47 + t * 0.48;
+          g = 0.80 - t * 0.34;
+          b = 0.16 - t * 0.04;
+        } else {
+          const t = (sNorm - 0.7) / 0.3;
+          r = 0.95 - t * 0.05;
+          g = 0.46 - t * 0.34;
+          b = 0.12 + t * 0.16;
+        }
+        r *= 0.72 + 0.28 * shade;
+        g *= 0.72 + 0.28 * shade;
+        b *= 0.72 + 0.28 * shade;
       } else if (mode === 'thermal') {
         const th = sampleThermalField(
           wx,
@@ -557,11 +713,12 @@ export function renderPlanarMapImageData(
         }
       }
 
-      // Draw crisp latitude/longitude graticule every 30°
+      // Draw crisp latitude/longitude graticule every gridStepDeg
       const lonDeg = (coord.lonRad * 180) / Math.PI;
       const latDeg = (coord.latRad * 180) / Math.PI;
-      const onLonGrid = Math.abs(((lonDeg + 180) % 30) - 15) > 14.3;
-      const onLatGrid = Math.abs(((latDeg + 90) % 30) - 15) > 14.3;
+      const halfStep = gridStepDeg * 0.5;
+      const onLonGrid = Math.abs(((lonDeg + 180) % gridStepDeg) - halfStep) > halfStep - 0.65;
+      const onLatGrid = Math.abs(((latDeg + 90) % gridStepDeg) - halfStep) > halfStep - 0.65;
       if (onLonGrid || onLatGrid) {
         r = r * 0.8 + 0.24 * 0.2;
         g = g * 0.8 + 0.36 * 0.2;

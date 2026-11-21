@@ -1,6 +1,9 @@
+import { DirectorAspectMask, RgbHistogramBins } from './director';
+
 /**
- * Pure utilities for deterministic Director Mode offline simulation substepping
- * and GPU RenderTarget RGBA readback normalization (WebGPU top-down & WebGL2 bottom-up).
+ * Pure utilities for deterministic Director Mode offline simulation substepping,
+ * GPU RenderTarget RGBA readback normalization, 32-bin RGB histogram telemetry,
+ * aspect-ratio matte framing, and checkpoint resume frame alignment.
  */
 
 export interface OfflineSubstepSchedule {
@@ -104,6 +107,149 @@ export function analyzeRgbaFrameLuma(
     alphaMin,
     sampleCount,
   };
+}
+
+/**
+ * Computes normalized 32-bin (or custom N-bin) RGB & Luma distributions for live waveform/histogram inspection.
+ */
+export function computeRgbHistogram(
+  rgba: Uint8Array | Uint8ClampedArray,
+  bins = 32,
+  pixelStride = 48,
+): RgbHistogramBins {
+  const nBins = Math.max(8, Math.min(128, Math.round(bins)));
+  const rArr = new Array<number>(nBins).fill(0);
+  const gArr = new Array<number>(nBins).fill(0);
+  const bArr = new Array<number>(nBins).fill(0);
+  const lArr = new Array<number>(nBins).fill(0);
+
+  const totalPixels = Math.floor(rgba.length / 4);
+  if (totalPixels <= 0) {
+    return {
+      bins: nBins,
+      r: rArr,
+      g: gArr,
+      b: bArr,
+      luma: lArr,
+      meanLuma: 0,
+      alphaMin: 0,
+      clipHighPct: 0,
+      clipLowPct: 0,
+    };
+  }
+
+  const step = Math.max(1, Math.floor(pixelStride));
+  let count = 0;
+  let lumaSum = 0;
+  let alphaMin = 255;
+  let clipHigh = 0;
+  let clipLow = 0;
+
+  for (let p = 0; p < totalPixels; p += step) {
+    const o = p * 4;
+    const r = rgba[o];
+    const g = rgba[o + 1];
+    const b = rgba[o + 2];
+    const a = rgba[o + 3];
+    if (a < alphaMin) alphaMin = a;
+
+    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    lumaSum += luma;
+    if (luma >= 250) clipHigh++;
+    if (luma <= 4) clipLow++;
+
+    const br = Math.min(nBins - 1, Math.floor((r / 256) * nBins));
+    const bg = Math.min(nBins - 1, Math.floor((g / 256) * nBins));
+    const bb = Math.min(nBins - 1, Math.floor((b / 256) * nBins));
+    const bl = Math.min(nBins - 1, Math.floor((Math.min(255, luma) / 256) * nBins));
+
+    rArr[br]++;
+    gArr[bg]++;
+    bArr[bb]++;
+    lArr[bl]++;
+    count++;
+  }
+
+  let peak = 1;
+  for (let i = 0; i < nBins; i++) {
+    if (rArr[i] > peak) peak = rArr[i];
+    if (gArr[i] > peak) peak = gArr[i];
+    if (bArr[i] > peak) peak = bArr[i];
+    if (lArr[i] > peak) peak = lArr[i];
+  }
+  for (let i = 0; i < nBins; i++) {
+    rArr[i] = Number((rArr[i] / peak).toFixed(4));
+    gArr[i] = Number((gArr[i] / peak).toFixed(4));
+    bArr[i] = Number((bArr[i] / peak).toFixed(4));
+    lArr[i] = Number((lArr[i] / peak).toFixed(4));
+  }
+
+  return {
+    bins: nBins,
+    r: rArr,
+    g: gArr,
+    b: bArr,
+    luma: lArr,
+    meanLuma: count > 0 ? lumaSum / count : 0,
+    alphaMin,
+    clipHighPct: count > 0 ? Number(((clipHigh / count) * 100).toFixed(1)) : 0,
+    clipLowPct: count > 0 ? Number(((clipLow / count) * 100).toFixed(1)) : 0,
+  };
+}
+
+/**
+ * Draws cinema letterbox / pillarbox bars directly onto a rendered 2D canvas frame when aspectMask !== 'none'.
+ */
+export function applyAspectMatteToCanvas2D(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  aspectMask: DirectorAspectMask,
+): void {
+  if (aspectMask === 'none' || width <= 0 || height <= 0) return;
+  const targetRatio =
+    aspectMask === '2.39:1'
+      ? 2.39
+      : aspectMask === '16:9'
+        ? 16 / 9
+        : 9 / 16;
+  const curRatio = width / height;
+  ctx.save();
+  ctx.fillStyle = '#000000';
+  if (curRatio < targetRatio - 0.01) {
+    // Letterbox top & bottom
+    const activeH = Math.round(width / targetRatio);
+    const barH = Math.max(0, Math.floor((height - activeH) / 2));
+    if (barH > 0) {
+      ctx.fillRect(0, 0, width, barH);
+      ctx.fillRect(0, height - barH, width, barH);
+    }
+  } else if (curRatio > targetRatio + 0.01) {
+    // Pillarbox left & right (e.g. 9:16 vertical short framing)
+    const activeW = Math.round(height * targetRatio);
+    const barW = Math.max(0, Math.floor((width - activeW) / 2));
+    if (barW > 0) {
+      ctx.fillRect(0, 0, barW, height);
+      ctx.fillRect(width - barW, 0, barW, height);
+    }
+  }
+  ctx.restore();
+}
+
+/**
+ * Aligns checkpoint resumption to the latest clean SimulationCheckpoint at or before completedFrames.
+ * For WebM VP8/VP9, GOP delta frames depend on the prior keyframe so resuming starts on a saved keyframe boundary.
+ */
+export function computeCheckpointResumeStartFrame(params: {
+  startFrame: number;
+  endFrame: number;
+  latestCheckpointFrame: number | null;
+}): number {
+  const { startFrame, endFrame, latestCheckpointFrame } = params;
+  if (latestCheckpointFrame === null || latestCheckpointFrame < startFrame) {
+    return startFrame;
+  }
+  return Math.max(startFrame, Math.min(endFrame + 1, latestCheckpointFrame));
 }
 
 /**

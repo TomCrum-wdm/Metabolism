@@ -8,8 +8,10 @@ import {
   ChevronUp,
   Clapperboard,
   Cloud,
+  Compass,
   Crosshair,
   ExternalLink,
+  Globe2,
   Hand,
   Magnet,
   Map as MapIcon,
@@ -26,6 +28,7 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
+import { COORD_SYSTEM_SPECS, CoordSystemId } from '../engine/coordinates';
 import { TerrainOverlayMode } from '../engine/voxelPlanet';
 import { PlanetToolDef, ToolAttributes } from '../engine/toolRegistry';
 import {
@@ -54,6 +57,8 @@ interface GameHudProps {
   directorPreviewing: boolean;
   debugOpen: boolean;
   mapsOpen: boolean;
+  surveyOpen: boolean;
+  surveyBenchmarkCount: number;
   atmosPanelOpen: boolean;
   dockOpen: boolean;
   touchEnabled: boolean;
@@ -75,6 +80,7 @@ interface GameHudProps {
   onResetPlanet: () => void;
   onOpenSeedModal: () => void;
   onToggleMaps: () => void;
+  onToggleSurvey: () => void;
   onToggleAtmosPanel: () => void;
   onToggleDebug: () => void;
   onReselectLanding: () => void;
@@ -147,6 +153,8 @@ export const GameHud: React.FC<GameHudProps> = ({
   directorPreviewing,
   debugOpen,
   mapsOpen,
+  surveyOpen,
+  surveyBenchmarkCount,
   atmosPanelOpen,
   dockOpen,
   touchEnabled,
@@ -168,6 +176,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   onResetPlanet,
   onOpenSeedModal,
   onToggleMaps,
+  onToggleSurvey,
   onToggleAtmosPanel,
   onToggleDebug,
   onReselectLanding,
@@ -577,6 +586,28 @@ export const GameHud: React.FC<GameHudProps> = ({
           <button
             type="button"
             tabIndex={-1}
+            data-testid="survey-panel-btn"
+            aria-pressed={surveyOpen}
+            title="打开地质测绘与多坐标系工作站：控制点、测地剖面线、钻孔岩芯、产状罗盘与坐标换算 (U)"
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onToggleSurvey();
+            }}
+            className={`h-7 px-2 rounded-xs border text-[11px] font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0 ${
+              surveyOpen
+                ? 'border-teal-400 bg-teal-950/70 text-teal-200'
+                : 'border-slate-700/80 bg-[#0d1322] text-slate-200 hover:border-teal-400/70'
+            }`}
+          >
+            <Compass className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+            <span>
+              地质测绘 [U]{surveyBenchmarkCount > 0 ? ` (${surveyBenchmarkCount})` : ''}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            tabIndex={-1}
             data-testid="gravity-field-btn"
             title="显示或隐藏牛顿引力矢量场 (G)"
             onClick={(e) => {
@@ -732,6 +763,78 @@ export const GameHud: React.FC<GameHudProps> = ({
           </button>
         </div>
       </header>
+
+      {/* Compact Scientific CRS & Surveying Readout Strip */}
+      {!directorPreviewing && (
+        <div
+          data-testid="hud-crs-strip"
+          className="pointer-events-none pl-16 pr-2.5 pt-1 flex items-center justify-between gap-2"
+        >
+          <div className="pointer-events-auto inline-flex flex-wrap items-center gap-x-2.5 gap-y-0.5 rounded-xs border border-slate-800/90 bg-[#070b14]/88 px-2 py-0.5 text-[10.5px] font-mono-tabular shadow-md">
+            <div className="flex items-center gap-1">
+              <Globe2 className="w-3 h-3 text-cyan-400 shrink-0" />
+              <select
+                data-testid="hud-crs-select"
+                value={config.coordSystem}
+                onChange={(e) =>
+                  onUpdateConfig({ coordSystem: e.target.value as CoordSystemId })
+                }
+                className="bg-transparent text-cyan-300 font-semibold focus:outline-none cursor-pointer"
+                title="切换当前实时显示坐标系"
+              >
+                {COORD_SYSTEM_SPECS.map((s) => (
+                  <option key={s.id} value={s.id} className="bg-[#090d18] text-slate-100">
+                    {s.code} · {s.shortName}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-1 border-l border-slate-800 pl-2">
+              <span className="text-slate-500">POS</span>
+              <span className="text-slate-100" data-testid="hud-player-coord">
+                {telemetry.playerCoord.compact}
+              </span>
+            </div>
+
+            {telemetry.hoveredCoord && (
+              <div className="hidden md:flex items-center gap-1 border-l border-slate-800 pl-2">
+                <span className="text-slate-500">CUR</span>
+                <span className="text-teal-300" data-testid="hud-hover-coord">
+                  {telemetry.hoveredCoord.compact}
+                </span>
+              </div>
+            )}
+
+            {telemetry.hoveredAttitude && (
+              <div className="hidden lg:flex items-center gap-1 border-l border-slate-800 pl-2">
+                <span className="text-slate-500">产状</span>
+                <span className="text-amber-300">
+                  {telemetry.hoveredAttitude.strikeLabel}
+                </span>
+              </div>
+            )}
+
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-coord-grid-btn"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onUpdateConfig({ showCoordGrid: !config.showCoordGrid });
+              }}
+              className={`ml-1 px-1.5 py-0.5 rounded-xs border text-[10px] cursor-pointer transition-colors ${
+                config.showCoordGrid
+                  ? 'border-cyan-400 bg-cyan-950/70 text-cyan-200'
+                  : 'border-slate-700/80 bg-slate-900/80 text-slate-400 hover:text-white'
+              }`}
+              title="显示/隐藏星球三维经纬坐标网格与极轴"
+            >
+              三维经纬网
+            </button>
+          </div>
+        </div>
+      )}
 
       {showBackendAlert && !downgradeBannerDismissed && !directorPreviewing && (
         <div className="pointer-events-none flex justify-center pt-1.5 px-3">

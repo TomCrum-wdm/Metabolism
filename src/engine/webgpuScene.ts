@@ -63,10 +63,12 @@ import {
   VoxelCellProbe,
   VoxelFormatStats,
   VoxelPlanet,
+  VoxelPlanetSnapshot,
 } from './voxelPlanet';
 import {
   ActiveFluidTractorField,
   FluidSim,
+  FluidSnapshot,
   MAX_FLUID_PARTICLES,
 } from './fluidSim';
 import {
@@ -116,18 +118,54 @@ import {
 } from './cameraMath';
 import {
   computePlanFrameCount,
+  computeProjectFrameRange,
   DirectorKeyframe,
   DirectorRenderProgress,
   DirectorSceneAnchor,
   DirectorShotPlan,
+  DirectorTimelineProject,
+  DirectorWorldEvent,
+  EvaluatedPostFxState,
+  evaluateCameraTrackPose,
   evaluateDirectorPose,
+  evaluateEnvironmentTrack,
+  evaluatePostFxTrack,
+  getLutColorMatrixParams,
+  WORLD_EVENT_META,
 } from './director';
 import {
+  applyAspectMatteToCanvas2D,
   blitRgbaTopDownToCanvas2D,
+  computeCheckpointResumeStartFrame,
   computeOfflineSubsteps,
+  computeRgbHistogram,
   normalizeReadbackRgbaToTopDown,
 } from './directorCapture';
+import {
+  assembleDirectorJobBlob,
+  getLatestCheckpointAtOrBefore,
+  RenderCheckpointJob,
+  saveEncodedFrameChunkToDb,
+  saveRenderJobToDb,
+  saveSimulationCheckpointToDb,
+} from './directorStorage';
 import { buildTarArchive, WebmMuxer, WebmVideoCodec } from './webmMuxer';
+import {
+  CoordDatum,
+  CoordReadout,
+  CoordSystemId,
+  worldToCoord,
+} from './coordinates';
+import {
+  BoreholeLogReport,
+  GeologicalAttitude,
+  GeologicalTransectReport,
+  measureGeologicalAttitude,
+  sampleBoreholeColumn,
+  sampleGeologicalTransect,
+  SurveyBenchmark,
+  SurveyToolKind,
+} from './geologySurvey';
 import {
   BackendDiagnosticInfo,
   classifyBackendDiagnostic,
@@ -152,6 +190,7 @@ import {
   ShadowQualityLevel,
 } from './renderQuality';
 import {
+  buildPostGradingCompositeNode,
   buildTerrainSubVoxelPbrBundle,
   buildVolumetricAtmoCompositeNode,
   buildWaterWaveNormalNode,
@@ -172,6 +211,19 @@ export type CameraMode =
 export type LandingCameraStage = 'selecting' | 'descending' | 'landed';
 export type GamePhase = 'title' | 'playing' | 'paused';
 export type LodMode = 'auto' | ChunkLodLevel;
+
+export interface DirectorWorldSnapshot {
+  planet: VoxelPlanetSnapshot;
+  fluid: FluidSnapshot;
+  hotspots: ThermalHotspot[];
+  simTimeSec: number;
+  sunAzimuthDeg: number;
+  sunElevationDeg: number;
+  atmosphere: AtmosphereConfig;
+  thermal: ThermalConfig;
+  playerPos: [number, number, number];
+  playerFwd: [number, number, number];
+}
 
 export interface GenerationProgress {
   active: boolean;
@@ -221,6 +273,10 @@ export interface SandboxTelemetry {
   tractorBeam: TractorBeamTelemetry;
   backendInfo: BackendDiagnosticInfo;
   perf: PerformanceMetricsSnapshot;
+  playerCoord: CoordReadout;
+  hoveredCoord: CoordReadout | null;
+  hoveredWorldPos: [number, number, number] | null;
+  hoveredAttitude: GeologicalAttitude | null;
 }
 
 export interface SandboxConfig {
@@ -247,6 +303,9 @@ export interface SandboxConfig {
   terrainRenderMode: TerrainRenderMode;
   terrainOverlay: TerrainOverlayMode;
   voxelEdges: boolean;
+  coordSystem: CoordSystemId;
+  showCoordGrid: boolean;
+  enuOrigin: [number, number, number];
   atmosphere: AtmosphereConfig;
   thermal: ThermalConfig;
   renderQuality: RenderQualityConfig;
@@ -297,6 +356,7 @@ export class PlanetarySandboxEngine {
   private directorPreviewAnchor: DirectorSceneAnchor | null = null;
   private directorPreviewBaseSunAzimuth = 28;
   private onDirectorPreviewEnd?: () => void;
+  private directorTimelineLocked = false;
 
   // Lighting & Sky
   private sunLight!: THREE.DirectionalLight;
@@ -330,13 +390,29 @@ export class PlanetarySandboxEngine {
   private bloomEnabledNode = uniform(1.0);
   private legacyAtmoShellScaleNode = uniform(1.0);
 
-  // TSL Post-Processing RenderPipeline (SSGI + SSR + GTAO + Volumetric Scattering + Bloom)
+  // Director NLE Color Grading & Film Finishing uniforms
+  private postExposureGainNode = uniform(1.0);
+  private postContrastNode = uniform(1.0);
+  private postSaturationNode = uniform(1.0);
+  private postLutIntensityNode = uniform(0.0);
+  private postShadowTintNode = uniform(new THREE.Vector3(1.0, 1.0, 1.0));
+  private postHighlightTintNode = uniform(new THREE.Vector3(1.0, 1.0, 1.0));
+  private postVignetteNode = uniform(0.0);
+  private postFilmGrainNode = uniform(0.0);
+  private activePostGradingEnabled = false;
+  private activeBloomStrength = 0.34;
+  private activeAspectMask: 'none' | '2.39:1' | '16:9' | '9:16' = 'none';
+  private resizeObserver: ResizeObserver | null = null;
+  private directorGizmoGroup: THREE.Group | null = null;
+
+  // TSL Post-Processing RenderPipeline (SSGI + SSR + GTAO + Volumetric Scattering + Bloom + Grading)
   private renderPipeline: THREE.RenderPipeline | null = null;
   private activePipelineKey = '';
   private pipelineFailed = false;
   private activeSsgiNode: ReturnType<typeof ssgi> | null = null;
   private activeSsrNode: ReturnType<typeof ssr> | null = null;
   private activeAoNode: ReturnType<typeof gtao> | null = null;
+  private activeBloomNode: ReturnType<typeof bloom> | null = null;
   private activeDenoiseNodes: Array<ReturnType<typeof denoise>> = [];
   private pipelineDisposables: Array<{ dispose?: () => void }> = [];
   private currentShadowMapSize = 2048;
@@ -645,6 +721,20 @@ export class PlanetarySandboxEngine {
 
   private thermalHotspots: ThermalHotspot[] = [];
   private onMaterialPicked: ((mat: MaterialId) => void) | null = null;
+  private onSurveyAction:
+    | ((action: {
+        kind: SurveyToolKind;
+        worldPos: [number, number, number];
+        normal: [number, number, number];
+        attitude: GeologicalAttitude;
+        hasWater: boolean;
+      }) => void)
+    | null = null;
+  private coordGridGroup!: THREE.Group;
+  private coordGridBuiltRadius = 0;
+  private surveyOverlayGroup!: THREE.Group;
+  private lastHoveredWorldPos: [number, number, number] | null = null;
+  private lastHoveredAttitude: GeologicalAttitude | null = null;
 
   // Input & Touch state
   private keys = new Set<string>();
@@ -692,6 +782,9 @@ export class PlanetarySandboxEngine {
     terrainRenderMode: 'smooth',
     terrainOverlay: 'material',
     voxelEdges: true,
+    coordSystem: 'geo_dd',
+    showCoordGrid: false,
+    enuOrigin: [DEFAULT_PLANET_RADIUS, 0, 0],
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
     renderQuality: { ...DEFAULT_RENDER_QUALITY },
@@ -859,6 +952,7 @@ export class PlanetarySandboxEngine {
     this.syncEnvironmentUniforms();
     this.updateCloudPuffs(0);
     this.updateSunDirection();
+    this.rebuildCoordGridOverlay();
   }
 
   public async init(): Promise<void> {
@@ -929,6 +1023,9 @@ export class PlanetarySandboxEngine {
     this.highResGroup = new THREE.Group();
     this.scene.add(this.highResGroup);
     this.setupChunkBoundsOverlay();
+    this.setupCoordGridOverlay();
+    this.setupSurveyOverlayGroup();
+    this.setupDirectorGizmoGroup();
     this.setupFluidMeshes();
     this.setupPlayer();
     this.setupGravityVisualizer();
@@ -948,6 +1045,12 @@ export class PlanetarySandboxEngine {
     this.syncRenderPipeline(false);
 
     this.bindEvents();
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        this.handleResize();
+      });
+      this.resizeObserver.observe(this.container);
+    }
     this.emitTelemetrySnapshot();
     this.lastTime = performance.now();
     this.scheduleNextFrame();
@@ -1558,6 +1661,364 @@ export class PlanetarySandboxEngine {
     this.scene.add(this.chunkBoundsLines);
   }
 
+  private setupCoordGridOverlay(): void {
+    this.coordGridGroup = new THREE.Group();
+    this.coordGridGroup.visible = this.config.showCoordGrid;
+    this.scene.add(this.coordGridGroup);
+    this.rebuildCoordGridOverlay();
+  }
+
+  private rebuildCoordGridOverlay(): void {
+    if (!this.coordGridGroup) return;
+    const baseR = this.planet.baseRadius;
+    if (Math.abs(this.coordGridBuiltRadius - baseR) < 1e-4 && this.coordGridGroup.children.length > 0) {
+      return;
+    }
+    this.coordGridBuiltRadius = baseR;
+
+    while (this.coordGridGroup.children.length > 0) {
+      const child = this.coordGridGroup.children.pop() as THREE.Object3D & {
+        geometry?: THREE.BufferGeometry;
+        material?: THREE.Material;
+      };
+      child.geometry?.dispose?.();
+      child.material?.dispose?.();
+    }
+
+    const rGrid = baseR * 1.18 + Math.max(0.25, this.planet.voxelSize * 0.8);
+    const verts: number[] = [];
+    const cols: number[] = [];
+
+    const pushSeg = (
+      ax: number,
+      ay: number,
+      az: number,
+      bx: number,
+      by: number,
+      bz: number,
+      cr: number,
+      cg: number,
+      cb: number,
+    ) => {
+      verts.push(ax, ay, az, bx, by, bz);
+      cols.push(cr, cg, cb, cr, cg, cb);
+    };
+
+    const segs = 96;
+    // Latitude parallels every 30° (-60..+60)
+    for (let latDeg = -60; latDeg <= 60; latDeg += 30) {
+      const lat = (latDeg * Math.PI) / 180;
+      const cosL = Math.cos(lat);
+      const y = rGrid * Math.sin(lat);
+      const isEq = latDeg === 0;
+      const cr = isEq ? 0.16 : 0.24;
+      const cg = isEq ? 0.92 : 0.62;
+      const cb = isEq ? 0.72 : 0.88;
+      for (let i = 0; i < segs; i++) {
+        const a0 = (i / segs) * Math.PI * 2;
+        const a1 = ((i + 1) / segs) * Math.PI * 2;
+        pushSeg(
+          rGrid * cosL * Math.cos(a0),
+          y,
+          rGrid * cosL * Math.sin(a0),
+          rGrid * cosL * Math.cos(a1),
+          y,
+          rGrid * cosL * Math.sin(a1),
+          cr,
+          cg,
+          cb,
+        );
+      }
+    }
+
+    // Meridians every 30° (0..330)
+    for (let lonDeg = 0; lonDeg < 180; lonDeg += 30) {
+      const lon = (lonDeg * Math.PI) / 180;
+      const cosLon = Math.cos(lon);
+      const sinLon = Math.sin(lon);
+      const isPrime = lonDeg === 0;
+      const cr = isPrime ? 0.98 : 0.22;
+      const cg = isPrime ? 0.78 : 0.56;
+      const cb = isPrime ? 0.22 : 0.84;
+      for (let i = 0; i < segs; i++) {
+        const t0 = (i / segs) * Math.PI * 2;
+        const t1 = ((i + 1) / segs) * Math.PI * 2;
+        pushSeg(
+          rGrid * Math.cos(t0) * cosLon,
+          rGrid * Math.sin(t0),
+          rGrid * Math.cos(t0) * sinLon,
+          rGrid * Math.cos(t1) * cosLon,
+          rGrid * Math.sin(t1),
+          rGrid * Math.cos(t1) * sinLon,
+          cr,
+          cg,
+          cb,
+        );
+      }
+    }
+
+    // ECEF Principal Axes (X Prime Meridian, Y North Pole, Z 90°E)
+    const axisExt = rGrid * 1.24;
+    pushSeg(-axisExt, 0, 0, axisExt, 0, 0, 0.96, 0.36, 0.36); // X
+    pushSeg(0, -axisExt, 0, 0, axisExt, 0, 0.32, 0.92, 0.48); // Y
+    pushSeg(0, 0, -axisExt, 0, 0, axisExt, 0.32, 0.68, 0.98); // Z
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    const mat = new THREE.LineBasicNodeMaterial();
+    mat.vertexColors = true;
+    mat.colorNode = vertexColor();
+    mat.opacityNode = float(0.45);
+    mat.transparent = true;
+
+    const lines = new THREE.LineSegments(geo, mat);
+    lines.frustumCulled = false;
+    this.coordGridGroup.add(lines);
+  }
+
+  private setupSurveyOverlayGroup(): void {
+    this.surveyOverlayGroup = new THREE.Group();
+    this.scene.add(this.surveyOverlayGroup);
+  }
+
+  private setupDirectorGizmoGroup(): void {
+    this.directorGizmoGroup = new THREE.Group();
+    this.directorGizmoGroup.visible = false;
+    this.scene.add(this.directorGizmoGroup);
+  }
+
+  public updateDirectorGizmoOverlay(
+    project: DirectorTimelineProject | null,
+    anchor: DirectorSceneAnchor | null,
+    visible: boolean,
+  ): void {
+    if (!this.directorGizmoGroup) return;
+    while (this.directorGizmoGroup.children.length > 0) {
+      const child = this.directorGizmoGroup.children.pop() as THREE.Object3D & {
+        geometry?: THREE.BufferGeometry;
+        material?: THREE.Material;
+      };
+      child.geometry?.dispose?.();
+      child.material?.dispose?.();
+    }
+    this.directorGizmoGroup.visible = visible && Boolean(project && anchor);
+    if (!visible || !project || !anchor) return;
+
+    const scale = this.getPlanetScale();
+    const dur = Math.max(0.25, project.durationSec);
+
+    // 1. 3D Spline Camera Trajectory
+    if (project.cameraTrack.length >= 2) {
+      const steps = Math.max(24, Math.min(120, project.cameraTrack.length * 14));
+      const pts: number[] = [];
+      for (let i = 0; i <= steps; i++) {
+        const t = (i / steps) * dur;
+        const pose = evaluateCameraTrackPose(project.cameraTrack, t, anchor);
+        pts.push(pose.position[0], pose.position[1], pose.position[2]);
+      }
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+      const lineMat = new THREE.LineBasicMaterial({
+        color: 0x22d3ee,
+        transparent: true,
+        opacity: 0.85,
+      });
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.frustumCulled = false;
+      this.directorGizmoGroup.add(line);
+
+      // Camera keyframe frustum markers
+      for (const kf of project.cameraTrack) {
+        const coneGeo = new THREE.ConeGeometry(0.28 * scale, 0.56 * scale, 4);
+        const coneMat = new THREE.MeshBasicMaterial({
+          color: 0x06b6d4,
+          wireframe: true,
+        });
+        const cone = new THREE.Mesh(coneGeo, coneMat);
+        cone.position.set(kf.position[0], kf.position[1], kf.position[2]);
+        cone.lookAt(kf.lookAt[0], kf.lookAt[1], kf.lookAt[2]);
+        cone.rotateX(-Math.PI / 2);
+        this.directorGizmoGroup.add(cone);
+      }
+    }
+
+    // 2. Planetary Event Pins anchored on spherical surface (latDeg, lonDeg)
+    for (const ev of project.eventTrack) {
+      if (!ev.enabled) continue;
+      const latRad = (clamp(ev.latDeg, -89.5, 89.5) * Math.PI) / 180;
+      const lonRad = (ev.lonDeg * Math.PI) / 180;
+      const [dx, dy, dz] = lonLatToDir(lonRad, latRad);
+      const surfR = this.planet.findSurfaceRadiusAlongRay(dx, dy, dz);
+      const liftR = surfR + Math.max(this.planet.nativeVoxelSize * 2, 0.55 * scale);
+      const meta = WORLD_EVENT_META.find((m) => m.type === ev.type);
+      const hex = meta?.colorHex ?? '#f43f5e';
+
+      const stemGeo = new THREE.BufferGeometry();
+      stemGeo.setAttribute(
+        'position',
+        new THREE.Float32BufferAttribute(
+          [dx * surfR, dy * surfR, dz * surfR, dx * liftR, dy * liftR, dz * liftR],
+          3,
+        ),
+      );
+      const stemMat = new THREE.LineBasicMaterial({ color: hex });
+      const stem = new THREE.Line(stemGeo, stemMat);
+      stem.frustumCulled = false;
+      this.directorGizmoGroup.add(stem);
+
+      const pinGeo = new THREE.OctahedronGeometry(0.24 * scale, 0);
+      const pinMat = new THREE.MeshBasicMaterial({ color: hex });
+      const pin = new THREE.Mesh(pinGeo, pinMat);
+      pin.position.set(dx * liftR, dy * liftR, dz * liftR);
+      this.directorGizmoGroup.add(pin);
+    }
+  }
+
+  public updateSurveyOverlays(
+    benchmarks: ReadonlyArray<SurveyBenchmark>,
+    transectSamples: ReadonlyArray<{ worldPos: [number, number, number] }>,
+    pendingTransectA: [number, number, number] | null,
+    activeBorehole: BoreholeLogReport | null,
+    activeAttitude: GeologicalAttitude | null,
+  ): void {
+    if (!this.surveyOverlayGroup) return;
+    while (this.surveyOverlayGroup.children.length > 0) {
+      const child = this.surveyOverlayGroup.children.pop() as THREE.Object3D & {
+        geometry?: THREE.BufferGeometry;
+        material?: THREE.Material;
+      };
+      child.geometry?.dispose?.();
+      child.material?.dispose?.();
+    }
+
+    const scale = this.getPlanetScale();
+    const lift = Math.max(this.planet.nativeVoxelSize * 0.45, 0.05 * scale);
+    const stemH = Math.max(this.planet.nativeVoxelSize * 2.5, 0.72 * scale);
+
+    // 1. Survey Benchmark Pins (vertical mast + diamond cap)
+    if (benchmarks.length > 0) {
+      const segs: number[] = [];
+      const cols: number[] = [];
+      for (const b of benchmarks) {
+        const [wx, wy, wz] = b.worldPos;
+        const r = Math.hypot(wx, wy, wz) || this.planet.baseRadius;
+        const ux = wx / r;
+        const uy = wy / r;
+        const uz = wz / r;
+        const tx = wx + ux * stemH;
+        const ty = wy + uy * stemH;
+        const tz = wz + uz * stemH;
+        segs.push(wx, wy, wz, tx, ty, tz);
+        cols.push(0.22, 0.74, 0.97, 0.22, 0.96, 0.85);
+
+        const capGeo = new THREE.OctahedronGeometry(0.16 * scale, 0);
+        const capMat = new THREE.MeshBasicNodeMaterial();
+        capMat.colorNode = color(0x38bdf8);
+        const cap = new THREE.Mesh(capGeo, capMat);
+        cap.position.set(tx, ty, tz);
+        this.surveyOverlayGroup.add(cap);
+      }
+      const pinGeo = new THREE.BufferGeometry();
+      pinGeo.setAttribute('position', new THREE.Float32BufferAttribute(segs, 3));
+      pinGeo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+      const pinMat = new THREE.LineBasicNodeMaterial();
+      pinMat.vertexColors = true;
+      pinMat.colorNode = vertexColor();
+      const pinLines = new THREE.LineSegments(pinGeo, pinMat);
+      pinLines.frustumCulled = false;
+      this.surveyOverlayGroup.add(pinLines);
+    }
+
+    // 2. Pending Transect Start Pin (Point A)
+    if (pendingTransectA) {
+      const [wx, wy, wz] = pendingTransectA;
+      const r = Math.hypot(wx, wy, wz) || this.planet.baseRadius;
+      const ringGeo = new THREE.SphereGeometry(0.18 * scale, 12, 12);
+      const ringMat = new THREE.MeshBasicNodeMaterial();
+      ringMat.colorNode = color(0x2dd4bf);
+      const m = new THREE.Mesh(ringGeo, ringMat);
+      m.position.set(wx + (wx / r) * lift * 2, wy + (wy / r) * lift * 2, wz + (wz / r) * lift * 2);
+      this.surveyOverlayGroup.add(m);
+    }
+
+    // 3. Active Geodesic Transect Polyline
+    if (transectSamples.length >= 2) {
+      const pts: number[] = [];
+      for (const s of transectSamples) {
+        const [wx, wy, wz] = s.worldPos;
+        const r = Math.hypot(wx, wy, wz) || this.planet.baseRadius;
+        pts.push(wx + (wx / r) * lift, wy + (wy / r) * lift, wz + (wz / r) * lift);
+      }
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+      const lineMat = new THREE.LineBasicNodeMaterial();
+      lineMat.colorNode = color(0x2dd4bf);
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.frustumCulled = false;
+      this.surveyOverlayGroup.add(line);
+    }
+
+    // 4. Active Borehole Collar & Radial Core Line
+    if (activeBorehole) {
+      const [cx, cy, cz] = activeBorehole.collarPos;
+      const r = Math.hypot(cx, cy, cz) || this.planet.baseRadius;
+      const ux = cx / r;
+      const uy = cy / r;
+      const uz = cz / r;
+      const topR = r + stemH * 1.1;
+      const botR = Math.max(0.1, r - activeBorehole.drilledDepthM);
+      const bGeo = new THREE.BufferGeometry();
+      bGeo.setAttribute(
+        'position',
+        new THREE.Float32BufferAttribute(
+          [ux * topR, uy * topR, uz * topR, ux * botR, uy * botR, uz * botR],
+          3,
+        ),
+      );
+      const bMat = new THREE.LineBasicNodeMaterial();
+      bMat.colorNode = color(0xc084fc);
+      const bLine = new THREE.LineSegments(bGeo, bMat);
+      bLine.frustumCulled = false;
+      this.surveyOverlayGroup.add(bLine);
+
+      const collarGeo = new THREE.CylinderGeometry(0.18 * scale, 0.18 * scale, 0.12 * scale, 16);
+      const collarMat = new THREE.MeshBasicNodeMaterial();
+      collarMat.colorNode = color(0xa855f7);
+      const collarMesh = new THREE.Mesh(collarGeo, collarMat);
+      collarMesh.position.set(cx + ux * lift, cy + uy * lift, cz + uz * lift);
+      collarMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(ux, uy, uz));
+      this.surveyOverlayGroup.add(collarMesh);
+    }
+
+    // 5. Active Strike/Dip Clinometer Vector
+    if (activeAttitude) {
+      const [ax, ay, az] = activeAttitude.worldPos;
+      const [nx, ny, nz] = activeAttitude.normal;
+      const tipLen = stemH * 1.15;
+      const attGeo = new THREE.BufferGeometry();
+      attGeo.setAttribute(
+        'position',
+        new THREE.Float32BufferAttribute(
+          [
+            ax + nx * lift,
+            ay + ny * lift,
+            az + nz * lift,
+            ax + nx * (lift + tipLen),
+            ay + ny * (lift + tipLen),
+            az + nz * (lift + tipLen),
+          ],
+          3,
+        ),
+      );
+      const attMat = new THREE.LineBasicNodeMaterial();
+      attMat.colorNode = color(0xfbbf24);
+      const attLine = new THREE.LineSegments(attGeo, attMat);
+      attLine.frustumCulled = false;
+      this.surveyOverlayGroup.add(attLine);
+    }
+  }
+
   private refreshChunkBoundsOverlay(): void {
     if (!this.chunkBoundsLines || !this.config.showChunkBounds) return;
     this.chunkBoundsDirty = false;
@@ -1975,6 +2436,8 @@ export class PlanetarySandboxEngine {
     if (this.waterMesh) this.waterMesh.visible = visible;
     if (this.splashMesh) this.splashMesh.visible = visible;
     if (this.highResGroup) this.highResGroup.visible = visible;
+    if (this.surveyOverlayGroup) this.surveyOverlayGroup.visible = visible;
+    if (this.coordGridGroup) this.coordGridGroup.visible = visible && this.config.showCoordGrid;
     if (this.playerGroup) {
       this.playerGroup.visible = visible && this.phase !== 'title';
     }
@@ -3817,6 +4280,9 @@ export class PlanetarySandboxEngine {
       this.hasWorld = true;
       this.setPlanetRigVisible(true);
       this.telemetryTimer = 1;
+      if (this.renderer) {
+        this.emitTelemetrySnapshot();
+      }
       emit(100, '星球生成完毕', '进入行星表面工作区');
       return true;
     } finally {
@@ -3924,6 +4390,9 @@ export class PlanetarySandboxEngine {
     this.hasWorld = true;
     this.setPlanetRigVisible(true);
     this.telemetryTimer = 1;
+    if (this.renderer) {
+      this.emitTelemetrySnapshot();
+    }
   }
 
   public regenerateWithSeed(seedConfig: PlanetSeedConfig): void {
@@ -4151,10 +4620,155 @@ export class PlanetarySandboxEngine {
     );
     this.explorerCamFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
     this.syncPlayerTransform();
+    if (this.hasWorld && this.renderer) {
+      this.emitTelemetrySnapshot();
+    }
   }
 
   public setOnMaterialPicked(cb: ((mat: MaterialId) => void) | null): void {
     this.onMaterialPicked = cb;
+  }
+
+  public setOnSurveyAction(
+    cb:
+      | ((action: {
+          kind: SurveyToolKind;
+          worldPos: [number, number, number];
+          normal: [number, number, number];
+          attitude: GeologicalAttitude;
+          hasWater: boolean;
+        }) => void)
+      | null,
+  ): void {
+    this.onSurveyAction = cb;
+  }
+
+  public getCoordDatum(): CoordDatum {
+    return {
+      planetRadius: this.planet.baseRadius,
+      nativeVoxelSize: this.planet.nativeVoxelSize,
+      enuOrigin: this.config.enuOrigin,
+    };
+  }
+
+  public sampleAttitudeAt(wx: number, wy: number, wz: number): GeologicalAttitude {
+    const sunDirArr: [number, number, number] = [
+      this.sunDirUniform.x,
+      this.sunDirUniform.y,
+      this.sunDirUniform.z,
+    ];
+    return measureGeologicalAttitude(
+      this.planet,
+      this.fluid,
+      this.getGravityParams(),
+      this.config.atmosphere,
+      this.config.thermal,
+      sunDirArr,
+      this.simTimeSec,
+      wx,
+      wy,
+      wz,
+    );
+  }
+
+  public sampleTransectBetween(
+    pointA: [number, number, number],
+    pointB: [number, number, number],
+    numSamples = 80,
+  ): GeologicalTransectReport {
+    const sunDirArr: [number, number, number] = [
+      this.sunDirUniform.x,
+      this.sunDirUniform.y,
+      this.sunDirUniform.z,
+    ];
+    return sampleGeologicalTransect(
+      this.planet,
+      this.fluid,
+      pointA,
+      pointB,
+      this.config.atmosphere,
+      this.config.thermal,
+      sunDirArr,
+      this.simTimeSec,
+      numSamples,
+    );
+  }
+
+  public sampleBoreholeAt(
+    wx: number,
+    wy: number,
+    wz: number,
+    maxDepthM?: number,
+  ): BoreholeLogReport {
+    const sunDirArr: [number, number, number] = [
+      this.sunDirUniform.x,
+      this.sunDirUniform.y,
+      this.sunDirUniform.z,
+    ];
+    return sampleBoreholeColumn(
+      this.planet,
+      wx,
+      wy,
+      wz,
+      this.config.atmosphere,
+      this.config.thermal,
+      sunDirArr,
+      this.simTimeSec,
+      maxDepthM,
+    );
+  }
+
+  public teleportToWorldPos(wx: number, wy: number, wz: number): void {
+    const r = Math.hypot(wx, wy, wz);
+    if (r < 1e-4) return;
+    const ux = wx / r;
+    const uy = wy / r;
+    const uz = wz / r;
+    const latRad = Math.asin(clamp(uy, -1, 1));
+    const surfR = this.planet.findSurfaceRadiusAlongRay(ux, uy, uz);
+    const scale = this.getPlanetScale();
+    const metrics = this.getPlayerMetrics();
+    const targetR = Math.max(r, surfR + Math.max(metrics.footRadius * 2.2, 0.25 * scale));
+
+    this.playerPos.set(ux * targetR, uy * targetR, uz * targetR);
+    this.playerVel.set(0, 0, 0);
+    parallelTransportTangentFrame(
+      this.playerPos.x,
+      this.playerPos.y,
+      this.playerPos.z,
+      this.playerFwd,
+      this._upLike,
+      this._fwdLike,
+      this._rightLike,
+    );
+    this.playerUp.set(this._upLike.x, this._upLike.y, this._upLike.z);
+    this.playerFwd.set(this._fwdLike.x, this._fwdLike.y, this._fwdLike.z);
+    this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
+    this.explorerCamAnchor.copy(this.playerPos);
+    const basis = transportCameraForwardOnSphere(
+      [this.playerUp.x, this.playerUp.y, this.playerUp.z],
+      [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
+      0,
+    );
+    this.explorerCamFwd.set(basis.forward[0], basis.forward[1], basis.forward[2]);
+
+    if (this.config.cameraMode === 'orbit') {
+      this.orbitYaw = Math.atan2(uz, ux);
+      this.orbitPitch = clamp(latRad, -1.35, 1.35);
+    } else if (this.config.cameraMode === 'detail') {
+      this.detailTarget.set(ux * surfR, uy * surfR, uz * surfR);
+      this.detailNormal.set(ux, uy, uz);
+    } else if (this.config.cameraMode === 'fps') {
+      const standR = surfR + 3.2 * scale;
+      this.fpsPos.set(ux * standR, uy * standR, uz * standR);
+      this.camPosSmooth.copy(this.fpsPos);
+    } else if (this.config.cameraMode === 'perspective') {
+      this.perspTarget.set(ux * surfR, uy * surfR, uz * surfR);
+    }
+    this.syncPlayerTransform();
+    if (this.hasWorld && this.renderer) {
+      this.emitTelemetrySnapshot();
+    }
   }
 
   public updateConfig(partial: Partial<SandboxConfig>): void {
@@ -4167,6 +4781,9 @@ export class PlanetarySandboxEngine {
     const prevChunkBounds = this.config.showChunkBounds;
     const prevLodMode = this.config.lodMode;
     const prevRenderMode = this.config.terrainRenderMode;
+    const prevCoordSystem = this.config.coordSystem;
+    const prevShowCoordGrid = this.config.showCoordGrid;
+    const prevEnuOrigin = this.config.enuOrigin;
 
     const prevLod0Dist = this.config.lod0Dist;
     const prevLod1Dist = this.config.lod1Dist;
@@ -4306,6 +4923,27 @@ export class PlanetarySandboxEngine {
       if (this.config.showChunkBounds) {
         this.chunkBoundsDirty = true;
       }
+    }
+
+    if (this.coordGridGroup) {
+      this.coordGridGroup.visible = this.config.showCoordGrid;
+      if (this.config.showCoordGrid) {
+        this.rebuildCoordGridOverlay();
+      }
+    }
+
+    if (
+      (this.config.coordSystem !== prevCoordSystem ||
+        this.config.showCoordGrid !== prevShowCoordGrid ||
+        this.config.enuOrigin !== prevEnuOrigin) &&
+      this.hasWorld &&
+      this.renderer
+    ) {
+      queueMicrotask(() => {
+        if (!this.isDisposed && this.hasWorld && this.renderer) {
+          this.emitTelemetrySnapshot();
+        }
+      });
     }
 
     if (partial.renderQuality && this.renderer) {
@@ -4497,6 +5135,7 @@ export class PlanetarySandboxEngine {
     this.activeSsgiNode = null;
     this.activeSsrNode = null;
     this.activeAoNode = null;
+    this.activeBloomNode = null;
     this.activeDenoiseNodes = [];
     this.activePipelineKey = '';
   }
@@ -4506,7 +5145,11 @@ export class PlanetarySandboxEngine {
     const rq = this.config.renderQuality;
     const hasVol = rq.volumetricFog || rq.atmoScattering || rq.contactShadows;
     const hasAnyPost =
-      rq.rayTracingMode !== 'off' || rq.aoEnabled || hasVol || rq.bloomEnabled;
+      rq.rayTracingMode !== 'off' ||
+      rq.aoEnabled ||
+      hasVol ||
+      rq.bloomEnabled ||
+      this.activePostGradingEnabled;
 
     if (!hasAnyPost || this.pipelineFailed) {
       this.disposeRenderPipeline();
@@ -4520,6 +5163,7 @@ export class PlanetarySandboxEngine {
       rq.aoEnabled ? 'ao1' : 'ao0',
       hasVol ? 'vol1' : 'vol0',
       rq.bloomEnabled ? 'blm1' : 'blm0',
+      this.activePostGradingEnabled ? 'pfx1' : 'pfx0',
       resScaleCap,
     ].join('|');
 
@@ -4539,6 +5183,9 @@ export class PlanetarySandboxEngine {
       if (this.activeAoNode) {
         this.activeAoNode.samples.value = rq.raySteps >= 0.8 || isOffline ? 16 : 8;
         this.activeAoNode.radius.value = Math.max(0.45, this.planet.baseRadius * 0.06);
+      }
+      if (this.activeBloomNode) {
+        this.activeBloomNode.strength.value = this.activeBloomStrength;
       }
       this.syncEnvironmentUniforms();
       return;
@@ -4682,9 +5329,25 @@ export class PlanetarySandboxEngine {
       }
 
       if (rq.bloomEnabled) {
-        const bloomPass = bloom(composedNode, 0.34, 0.45, 0.88);
+        const bloomPass = bloom(composedNode, this.activeBloomStrength, 0.45, 0.88);
+        this.activeBloomNode = bloomPass;
         this.pipelineDisposables.push(bloomPass);
         composedNode = vec4(composedNode.rgb.add(bloomPass.rgb), composedNode.a);
+      }
+
+      if (this.activePostGradingEnabled) {
+        composedNode = buildPostGradingCompositeNode({
+          colorNode: composedNode,
+          exposureGainNode: this.postExposureGainNode,
+          contrastNode: this.postContrastNode,
+          saturationNode: this.postSaturationNode,
+          lutIntensityNode: this.postLutIntensityNode,
+          shadowTintNode: this.postShadowTintNode,
+          highlightTintNode: this.postHighlightTintNode,
+          vignetteNode: this.postVignetteNode,
+          filmGrainNode: this.postFilmGrainNode,
+          simTimeNode: this.simTimeNode,
+        });
       }
 
       pipeline.outputNode = composedNode;
@@ -4894,6 +5557,7 @@ export class PlanetarySandboxEngine {
     player: boolean;
     tractorBeam: boolean;
     tractorStretch: boolean;
+    directorGizmo: boolean;
   } {
     const prev = {
       brush: this.brushPreview?.visible ?? false,
@@ -4903,6 +5567,7 @@ export class PlanetarySandboxEngine {
       player: this.playerGroup?.visible ?? false,
       tractorBeam: this.tractorBeamGroup?.visible ?? false,
       tractorStretch: this.tractorStretchLine?.visible ?? false,
+      directorGizmo: this.directorGizmoGroup?.visible ?? false,
     };
     if (!visible) {
       if (this.brushPreview) this.brushPreview.visible = false;
@@ -4911,6 +5576,7 @@ export class PlanetarySandboxEngine {
       if (this.chunkBoundsLines) this.chunkBoundsLines.visible = false;
       if (this.tractorBeamGroup) this.tractorBeamGroup.visible = false;
       if (this.tractorStretchLine) this.tractorStretchLine.visible = false;
+      if (this.directorGizmoGroup) this.directorGizmoGroup.visible = false;
       if (this.playerGroup && this.config.cameraMode !== 'explorer') {
         this.playerGroup.visible = false;
       }
@@ -4921,6 +5587,7 @@ export class PlanetarySandboxEngine {
       if (this.chunkBoundsLines) this.chunkBoundsLines.visible = prev.chunkBounds;
       if (this.tractorBeamGroup) this.tractorBeamGroup.visible = prev.tractorBeam;
       if (this.tractorStretchLine) this.tractorStretchLine.visible = prev.tractorStretch;
+      if (this.directorGizmoGroup) this.directorGizmoGroup.visible = prev.directorGizmo;
       if (this.playerGroup) this.playerGroup.visible = prev.player;
     }
     return prev;
@@ -4934,6 +5601,7 @@ export class PlanetarySandboxEngine {
     player: boolean;
     tractorBeam: boolean;
     tractorStretch: boolean;
+    directorGizmo?: boolean;
   }): void {
     if (this.brushPreview) this.brushPreview.visible = prev.brush;
     if (this.detailReticleRing) this.detailReticleRing.visible = prev.detailRing;
@@ -4941,6 +5609,9 @@ export class PlanetarySandboxEngine {
     if (this.chunkBoundsLines) this.chunkBoundsLines.visible = prev.chunkBounds;
     if (this.tractorBeamGroup) this.tractorBeamGroup.visible = prev.tractorBeam;
     if (this.tractorStretchLine) this.tractorStretchLine.visible = prev.tractorStretch;
+    if (this.directorGizmoGroup && prev.directorGizmo !== undefined) {
+      this.directorGizmoGroup.visible = prev.directorGizmo;
+    }
     if (this.playerGroup) this.playerGroup.visible = prev.player;
   }
 
@@ -5840,6 +6511,1102 @@ export class PlanetarySandboxEngine {
     }
   }
 
+  public pickLatLonAtClientXY(
+    clientX: number,
+    clientY: number,
+  ): { latDeg: number; lonDeg: number; worldPos: [number, number, number] } | null {
+    if (!this.renderer || !this.camera || !this.hasWorld) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera);
+    const orig = this.raycaster.ray.origin;
+    const dir = this.raycaster.ray.direction;
+    const hit = this.planet.raycastTerrain(
+      orig.x,
+      orig.y,
+      orig.z,
+      dir.x,
+      dir.y,
+      dir.z,
+      this.planet.worldHalf * 6.0,
+    );
+    if (!hit.hit) return null;
+    const sph = dirToLonLat(hit.x, hit.y, hit.z);
+    return {
+      latDeg: Number(((sph.latRad * 180) / Math.PI).toFixed(2)),
+      lonDeg: Number(((sph.lonRad * 180) / Math.PI).toFixed(2)),
+      worldPos: [hit.x, hit.y, hit.z],
+    };
+  }
+
+  public applyPostFxState(pfx: EvaluatedPostFxState, rebuildIfNeeded = true): void {
+    const lut = getLutColorMatrixParams(pfx.lutPreset);
+    this.postExposureGainNode.value = clamp(pfx.exposure / 1.12, 0.25, 3.0);
+    this.postContrastNode.value = clamp(pfx.contrast * lut.contrastScale, 0.5, 2.2);
+    this.postSaturationNode.value = clamp(pfx.saturation * lut.saturationScale, 0.0, 2.5);
+    this.postLutIntensityNode.value = clamp(pfx.lutIntensity, 0.0, 1.4);
+    this.postShadowTintNode.value.set(
+      lut.shadowTint[0],
+      lut.shadowTint[1],
+      lut.shadowTint[2],
+    );
+    this.postHighlightTintNode.value.set(
+      lut.highlightTint[0],
+      lut.highlightTint[1],
+      lut.highlightTint[2],
+    );
+    this.postVignetteNode.value = clamp(pfx.vignette, 0.0, 0.95);
+    this.postFilmGrainNode.value = clamp(pfx.filmGrain, 0.0, 0.35);
+    this.activeBloomStrength = clamp(pfx.bloomStrength, 0.0, 1.8);
+    this.activeAspectMask = pfx.aspectMask;
+    if (this.activeBloomNode) {
+      this.activeBloomNode.strength.value = this.activeBloomStrength;
+    }
+
+    const needsNode =
+      pfx.lutPreset !== 'natural' ||
+      Math.abs(pfx.exposure - 1.12) > 0.02 ||
+      Math.abs(pfx.contrast - 1.0) > 0.02 ||
+      Math.abs(pfx.saturation - 1.0) > 0.02 ||
+      pfx.vignette > 0.01 ||
+      pfx.filmGrain > 0.005;
+
+    if (rebuildIfNeeded && needsNode !== this.activePostGradingEnabled) {
+      this.activePostGradingEnabled = needsNode;
+      this.syncRenderPipeline(this.isOfflineRendering);
+    } else {
+      this.activePostGradingEnabled = needsNode;
+    }
+  }
+
+  public resetDirectorPostGradingUniforms(): void {
+    this.postExposureGainNode.value = 1.0;
+    this.postContrastNode.value = 1.0;
+    this.postSaturationNode.value = 1.0;
+    this.postLutIntensityNode.value = 0.0;
+    this.postShadowTintNode.value.set(1, 1, 1);
+    this.postHighlightTintNode.value.set(1, 1, 1);
+    this.postVignetteNode.value = 0.0;
+    this.postFilmGrainNode.value = 0.0;
+    this.activeBloomStrength = 0.34;
+    this.activeAspectMask = 'none';
+    if (this.activePostGradingEnabled) {
+      this.activePostGradingEnabled = false;
+      this.syncRenderPipeline(this.isOfflineRendering);
+    }
+  }
+
+  public exportDirectorWorldRestoreSnapshot(): DirectorWorldSnapshot {
+    return {
+      planet: this.planet.exportSnapshot(),
+      fluid: this.fluid.exportState(),
+      hotspots: this.thermalHotspots.map((h) => ({ ...h })),
+      simTimeSec: this.simTimeSec,
+      sunAzimuthDeg: this.config.sunAzimuthDeg,
+      sunElevationDeg: this.config.sunElevationDeg,
+      atmosphere: { ...this.config.atmosphere },
+      thermal: { ...this.config.thermal },
+      playerPos: [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+      playerFwd: [this.playerFwd.x, this.playerFwd.y, this.playerFwd.z],
+    };
+  }
+
+  public restoreDirectorWorldSnapshot(snap: DirectorWorldSnapshot): void {
+    this.planet.importSnapshot(snap.planet);
+    this.rebuildChunkCenters();
+    this.fluid.importState(snap.fluid);
+    this.thermalHotspots = snap.hotspots.map((h) => ({ ...h }));
+    this.simTimeSec = snap.simTimeSec;
+    this.simTimeNode.value = snap.simTimeSec;
+    this.playerPos.set(snap.playerPos[0], snap.playerPos[1], snap.playerPos[2]);
+    this.playerFwd
+      .set(snap.playerFwd[0], snap.playerFwd[1], snap.playerFwd[2])
+      .normalize();
+    this.playerVel.set(0, 0, 0);
+    this.syncPlayerTransform();
+    this.activeMeteors = [];
+    this.activeShockwaves = [];
+    this.activeVortices = [];
+    this.activeWorms = [];
+    this.lightningLife = 0;
+
+    this.config = {
+      ...this.config,
+      sunAzimuthDeg: snap.sunAzimuthDeg,
+      sunElevationDeg: snap.sunElevationDeg,
+      atmosphere: { ...snap.atmosphere },
+      thermal: { ...snap.thermal },
+    };
+    this.updateSunDirection();
+    this.syncEnvironmentUniforms();
+    this.rebuildAllChunks();
+    this.rebuildWaterMesh();
+    this.updateSplashInstances();
+    this.emitTelemetrySnapshot();
+  }
+
+  public dispatchDirectorWorldEvent(
+    ev: DirectorWorldEvent,
+    phaseScale = 1.0,
+  ): void {
+    if (!ev.enabled || !this.hasWorld) return;
+    const scale = this.getPlanetScale();
+    const latRad = (clamp(ev.latDeg, -89.5, 89.5) * Math.PI) / 180;
+    const lonRad = (ev.lonDeg * Math.PI) / 180;
+    const [nx, ny, nz] = lonLatToDir(lonRad, latRad);
+    const surfR = this.planet.findSurfaceRadiusAlongRay(nx, ny, nz);
+    const hx = nx * surfR;
+    const hy = ny * surfR;
+    const hz = nz * surfR;
+    const effRad = Math.max(
+      this.planet.nativeVoxelSize * 1.4,
+      1.9 * scale * clamp(ev.radiusMult, 0.25, 6.0),
+    );
+    const effStr = clamp(ev.strength, 0.2, 5.0) * Math.max(0.25, phaseScale);
+
+    switch (ev.type) {
+      case 'volcano': {
+        this.planet.applyBrush(hx, hy, hz, 'volcano', effRad, effStr * 1.5, ev.materialId || MaterialId.Basalt);
+        this.spawnMagmaBurst(
+          hx + nx * effRad * 0.45,
+          hy + ny * effRad * 0.45,
+          hz + nz * effRad * 0.45,
+          nx,
+          ny,
+          nz,
+          8,
+          effRad * 0.28,
+          1.25,
+          false,
+        );
+        this.spawnDebrisBurst(hx, hy, hz, nx, ny, nz, 10, 14, effStr);
+        this.addThermalHotspot(hx, hy, hz, effRad * 2.4, 480 * effStr, 35);
+        this.updateChunksWithLod(56);
+        this.updateHighResStreaming({ hit: true, distance: 0, x: hx, y: hy, z: hz, nx, ny, nz }, 56);
+        this.waterMeshDirty = true;
+        break;
+      }
+      case 'nuke': {
+        this.planet.applyBrush(hx, hy, hz, 'crater', effRad * 1.35, effStr * 2.4, MaterialId.Basalt, {
+          rimHeight: 1.1,
+          rimMaterial: MaterialId.Basalt,
+          floorMaterial: MaterialId.Crystal,
+        });
+        this.fluid.applyRadialImpulse(hx, hy, hz, effRad * 2.8, 28 * Math.sqrt(scale), 14 * Math.sqrt(scale));
+        this.fluid.drainWithinRadius(hx, hy, hz, effRad * 0.9);
+        this.spawnMagmaBurst(hx, hy, hz, nx, ny, nz, 14, effRad * 0.35, 1.35, false);
+        this.spawnShockwave(hx, hy, hz, nx, ny, nz, effRad * 2.9, true, true);
+        this.spawnDebrisBurst(hx, hy, hz, nx, ny, nz, 14, 18, effStr);
+        this.addThermalHotspot(hx, hy, hz, effRad * 2.8, 860 * effStr, 55);
+        this.updateChunksWithLod(64);
+        this.updateHighResStreaming({ hit: true, distance: 0, x: hx, y: hy, z: hz, nx, ny, nz }, 64);
+        this.waterMeshDirty = true;
+        break;
+      }
+      case 'crater': {
+        this.planet.applyBrush(hx, hy, hz, 'crater', effRad * 1.1, effStr * 1.8, MaterialId.Stone, {
+          rimHeight: 0.72,
+          rimMaterial: MaterialId.Sandstone,
+          floorMaterial: ev.materialId || MaterialId.Stone,
+        });
+        this.spawnShockwave(hx, hy, hz, nx, ny, nz, effRad * 2.1, true, false);
+        this.spawnDebrisBurst(hx, hy, hz, nx, ny, nz, 10, 15, effStr);
+        this.addThermalHotspot(hx, hy, hz, effRad * 2.0, 260 * effStr, 60);
+        this.updateChunksWithLod(56);
+        this.updateHighResStreaming({ hit: true, distance: 0, x: hx, y: hy, z: hz, nx, ny, nz }, 56);
+        this.waterMeshDirty = true;
+        break;
+      }
+      case 'meteorShower': {
+        const orbitDist = Math.max(this.planet.baseRadius * 1.25, 13 * scale);
+        const speed = 26 * Math.sqrt(scale);
+        const mCount = clamp(Math.round(2 + ev.strength * 2), 2, 6);
+        for (let k = 0; k < mCount; k++) {
+          if (this.activeMeteors.length >= this.MAX_METEORS) break;
+          const jx = (Math.random() - 0.5) * effRad * 2.2;
+          const jy = (Math.random() - 0.5) * effRad * 2.2;
+          const jz = (Math.random() - 0.5) * effRad * 2.2;
+          const tx = hx + jx * 0.6;
+          const ty = hy + jy * 0.6;
+          const tz = hz + jz * 0.6;
+          const sx = hx + nx * orbitDist + jx;
+          const sy = hy + ny * orbitDist + jy;
+          const sz = hz + nz * orbitDist + jz;
+          const dLen = Math.hypot(tx - sx, ty - sy, tz - sz) || 1;
+          this.activeMeteors.push({
+            x: sx,
+            y: sy,
+            z: sz,
+            vx: ((tx - sx) / dLen) * speed,
+            vy: ((ty - sy) / dLen) * speed,
+            vz: ((tz - sz) / dLen) * speed,
+            radius: effRad * 0.72,
+            strength: effStr * 1.5,
+            thermalDeltaC: 340,
+            debrisCount: 8,
+            material: ev.materialId || MaterialId.Basalt,
+            rimMaterial: MaterialId.Sandstone,
+            leaveRim: true,
+            life: 3.0,
+          });
+        }
+        break;
+      }
+      case 'waterFlood': {
+        const streamCount = clamp(Math.round(18 * ev.strength), 8, 64);
+        this.fluid.emitStream(hx, hy, hz, nx, ny, nz, streamCount, effRad * 0.85, scale);
+        this.fluid.applyRadialImpulse(hx, hy, hz, effRad * 1.5, 4.5 * Math.sqrt(scale), 3.0 * Math.sqrt(scale));
+        this.waterMeshDirty = true;
+        break;
+      }
+      case 'drain': {
+        this.fluid.drainWithinRadius(hx, hy, hz, Math.max(effRad * 1.35, 1.2 * scale));
+        this.waterMeshDirty = true;
+        break;
+      }
+      case 'tractorBurst': {
+        this.fluid.applyRadialImpulse(
+          hx,
+          hy,
+          hz,
+          effRad * 2.2,
+          16 * effStr * Math.sqrt(scale),
+          14 * effStr * Math.sqrt(scale),
+        );
+        this.spawnDebrisBurst(hx, hy, hz, nx, ny, nz, 10, 14 * effStr, effStr);
+        this.spawnShockwave(hx, hy, hz, nx, ny, nz, effRad * 2.0, false, false);
+        break;
+      }
+      case 'thermalHotspot': {
+        this.addThermalHotspot(hx, hy, hz, effRad * 2.6, 550 * effStr, 25);
+        this.spawnMagmaBurst(hx, hy, hz, nx, ny, nz, 6, effRad * 0.25, 1.0, true);
+        break;
+      }
+      case 'terraformMaterial': {
+        this.planet.applyBrush(hx, hy, hz, 'build', effRad, effStr * 1.35, ev.materialId || MaterialId.Crystal);
+        this.updateChunksWithLod(48);
+        this.updateHighResStreaming({ hit: true, distance: 0, x: hx, y: hy, z: hz, nx, ny, nz }, 48);
+        this.waterMeshDirty = true;
+        break;
+      }
+    }
+  }
+
+  public setDirectorTimelineLocked(locked: boolean): void {
+    this.directorTimelineLocked = locked;
+  }
+
+  /**
+   * Applies full NLE timeline state (Camera, Environment/Sun/Clouds, Post-FX LUTs, optional World Events)
+   * at `timeSec` for live Program Monitor scrubbing & playback.
+   */
+  public applyDirectorTimelineAtTime(
+    project: DirectorTimelineProject,
+    anchor: DirectorSceneAnchor,
+    timeSec: number,
+    options?: {
+      advanceEventsFromSec?: number;
+      firedEventIds?: Set<string>;
+      updateEnvironment?: boolean;
+      updatePostFx?: boolean;
+    },
+  ): {
+    pose: ReturnType<typeof evaluateCameraTrackPose>;
+    env: ReturnType<typeof evaluateEnvironmentTrack>;
+    pfx: EvaluatedPostFxState;
+  } {
+    const t = clamp(timeSec, 0, Math.max(0.25, project.durationSec));
+    const pose = evaluateCameraTrackPose(project.cameraTrack, t, anchor);
+    const env = evaluateEnvironmentTrack(project.envTrack, t, {
+      sunElevationDeg: this.config.sunElevationDeg,
+      sunAzimuthDeg: this.config.sunAzimuthDeg,
+      atmoDensity: this.config.atmosphere.surfacePressureAtm,
+      scatterStrength: this.config.atmosphere.rayleighStrength,
+      cloudCoverage: this.config.atmosphere.cloudCover,
+      cloudAltitudeRatio: this.config.atmosphere.cloudAltitudeRatio,
+      windSpeed: this.config.atmosphere.windSpeed,
+      tempOffsetC: this.config.thermal.baseEquilibriumC + 18,
+    });
+    const pfx = evaluatePostFxTrack(project.postFxTrack, t);
+
+    if (options?.updateEnvironment !== false) {
+      this.config.sunElevationDeg = env.sunElevationDeg;
+      this.config.sunAzimuthDeg = env.sunAzimuthDeg;
+      this.config.atmosphere = {
+        ...this.config.atmosphere,
+        surfacePressureAtm: env.atmoDensity,
+        rayleighStrength: env.scatterStrength,
+        cloudCover: env.cloudCoverage,
+        cloudAltitudeRatio: env.cloudAltitudeRatio,
+        windSpeed: env.windSpeed,
+      };
+      this.config.thermal = {
+        ...this.config.thermal,
+        baseEquilibriumC: -18 + env.tempOffsetC,
+      };
+      this.updateSunDirection();
+      this.syncEnvironmentUniforms();
+    }
+
+    if (options?.updatePostFx !== false) {
+      this.applyPostFxState(pfx, !this.isOfflineRendering);
+    }
+
+    if (options?.firedEventIds && options.advanceEventsFromSec !== undefined) {
+      const fromT = options.advanceEventsFromSec;
+      for (const ev of project.eventTrack) {
+        if (!ev.enabled) continue;
+        if (options.firedEventIds.has(ev.id)) continue;
+        if (ev.triggerTimeSec <= t && ev.triggerTimeSec >= Math.min(fromT - 0.05, 0)) {
+          this.dispatchDirectorWorldEvent(ev, 1.0);
+          options.firedEventIds.add(ev.id);
+        }
+      }
+    }
+
+    this.camera.position.set(pose.position[0], pose.position[1], pose.position[2]);
+    this.camera.up.set(pose.up[0], pose.up[1], pose.up[2]).normalize();
+    this.camera.fov = pose.fovDeg;
+    this.camera.lookAt(pose.lookAt[0], pose.lookAt[1], pose.lookAt[2]);
+
+    const distFromCenter = this.camera.position.length();
+    const surfDist = Math.max(
+      this.planet.nativeVoxelSize * 0.25,
+      Math.abs(distFromCenter - this.planet.baseRadius),
+    );
+    const focusDist = Math.max(
+      this.planet.nativeVoxelSize * 0.45,
+      Math.hypot(
+        this.camera.position.x - pose.streamFocus[0],
+        this.camera.position.y - pose.streamFocus[1],
+        this.camera.position.z - pose.streamFocus[2],
+      ),
+    );
+    const safeClips = computeSafeClipPlanes(
+      surfDist,
+      focusDist,
+      this.planet.baseRadius,
+      this.camera.fov,
+    );
+    this.camera.near = safeClips.near;
+    this.camera.far = safeClips.far;
+    this.camera.updateProjectionMatrix();
+    this.lastHighResFocus.set(pose.streamFocus[0], pose.streamFocus[1], pose.streamFocus[2]);
+
+    return { pose, env, pfx };
+  }
+
+  /**
+   * Checkpointed & Resumable Offline Multi-Track Director Render Engine.
+   * Persists simulation snapshots, encoded chunks, RGB histograms & thumbnails to IndexedDB on every frame
+   * so renders survive Pause, Abort-Keep, and full page reload cleanly.
+   */
+  public async renderDirectorProjectOffline(options: {
+    project: DirectorTimelineProject;
+    anchor?: DirectorSceneAnchor;
+    resumeJob?: RenderCheckpointJob;
+    onProgress: (p: DirectorRenderProgress) => void;
+    abortSignal?: AbortSignal;
+    shouldPause?: () => boolean;
+  }): Promise<{
+    status: 'completed' | 'paused' | 'aborted';
+    job: RenderCheckpointJob;
+    result?: {
+      blob: Blob;
+      mimeType: string;
+      filename: string;
+      frameCount: number;
+      actualWidth: number;
+      actualHeight: number;
+      fps: number;
+      elapsedMs: number;
+      encoderLabel: string;
+    };
+  }> {
+    this.stopDirectorPreview();
+    cancelAnimationFrame(this.frameHandle);
+    clearTimeout(this.timerHandle);
+
+    const project = options.resumeJob?.projectSnapshot ?? options.project;
+    const range = computeProjectFrameRange(project);
+    const startFrame = options.resumeJob ? options.resumeJob.startFrame : range.startFrame;
+    const endFrame = options.resumeJob ? options.resumeJob.endFrame : range.endFrame;
+    const fps = range.fps;
+    const totalRangeFrames = Math.max(1, endFrame - startFrame + 1);
+    const dt = 1 / fps;
+
+    const targetW = Math.max(64, Math.min(8192, Math.floor(project.width / 2) * 2));
+    const targetH = Math.max(64, Math.min(8192, Math.floor(project.height / 2) * 2));
+    const anchor = options.resumeJob?.anchorSnapshot ?? options.anchor ?? this.buildDirectorAnchor();
+    const { renderW, renderH } = this.computeRenderBufferSize(targetW, targetH);
+
+    // Save live interactive sandbox state so exiting/completing never leaves stale viewport settings
+    const savedPos = this.camera.position.clone();
+    const savedQuat = this.camera.quaternion.clone();
+    const savedUp = this.camera.up.clone();
+    const savedFov = this.camera.fov;
+    const savedNear = this.camera.near;
+    const savedFar = this.camera.far;
+    const savedAspect = this.camera.aspect;
+    const savedPixelRatio = this.renderer.getPixelRatio();
+    const savedCssW = Math.max(1, this.container.clientWidth);
+    const savedCssH = Math.max(1, this.container.clientHeight);
+    const savedQuality = { ...this.config.renderQuality };
+    const savedSunAzimuth = this.config.sunAzimuthDeg;
+    const savedSunElevation = this.config.sunElevationDeg;
+    const savedAtmo = { ...this.config.atmosphere };
+    const savedThermal = { ...this.config.thermal };
+    const savedSimTime = this.simTimeSec;
+    const prevHelpers = project.cleanFrame ? this.setEditorHelpersVisible(false) : null;
+
+    this.isOfflineRendering = true;
+    const renderT0 = performance.now();
+
+    const captureRT = this.createOfflineCaptureTarget(renderW, renderH);
+    const rgbaBuf = new Uint8ClampedArray(renderW * renderH * 4);
+
+    const srcCanvas2D = document.createElement('canvas');
+    srcCanvas2D.width = renderW;
+    srcCanvas2D.height = renderH;
+    const srcCtx2D = srcCanvas2D.getContext('2d', { alpha: false, willReadFrequently: true });
+    if (!srcCtx2D) {
+      captureRT.dispose();
+      throw new Error('Failed to create offline staging 2D canvas context');
+    }
+
+    let encodeCanvas2D: HTMLCanvasElement = srcCanvas2D;
+    let encodeCtx2D: CanvasRenderingContext2D = srcCtx2D;
+    if (renderW !== targetW || renderH !== targetH) {
+      encodeCanvas2D = document.createElement('canvas');
+      encodeCanvas2D.width = targetW;
+      encodeCanvas2D.height = targetH;
+      encodeCtx2D =
+        encodeCanvas2D.getContext('2d', { alpha: false, willReadFrequently: true }) ?? srcCtx2D;
+    }
+
+    const thumbCanvas = document.createElement('canvas');
+    thumbCanvas.width = 240;
+    thumbCanvas.height = Math.max(72, Math.round((240 * targetH) / targetW));
+    const thumbCtx = thumbCanvas.getContext('2d', { alpha: false });
+    let cachedImageData: ImageData | null = null;
+
+    type WebCodecsEnc = {
+      configure: (cfg: Record<string, unknown>) => void;
+      encode: (frame: unknown, opts?: { keyFrame?: boolean }) => void;
+      flush: () => Promise<void>;
+      close: () => void;
+      encodeQueueSize: number;
+    };
+
+    let encoder: WebCodecsEnc | null = null;
+    let encoderClosed = false;
+    const jobId = options.resumeJob?.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    let jobRecord: RenderCheckpointJob | null = null;
+
+    try {
+      const offlineQual = resolveDirectorOfflineQuality(savedQuality, project.offlineQuality);
+      this.config.renderQuality = offlineQual;
+      this.activePostGradingEnabled = true;
+      this.renderer.setPixelRatio(1);
+      this.renderer.setSize(renderW, renderH, false);
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(true, renderW);
+
+      this.camera.aspect = targetW / targetH;
+      this.camera.updateProjectionMatrix();
+
+      type WebCodecsCtor = {
+        new (init: {
+          output: (chunk: {
+            byteLength: number;
+            timestamp: number;
+            type: 'key' | 'delta';
+            copyTo: (dest: Uint8Array) => void;
+          }) => void;
+          error: (err: unknown) => void;
+        }): WebCodecsEnc;
+        isConfigSupported: (cfg: Record<string, unknown>) => Promise<{ supported?: boolean }>;
+      };
+      type VideoFrameCtor = new (
+        source: BufferSource | HTMLCanvasElement,
+        init: Record<string, unknown>,
+      ) => { close: () => void };
+
+      const g = globalThis as unknown as {
+        VideoEncoder?: WebCodecsCtor;
+        VideoFrame?: VideoFrameCtor;
+      };
+
+      let useWebm = false;
+      let webmCodec: WebmVideoCodec = 'V_VP9';
+      let encoderError: unknown = null;
+      let encoderLabel = 'PNG 无损序列 (.tar)';
+      let activeEncodeW = targetW;
+      let activeEncodeH = targetH;
+
+      // Collect serialized WebCodecs chunks tagged chronologically with pending metadata
+      const pendingChunkQueue: Array<{
+        frameIdx: number;
+        timestampUs: number;
+        thumbDataUrl: string;
+        renderMs: number;
+        meanLuma: number;
+        alphaMin: number;
+        histogram: ReturnType<typeof computeRgbHistogram>;
+      }> = [];
+      let chunkSavePromises: Promise<void>[] = [];
+
+      const wantWebm = project.format !== 'png-tar';
+      if (wantWebm && typeof g.VideoEncoder === 'function' && typeof g.VideoFrame === 'function') {
+        const candidates: Array<{
+          codec: string;
+          webmCodec: WebmVideoCodec;
+          label: string;
+          w: number;
+          h: number;
+          hintFps: number;
+        }> = [];
+        const primaryCodecs =
+          project.format === 'webm-vp8'
+            ? [{ codec: 'vp8', webmCodec: 'V_VP8' as WebmVideoCodec, label: 'WebCodecs VP8' }]
+            : [
+                { codec: 'vp09.00.62.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L6.2' },
+                { codec: 'vp09.00.61.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L6.1' },
+                { codec: 'vp09.00.52.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L5.2' },
+                { codec: 'vp09.00.51.08', webmCodec: 'V_VP9' as WebmVideoCodec, label: 'WebCodecs VP9 L5.1' },
+                { codec: 'vp8', webmCodec: 'V_VP8' as WebmVideoCodec, label: 'WebCodecs VP8' },
+              ];
+
+        for (const c of primaryCodecs) {
+          candidates.push({ ...c, w: targetW, h: targetH, hintFps: fps });
+          if (fps > 60) {
+            candidates.push({ ...c, w: targetW, h: targetH, hintFps: 60 });
+          }
+        }
+        if (targetW > 4096) {
+          const capScale = 4096 / targetW;
+          const capW = 4096;
+          const capH = Math.max(64, Math.floor((targetH * capScale) / 2) * 2);
+          for (const c of primaryCodecs) {
+            candidates.push({
+              ...c,
+              label: `${c.label} (4K编码适配)`,
+              w: capW,
+              h: capH,
+              hintFps: Math.min(fps, 60),
+            });
+          }
+        }
+
+        let selected: (typeof candidates)[0] | null = null;
+        for (const cand of candidates) {
+          try {
+            const bitrate = Math.min(
+              140_000_000,
+              Math.max(4_000_000, Math.round(cand.w * cand.h * Math.min(fps, 60) * 0.14)),
+            );
+            const res = await g.VideoEncoder.isConfigSupported({
+              codec: cand.codec,
+              width: cand.w,
+              height: cand.h,
+              bitrate,
+              framerate: cand.hintFps,
+            });
+            if (res.supported) {
+              selected = cand;
+              break;
+            }
+          } catch {
+            // Try next candidate
+          }
+        }
+
+        if (selected) {
+          useWebm = true;
+          webmCodec = selected.webmCodec;
+          activeEncodeW = selected.w;
+          activeEncodeH = selected.h;
+          if (activeEncodeW !== renderW || activeEncodeH !== renderH) {
+            if (encodeCanvas2D === srcCanvas2D) {
+              encodeCanvas2D = document.createElement('canvas');
+              encodeCtx2D =
+                encodeCanvas2D.getContext('2d', { alpha: false, willReadFrequently: true }) ??
+                srcCtx2D;
+            }
+            encodeCanvas2D.width = activeEncodeW;
+            encodeCanvas2D.height = activeEncodeH;
+          }
+
+          encoder = new g.VideoEncoder({
+            output: (chunk) => {
+              const meta = pendingChunkQueue.shift();
+              if (!meta) return;
+              const bytes = new Uint8Array(chunk.byteLength);
+              chunk.copyTo(bytes);
+              chunkSavePromises.push(
+                saveEncodedFrameChunkToDb({
+                  jobId,
+                  frameIdx: meta.frameIdx,
+                  timestampUs: chunk.timestamp,
+                  isKeyFrame: chunk.type === 'key',
+                  isPng: false,
+                  payload: bytes.buffer,
+                  thumbDataUrl: meta.thumbDataUrl,
+                  renderMs: meta.renderMs,
+                  meanLuma: meta.meanLuma,
+                  alphaMin: meta.alphaMin,
+                  histogram: meta.histogram,
+                }),
+              );
+            },
+            error: (err) => {
+              encoderError = err;
+            },
+          });
+
+          const bitrate = Math.min(
+            140_000_000,
+            Math.max(4_000_000, Math.round(activeEncodeW * activeEncodeH * Math.min(fps, 60) * 0.14)),
+          );
+          encoder.configure({
+            codec: selected.codec,
+            width: activeEncodeW,
+            height: activeEncodeH,
+            bitrate,
+            framerate: selected.hintFps,
+            latencyMode: 'quality',
+          });
+          encoderLabel = `${selected.label} · ${activeEncodeW}×${activeEncodeH} @ ${fps}FPS`;
+        }
+      }
+
+      const keyframeInterval = clamp(
+        Math.round(project.checkpointIntervalFrames || Math.max(12, Math.min(60, Math.round(fps / 2)))),
+        4,
+        180,
+      );
+      const frameDurUs = Math.round(1_000_000 / fps);
+      const needsResample = activeEncodeW !== renderW || activeEncodeH !== renderH;
+
+      // Determine exact resume startFrame from latest saved SimulationCheckpoint
+      let resumeFrame = startFrame;
+      const firedEventIds = new Set<string>();
+      if (options.resumeJob) {
+        const latestCp = await getLatestCheckpointAtOrBefore(
+          options.resumeJob.id,
+          options.resumeJob.lastCheckpointFrame,
+        );
+        resumeFrame = computeCheckpointResumeStartFrame({
+          startFrame,
+          endFrame,
+          latestCheckpointFrame: latestCp ? latestCp.frameIdx : null,
+        });
+        if (latestCp) {
+          this.planet.importSnapshot(latestCp.planet);
+          this.rebuildChunkCenters();
+          this.fluid.importState(latestCp.fluid);
+          this.thermalHotspots = latestCp.hotspots.map((h) => ({ ...h }));
+          this.simTimeSec = latestCp.simTimeSec;
+          this.simTimeNode.value = latestCp.simTimeSec;
+          this.config.sunAzimuthDeg = latestCp.sunAzimuthDeg;
+          this.config.sunElevationDeg = latestCp.sunElevationDeg;
+          this.updateSunDirection();
+          for (const eid of latestCp.firedEventIds) {
+            firedEventIds.add(eid);
+          }
+          this.playerPos.set(latestCp.playerPos[0], latestCp.playerPos[1], latestCp.playerPos[2]);
+          this.playerFwd.set(latestCp.playerFwd[0], latestCp.playerFwd[1], latestCp.playerFwd[2]).normalize();
+          this.rebuildAllChunks();
+          this.rebuildWaterMesh();
+        }
+      }
+
+      jobRecord = {
+        id: jobId,
+        projectId: project.id,
+        projectName: project.name,
+        createdAt: options.resumeJob?.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+        status: 'rendering',
+        format: project.format,
+        webmCodec: useWebm ? webmCodec : undefined,
+        encoderLabel,
+        width: activeEncodeW,
+        height: activeEncodeH,
+        fps,
+        startFrame,
+        endFrame,
+        totalFrames: range.totalFrames,
+        keyframeInterval,
+        completedFrames: options.resumeJob?.completedFrames ?? 0,
+        lastCheckpointFrame: options.resumeJob?.lastCheckpointFrame ?? startFrame,
+        projectSnapshot: project,
+        anchorSnapshot: anchor,
+      };
+      await saveRenderJobToDb(jobRecord);
+
+      let prevTimeSec = resumeFrame * dt;
+      for (let frameIdx = resumeFrame; frameIdx <= endFrame; frameIdx++) {
+        if (options.shouldPause?.()) {
+          // Save clean simulation checkpoint right before yielding pause
+          if (encoder && !encoderClosed) {
+            await encoder.flush();
+            await Promise.all(chunkSavePromises);
+            chunkSavePromises = [];
+          }
+          await saveSimulationCheckpointToDb({
+            jobId,
+            frameIdx,
+            createdAt: Date.now(),
+            simTimeSec: this.simTimeSec,
+            sunAzimuthDeg: this.config.sunAzimuthDeg,
+            sunElevationDeg: this.config.sunElevationDeg,
+            planet: this.planet.exportSnapshot(),
+            fluid: this.fluid.exportState(),
+            hotspots: this.thermalHotspots.map((h) => ({ ...h })),
+            firedEventIds: Array.from(firedEventIds),
+            playerPos: [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+            playerFwd: [this.playerFwd.x, this.playerFwd.y, this.playerFwd.z],
+          });
+          jobRecord = {
+            ...jobRecord,
+            updatedAt: Date.now(),
+            status: 'paused',
+            completedFrames: frameIdx - startFrame,
+            lastCheckpointFrame: frameIdx,
+          };
+          await saveRenderJobToDb(jobRecord);
+          return { status: 'paused', job: jobRecord };
+        }
+
+        if (options.abortSignal?.aborted) {
+          if (encoder && !encoderClosed) {
+            try {
+              await encoder.flush();
+              await Promise.all(chunkSavePromises);
+            } catch {
+              // ignore flush errors on abort
+            }
+          }
+          jobRecord = {
+            ...jobRecord,
+            updatedAt: Date.now(),
+            status: 'aborted',
+            completedFrames: frameIdx - startFrame,
+          };
+          await saveRenderJobToDb(jobRecord);
+          return { status: 'aborted', job: jobRecord };
+        }
+
+        if (encoderError) {
+          throw encoderError instanceof Error ? encoderError : new Error(String(encoderError));
+        }
+
+        const frameStartMs = performance.now();
+        const curTimeSec = frameIdx * dt;
+        const isCpBoundary =
+          frameIdx === startFrame || (frameIdx - startFrame) % keyframeInterval === 0;
+
+        // Save IndexedDB physical snapshot at every checkpoint/keyframe boundary before advancing
+        if (isCpBoundary) {
+          await saveSimulationCheckpointToDb({
+            jobId,
+            frameIdx,
+            createdAt: Date.now(),
+            simTimeSec: this.simTimeSec,
+            sunAzimuthDeg: this.config.sunAzimuthDeg,
+            sunElevationDeg: this.config.sunElevationDeg,
+            planet: this.planet.exportSnapshot(),
+            fluid: this.fluid.exportState(),
+            hotspots: this.thermalHotspots.map((h) => ({ ...h })),
+            firedEventIds: Array.from(firedEventIds),
+            playerPos: [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+            playerFwd: [this.playerFwd.x, this.playerFwd.y, this.playerFwd.z],
+          });
+          jobRecord.lastCheckpointFrame = frameIdx;
+        }
+
+        // Advance simulation + evaluate timeline tracks & timed world events
+        if (frameIdx === startFrame && !options.resumeJob) {
+          this.stepOfflineSimulation(0, false, !project.cleanFrame);
+        } else if (project.simTimeScale > 0) {
+          this.stepOfflineSimulation(dt * project.simTimeScale, true, !project.cleanFrame);
+        }
+
+        const evaluated = this.applyDirectorTimelineAtTime(project, anchor, curTimeSec, {
+          advanceEventsFromSec: prevTimeSec,
+          firedEventIds,
+          updateEnvironment: true,
+          updatePostFx: true,
+        });
+        prevTimeSec = curTimeSec;
+
+        this.updateDynamicShadowFrustum(
+          evaluated.pose.streamFocus[0],
+          evaluated.pose.streamFocus[1],
+          evaluated.pose.streamFocus[2],
+          Math.max(
+            this.planet.nativeVoxelSize * 0.45,
+            Math.hypot(
+              this.camera.position.x - evaluated.pose.streamFocus[0],
+              this.camera.position.y - evaluated.pose.streamFocus[1],
+              this.camera.position.z - evaluated.pose.streamFocus[2],
+            ),
+          ),
+        );
+
+        await this.convergeOfflineGeometryAndShaders(
+          frameIdx === resumeFrame,
+          {
+            focus: evaluated.pose.streamFocus,
+            dist: evaluated.pose.streamDist,
+            lodModeOverride: project.forceMaxVoxelDetail ? 0 : this.config.lodMode,
+          },
+          options.abortSignal,
+        );
+
+        await this.renderTargetAccumulatedRgbaTopDown(
+          captureRT,
+          renderW,
+          renderH,
+          offlineQual.offlineAccumSamples,
+          rgbaBuf,
+          options.abortSignal,
+        );
+
+        const wantsAspectMatte = evaluated.pfx.aspectMask !== 'none';
+        const wantsCanvasFrame =
+          needsResample || wantsAspectMatte || !useWebm || !encoder || !g.VideoFrame;
+
+        // Always update srcCanvas2D when resampled/matted or generating thumbnail
+        cachedImageData = blitRgbaTopDownToCanvas2D(
+          rgbaBuf,
+          renderW,
+          renderH,
+          srcCanvas2D,
+          srcCtx2D,
+          needsResample ? encodeCanvas2D : undefined,
+          needsResample ? encodeCtx2D : null,
+          cachedImageData,
+        );
+        if (wantsAspectMatte) {
+          applyAspectMatteToCanvas2D(
+            encodeCtx2D,
+            activeEncodeW,
+            activeEncodeH,
+            evaluated.pfx.aspectMask,
+          );
+        }
+
+        const histogram = computeRgbHistogram(rgbaBuf, 32, 48);
+        let thumbDataUrl = '';
+        if (thumbCtx) {
+          thumbCtx.fillStyle = '#040711';
+          thumbCtx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
+          thumbCtx.drawImage(
+            wantsAspectMatte ? encodeCanvas2D : srcCanvas2D,
+            0,
+            0,
+            thumbCanvas.width,
+            thumbCanvas.height,
+          );
+          thumbDataUrl = thumbCanvas.toDataURL('image/jpeg', 0.72);
+        }
+
+        const frameRenderMs = performance.now() - frameStartMs;
+
+        if (useWebm && encoder && g.VideoFrame) {
+          while (encoder.encodeQueueSize >= 6) {
+            await new Promise((r) => setTimeout(r, 4));
+          }
+          const timestampUs = Math.round((frameIdx * 1_000_000) / fps);
+          pendingChunkQueue.push({
+            frameIdx,
+            timestampUs,
+            thumbDataUrl,
+            renderMs: frameRenderMs,
+            meanLuma: histogram.meanLuma,
+            alphaMin: histogram.alphaMin,
+            histogram,
+          });
+
+          const framePixels =
+            needsResample || wantsAspectMatte
+              ? encodeCtx2D.getImageData(0, 0, activeEncodeW, activeEncodeH).data
+              : rgbaBuf;
+
+          let vf: { close: () => void };
+          try {
+            vf = new g.VideoFrame(framePixels, {
+              format: 'RGBA',
+              codedWidth: activeEncodeW,
+              codedHeight: activeEncodeH,
+              timestamp: timestampUs,
+              duration: frameDurUs,
+            });
+          } catch {
+            vf = new g.VideoFrame(encodeCanvas2D, {
+              timestamp: timestampUs,
+              duration: frameDurUs,
+            });
+          }
+          const forceKey = isCpBoundary || frameIdx === startFrame;
+          encoder.encode(vf, { keyFrame: forceKey });
+          vf.close();
+          void wantsCanvasFrame;
+        } else {
+          const pngBlob = await this.canvasToBlob(encodeCanvas2D, 'image/png');
+          const ab = await pngBlob.arrayBuffer();
+          await saveEncodedFrameChunkToDb({
+            jobId,
+            frameIdx,
+            timestampUs: Math.round((frameIdx * 1_000_000) / fps),
+            isKeyFrame: true,
+            isPng: true,
+            payload: ab,
+            thumbDataUrl,
+            renderMs: frameRenderMs,
+            meanLuma: histogram.meanLuma,
+            alphaMin: histogram.alphaMin,
+            histogram,
+          });
+        }
+
+        if (chunkSavePromises.length >= 6) {
+          await Promise.all(chunkSavePromises);
+          chunkSavePromises = [];
+        }
+
+        const completedInRange = frameIdx - startFrame + 1;
+        jobRecord.completedFrames = completedInRange;
+        jobRecord.updatedAt = Date.now();
+        if (isCpBoundary || frameIdx === endFrame) {
+          await saveRenderJobToDb(jobRecord);
+        }
+
+        const elapsedSec = (performance.now() - renderT0) / 1000;
+        const processedThisRun = frameIdx - resumeFrame + 1;
+        const etaSec =
+          processedThisRun > 0 ? (elapsedSec / processedThisRun) * (endFrame - frameIdx) : 0;
+
+        options.onProgress({
+          jobId,
+          frame: frameIdx,
+          totalFrames: range.totalFrames,
+          completedInRange,
+          rangeTotal: totalRangeFrames,
+          percent: Math.round((completedInRange / totalRangeFrames) * 1000) / 10,
+          elapsedSec,
+          etaSec,
+          frameRenderMs,
+          actualWidth: activeEncodeW,
+          actualHeight: activeEncodeH,
+          encoderLabel,
+          statusText: `非线性断点渲染 · 帧 ${frameIdx + 1}/${endFrame + 1} (${offlineQual.offlineAccumSamples}×SSAA)`,
+          previewDataUrl: thumbDataUrl,
+          histogram,
+          meanLuma: histogram.meanLuma,
+          alphaMin: histogram.alphaMin,
+          checkpointSaved: isCpBoundary,
+        });
+
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
+      if (encoder && !encoderClosed) {
+        options.onProgress({
+          jobId,
+          frame: endFrame,
+          totalFrames: range.totalFrames,
+          completedInRange: totalRangeFrames,
+          rangeTotal: totalRangeFrames,
+          percent: 99.5,
+          elapsedSec: (performance.now() - renderT0) / 1000,
+          etaSec: 0,
+          actualWidth: activeEncodeW,
+          actualHeight: activeEncodeH,
+          encoderLabel,
+          statusText: '正在刷新编码队列并封装无损容器...',
+        });
+        await encoder.flush();
+        encoder.close();
+        encoderClosed = true;
+      }
+      await Promise.all(chunkSavePromises);
+
+      jobRecord = {
+        ...jobRecord,
+        status: 'completed',
+        updatedAt: Date.now(),
+        completedFrames: totalRangeFrames,
+      };
+      await saveRenderJobToDb(jobRecord);
+
+      const assembled = await assembleDirectorJobBlob(jobRecord, this.planet.seedConfig.seed);
+      return {
+        status: 'completed',
+        job: jobRecord,
+        result: {
+          ...assembled,
+          elapsedMs: performance.now() - renderT0,
+        },
+      };
+    } catch (err) {
+      if (jobRecord) {
+        jobRecord.status = 'error';
+        jobRecord.updatedAt = Date.now();
+        jobRecord.errorMessage = err instanceof Error ? err.message : String(err);
+        await saveRenderJobToDb(jobRecord);
+      }
+      throw err;
+    } finally {
+      if (encoder && !encoderClosed) {
+        try {
+          encoder.close();
+        } catch {
+          // ignore
+        }
+      }
+      this.renderer.setOutputRenderTarget(null);
+      this.renderer.setRenderTarget(null);
+      captureRT.dispose();
+
+      this.camera.clearViewOffset();
+      this.camera.position.copy(savedPos);
+      this.camera.quaternion.copy(savedQuat);
+      this.camera.up.copy(savedUp);
+      this.camera.fov = savedFov;
+      this.camera.near = savedNear;
+      this.camera.far = savedFar;
+      this.camera.aspect = savedAspect;
+      this.camera.updateProjectionMatrix();
+
+      this.config.renderQuality = savedQuality;
+      this.config.sunAzimuthDeg = savedSunAzimuth;
+      this.config.sunElevationDeg = savedSunElevation;
+      this.config.atmosphere = savedAtmo;
+      this.config.thermal = savedThermal;
+      this.resetDirectorPostGradingUniforms();
+
+      this.renderer.setPixelRatio(savedPixelRatio);
+      this.renderer.setSize(savedCssW, savedCssH, false);
+      this.applyShadowQualitySettings();
+      this.syncRenderPipeline(false);
+
+      this.updateSunDirection();
+      this.simTimeSec = savedSimTime;
+      this.simTimeNode.value = savedSimTime;
+
+      if (prevHelpers) this.restoreEditorHelpersVisible(prevHelpers);
+
+      this.isOfflineRendering = false;
+      this.lastTime = performance.now();
+      this.scheduleNextFrame();
+    }
+  }
+
   private handleKeyDown = (e: KeyboardEvent): void => {
     if (this.phase !== 'playing') return;
     const tag = (e.target as HTMLElement | null)?.tagName;
@@ -6005,7 +7772,13 @@ export class PlanetarySandboxEngine {
     this.lastPointerX = e.clientX;
     this.lastPointerY = e.clientY;
 
-    const isTractorTool = this.getActiveToolAttrs().behavior === 'tractorBeam';
+    const bhv = this.getActiveToolAttrs().behavior;
+    const isTractorTool = bhv === 'tractorBeam';
+    const isSingleShotSurveyTool =
+      bhv === 'surveyPin' ||
+      bhv === 'surveyTransect' ||
+      bhv === 'surveyBorehole' ||
+      bhv === 'surveyClinometer';
 
     if (e.pointerType === 'touch') {
       this.activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -6039,7 +7812,7 @@ export class PlanetarySandboxEngine {
       }
       const hit = this.raycastFromPointer();
       if (hit.hit) {
-        this.isSculpting = true;
+        this.isSculpting = !isSingleShotSurveyTool;
         this.brushCooldown = 0;
         this.performBrushAction(hit);
       } else {
@@ -6088,7 +7861,7 @@ export class PlanetarySandboxEngine {
       }
       const hit = this.raycastFromPointer();
       if (hit.hit) {
-        this.isSculpting = true;
+        this.isSculpting = !isSingleShotSurveyTool;
         this.brushCooldown = 0;
         this.performBrushAction(hit);
       } else {
@@ -6842,6 +8615,29 @@ export class PlanetarySandboxEngine {
     };
 
     const bhv = attrs.behavior;
+
+    if (
+      bhv === 'surveyPin' ||
+      bhv === 'surveyTransect' ||
+      bhv === 'surveyBorehole' ||
+      bhv === 'surveyClinometer'
+    ) {
+      const worldPos: [number, number, number] = [hit.x, hit.y, hit.z];
+      const attitude = this.sampleAttitudeAt(hit.x, hit.y, hit.z);
+      const hasWater = this.fluid.sampleWaterAt(hit.x, hit.y, hit.z) > 0.02;
+      this.lastProbe = this.planet.probeVoxelCell(hit.x, hit.y, hit.z);
+      this.lastHoveredWorldPos = worldPos;
+      this.lastHoveredAttitude = attitude;
+      this.onSurveyAction?.({
+        kind: bhv,
+        worldPos,
+        normal: [hit.nx, hit.ny, hit.nz],
+        attitude,
+        hasWater,
+      });
+      this.sound.playProbe();
+      return;
+    }
 
     if (bhv === 'probe' || bhv === 'seismicProbe') {
       const sampleStep = Math.max(this.planet.nativeVoxelSize * 0.6, this.planet.voxelSize * 0.2);
@@ -7958,6 +9754,10 @@ export class PlanetarySandboxEngine {
       return;
     }
 
+    if (this.directorTimelineLocked) {
+      return;
+    }
+
     if (this.config.cameraMode === 'fps') {
       this.updateFpsCamera(dt);
       return;
@@ -8377,8 +10177,24 @@ export class PlanetarySandboxEngine {
         meshBuildMsThisFrame += performance.now() - wT0;
       }
 
-      if (this.config.debugProbeEnabled && hoveredHit && hoveredHit.hit) {
-        this.lastProbe = this.planet.probeVoxelCell(hoveredHit.x, hoveredHit.y, hoveredHit.z);
+      if (hoveredHit && hoveredHit.hit) {
+        this.lastHoveredWorldPos = [hoveredHit.x, hoveredHit.y, hoveredHit.z];
+        const curBhv = this.getActiveToolAttrs().behavior;
+        if (
+          this.config.debugProbeEnabled ||
+          curBhv === 'surveyClinometer' ||
+          curBhv === 'surveyPin'
+        ) {
+          this.lastHoveredAttitude = this.sampleAttitudeAt(hoveredHit.x, hoveredHit.y, hoveredHit.z);
+        } else {
+          this.lastHoveredAttitude = null;
+        }
+        if (this.config.debugProbeEnabled) {
+          this.lastProbe = this.planet.probeVoxelCell(hoveredHit.x, hoveredHit.y, hoveredHit.z);
+        }
+      } else {
+        this.lastHoveredWorldPos = null;
+        this.lastHoveredAttitude = null;
       }
     } else if (this.phase === 'title') {
       if (this.waterMeshDirty) {
@@ -8661,6 +10477,12 @@ export class PlanetarySandboxEngine {
       canvasHeight: dom?.height ?? Math.max(1, this.container.clientHeight),
     });
 
+    const datum = this.getCoordDatum();
+    const playerCoord = worldToCoord([refPos.x, refPos.y, refPos.z], this.config.coordSystem, datum);
+    const hoveredCoord = this.lastHoveredWorldPos
+      ? worldToCoord(this.lastHoveredWorldPos, this.config.coordSystem, datum)
+      : null;
+
     this.onTelemetry({
       altitude: r - this.planet.baseRadius,
       localGravity: computeGravityMagnitude(r, params),
@@ -8702,6 +10524,10 @@ export class PlanetarySandboxEngine {
       tractorBeam: { ...this.tractorTelemetry },
       backendInfo: this.backendDiagnostic,
       perf,
+      playerCoord,
+      hoveredCoord,
+      hoveredWorldPos: this.lastHoveredWorldPos,
+      hoveredAttitude: this.lastHoveredAttitude,
     });
   }
 
@@ -8709,6 +10535,9 @@ export class PlanetarySandboxEngine {
     this.isDisposed = true;
     cancelAnimationFrame(this.frameHandle);
     clearTimeout(this.timerHandle);
+
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
 
     window.removeEventListener('resize', this.handleResize);
     window.removeEventListener('keydown', this.handleKeyDown);

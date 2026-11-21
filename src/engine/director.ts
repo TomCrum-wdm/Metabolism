@@ -1,4 +1,5 @@
 import { computeDetailCameraOptics, transportCameraForwardOnSphere } from './cameraMath';
+import { MaterialId } from './voxelPlanet';
 import {
   createDefaultDirectorQuality,
   DirectorQualitySettings,
@@ -17,6 +18,31 @@ export type DirectorExportFormat = 'webm-vp9' | 'webm-vp8' | 'png-tar';
 
 export type ScreenshotFormat = 'png' | 'webp' | 'jpeg';
 
+export type CubicBezier4 = [number, number, number, number];
+
+export type CameraInterpMode = 'catmull_rom' | 'linear' | 'hold';
+
+export type DirectorWorldEventType =
+  | 'volcano'
+  | 'nuke'
+  | 'crater'
+  | 'meteorShower'
+  | 'waterFlood'
+  | 'drain'
+  | 'tractorBurst'
+  | 'thermalHotspot'
+  | 'terraformMaterial';
+
+export type DirectorLutPreset =
+  | 'natural'
+  | 'cinema_teal_orange'
+  | 'sci_fi_cyan'
+  | 'noir_high_contrast'
+  | 'solar_amber'
+  | 'thermal_falsecolor';
+
+export type DirectorAspectMask = 'none' | '2.39:1' | '16:9' | '9:16';
+
 export interface ResolutionPreset {
   id: string;
   label: string;
@@ -34,6 +60,103 @@ export const RESOLUTION_PRESETS: ReadonlyArray<ResolutionPreset> = [
 ];
 
 export const FPS_PRESETS: ReadonlyArray<number> = [24, 30, 60, 120, 165, 240];
+
+export const EASING_PRESETS: ReadonlyArray<{
+  id: string;
+  label: string;
+  bezier: CubicBezier4;
+}> = [
+  { id: 'linear', label: '线性 Linear', bezier: [0.0, 0.0, 1.0, 1.0] },
+  { id: 'ease_in_out', label: '缓入缓出 Sine', bezier: [0.42, 0.0, 0.58, 1.0] },
+  { id: 'expo_snap', label: '指数锐进 Expo', bezier: [0.16, 1.0, 0.3, 1.0] },
+  { id: 'ease_in_cubic', label: '蓄力推入 CubicIn', bezier: [0.55, 0.055, 0.675, 0.19] },
+  { id: 'overshoot', label: '电影过冲 Overshoot', bezier: [0.34, 1.38, 0.64, 1.0] },
+];
+
+export const WORLD_EVENT_META: ReadonlyArray<{
+  type: DirectorWorldEventType;
+  label: string;
+  colorHex: string;
+  defaultDurationSec: number;
+  desc: string;
+}> = [
+  {
+    type: 'volcano',
+    label: '火山喷发',
+    colorHex: '#f97316',
+    defaultDurationSec: 1.5,
+    desc: '在指定经纬度抬升火山锥体、喷射熔岩并加热周边大气',
+  },
+  {
+    type: 'nuke',
+    label: '核爆冲击',
+    colorHex: '#f43f5e',
+    defaultDurationSec: 1.2,
+    desc: '触发强冲击波、辐射环形坑、高温气化水体与炽热火球',
+  },
+  {
+    type: 'crater',
+    label: '陨石撞击坑',
+    colorHex: '#eab308',
+    defaultDurationSec: 0.6,
+    desc: '瞬间形成深层撞击陨石坑与碎屑喷溅环',
+  },
+  {
+    type: 'meteorShower',
+    label: '流星雨轰炸',
+    colorHex: '#fb923c',
+    defaultDurationSec: 2.8,
+    desc: '多波次高空陨石俯冲砸向目标半球区域',
+  },
+  {
+    type: 'waterFlood',
+    label: '洪水注水',
+    colorHex: '#06b6d4',
+    defaultDurationSec: 2.0,
+    desc: '在选定坐标高流量倾泻体素水粒子形成江河湖泊',
+  },
+  {
+    type: 'drain',
+    label: '地陷抽水',
+    colorHex: '#38bdf8',
+    defaultDurationSec: 1.4,
+    desc: '瞬间抽干指定半径内的积水或海洋盆地',
+  },
+  {
+    type: 'tractorBurst',
+    label: '引力束扰动',
+    colorHex: '#22d3ee',
+    defaultDurationSec: 1.8,
+    desc: '对目标点附近水域及碎屑施加引力拖拽与抛射脉冲',
+  },
+  {
+    type: 'thermalHotspot',
+    label: '地热异常点',
+    colorHex: '#ef4444',
+    defaultDurationSec: 2.5,
+    desc: '激活局地高能热柱，形成对流与热力温度场梯度',
+  },
+  {
+    type: 'terraformMaterial',
+    label: '地貌重塑铺层',
+    colorHex: '#10b981',
+    defaultDurationSec: 1.0,
+    desc: '以指定地质材质重塑该区高程或铺设结晶/玄武岩层',
+  },
+];
+
+export const LUT_PRESET_META: ReadonlyArray<{
+  id: DirectorLutPreset;
+  label: string;
+  desc: string;
+}> = [
+  { id: 'natural', label: '标准光学 Natural', desc: '忠实呈现物理太阳光谱与地表漫反射色彩' },
+  { id: 'cinema_teal_orange', label: '影院青橙 Teal&Orange', desc: '高光暖琥珀与阴影青蓝分离，典型科幻大片风格' },
+  { id: 'sci_fi_cyan', label: '深空冷青 Sci-Fi Cyan', desc: '强化大气瑞利冷调、星际寒光与硬朗反差' },
+  { id: 'noir_high_contrast', label: '高反差硬核 Noir', desc: '深邃暗部与压缩饱和度，突出几何体素轮廓' },
+  { id: 'solar_amber', label: '炽阳鎏金 Solar Amber', desc: '暖金黄昏滤镜，强化夕阳散射与火山熔岩辉光' },
+  { id: 'thermal_falsecolor', label: '科学热成像 FalseColor', desc: '实验室光谱映射，放大亮度与热工层视觉对比' },
+];
 
 export interface DirectorActionMeta {
   id: DirectorActionType;
@@ -88,6 +211,61 @@ export interface DirectorKeyframe {
   fovDeg: number;
 }
 
+export interface DirectorCameraKeyframe extends DirectorKeyframe {
+  timeSec: number;
+  focusDist: number;
+  aperture: number;
+  rollDeg: number;
+  shakeAmp: number;
+  shakeFreq: number;
+  interpMode: CameraInterpMode;
+  easing: CubicBezier4;
+}
+
+export interface DirectorEnvKeyframe {
+  id: string;
+  timeSec: number;
+  sunElevationDeg: number;
+  sunAzimuthDeg: number;
+  atmoDensity: number;
+  scatterStrength: number;
+  cloudCoverage: number;
+  cloudAltitudeRatio: number;
+  windSpeed: number;
+  tempOffsetC: number;
+  easing: CubicBezier4;
+}
+
+export interface DirectorWorldEvent {
+  id: string;
+  label: string;
+  type: DirectorWorldEventType;
+  latDeg: number;
+  lonDeg: number;
+  triggerTimeSec: number;
+  durationSec: number;
+  radiusMult: number;
+  strength: number;
+  materialId: MaterialId;
+  enabled: boolean;
+}
+
+export interface DirectorPostFxKeyframe {
+  id: string;
+  timeSec: number;
+  lutPreset: DirectorLutPreset;
+  lutIntensity: number;
+  exposure: number;
+  contrast: number;
+  saturation: number;
+  bloomStrength: number;
+  vignette: number;
+  filmGrain: number;
+  chromaticAberration: number;
+  aspectMask: DirectorAspectMask;
+  easing: CubicBezier4;
+}
+
 export interface DirectorShotPlan {
   action: DirectorActionType;
   width: number;
@@ -121,6 +299,28 @@ export interface DirectorShotPlan {
   keyframes: DirectorKeyframe[];
 }
 
+export interface DirectorTimelineProject {
+  id: string;
+  name: string;
+  updatedAt: number;
+  durationSec: number;
+  fps: number;
+  width: number;
+  height: number;
+  format: DirectorExportFormat;
+  inTimeSec: number;
+  outTimeSec: number;
+  simTimeScale: number;
+  cleanFrame: boolean;
+  forceMaxVoxelDetail: boolean;
+  checkpointIntervalFrames: number;
+  offlineQuality: DirectorQualitySettings;
+  cameraTrack: DirectorCameraKeyframe[];
+  envTrack: DirectorEnvKeyframe[];
+  eventTrack: DirectorWorldEvent[];
+  postFxTrack: DirectorPostFxKeyframe[];
+}
+
 export interface DirectorSceneAnchor {
   baseRadius: number;
   nativeVoxelSize: number;
@@ -148,19 +348,66 @@ export interface DirectorCameraPose {
   streamDist: number;
   /** Relative solar azimuth rotation in degrees */
   sunAzimuthDeltaDeg: number;
+  focusDist?: number;
+  aperture?: number;
+  rollDeg?: number;
+}
+
+export interface EvaluatedEnvState {
+  sunElevationDeg: number;
+  sunAzimuthDeg: number;
+  atmoDensity: number;
+  scatterStrength: number;
+  cloudCoverage: number;
+  cloudAltitudeRatio: number;
+  windSpeed: number;
+  tempOffsetC: number;
+}
+
+export interface EvaluatedPostFxState {
+  lutPreset: DirectorLutPreset;
+  lutIntensity: number;
+  exposure: number;
+  contrast: number;
+  saturation: number;
+  bloomStrength: number;
+  vignette: number;
+  filmGrain: number;
+  chromaticAberration: number;
+  aspectMask: DirectorAspectMask;
+}
+
+export interface RgbHistogramBins {
+  bins: number;
+  r: number[];
+  g: number[];
+  b: number[];
+  luma: number[];
+  meanLuma: number;
+  alphaMin: number;
+  clipHighPct: number;
+  clipLowPct: number;
 }
 
 export interface DirectorRenderProgress {
+  jobId?: string;
   frame: number;
   totalFrames: number;
+  completedInRange?: number;
+  rangeTotal?: number;
   percent: number;
   elapsedSec: number;
   etaSec: number;
+  frameRenderMs?: number;
   actualWidth: number;
   actualHeight: number;
   encoderLabel: string;
   statusText: string;
   previewDataUrl?: string;
+  histogram?: RgbHistogramBins;
+  meanLuma?: number;
+  alphaMin?: number;
+  checkpointSaved?: boolean;
 }
 
 export function createDefaultDirectorPlan(): DirectorShotPlan {
@@ -186,8 +433,122 @@ export function createDefaultDirectorPlan(): DirectorShotPlan {
   };
 }
 
+export function createDefaultDirectorProject(
+  anchor?: Partial<DirectorSceneAnchor>,
+  seedTag?: number,
+): DirectorTimelineProject {
+  const R = anchor?.baseRadius ?? 13;
+  const startPos: [number, number, number] = anchor?.currentPos ?? [R * 1.4, R * 1.15, R * 1.8];
+  const startLook: [number, number, number] = anchor?.currentLookAt ?? [0, 0, 0];
+  const startUp: [number, number, number] = anchor?.currentUp ?? [0, 1, 0];
+  const startFov = anchor?.currentFovDeg ?? 52;
+  const durationSec = 8;
+
+  return {
+    id: `proj_${Date.now().toString(36)}`,
+    name: seedTag ? `行星 #${seedTag} 主剪辑工程` : 'TerraSphere 主时间轴工程',
+    updatedAt: Date.now(),
+    durationSec,
+    fps: 60,
+    width: 1920,
+    height: 1080,
+    format: 'webm-vp9',
+    inTimeSec: 0,
+    outTimeSec: durationSec,
+    simTimeScale: 1.0,
+    cleanFrame: true,
+    forceMaxVoxelDetail: true,
+    checkpointIntervalFrames: 24,
+    offlineQuality: createDefaultDirectorQuality(),
+    cameraTrack: [
+      {
+        id: 'cam_kf_0',
+        label: '起始机位',
+        timeSec: 0,
+        position: [...startPos],
+        lookAt: [...startLook],
+        up: [...startUp],
+        fovDeg: startFov,
+        focusDist: Math.max(1, Math.hypot(startPos[0] - startLook[0], startPos[1] - startLook[1], startPos[2] - startLook[2])),
+        aperture: 2.8,
+        rollDeg: 0,
+        shakeAmp: 0,
+        shakeFreq: 4,
+        interpMode: 'catmull_rom',
+        easing: [0.42, 0, 0.58, 1],
+      },
+      {
+        id: 'cam_kf_end',
+        label: '全景落幅',
+        timeSec: durationSec,
+        position: [-startPos[2] * 1.15, startPos[1] * 1.18, startPos[0] * 1.15],
+        lookAt: [0, 0, 0],
+        up: [0, 1, 0],
+        fovDeg: 48,
+        focusDist: R * 2.5,
+        aperture: 4.0,
+        rollDeg: 0,
+        shakeAmp: 0,
+        shakeFreq: 4,
+        interpMode: 'catmull_rom',
+        easing: [0.42, 0, 0.58, 1],
+      },
+    ],
+    envTrack: [
+      {
+        id: 'env_kf_0',
+        timeSec: 0,
+        sunElevationDeg: 28,
+        sunAzimuthDeg: 28,
+        atmoDensity: 1.0,
+        scatterStrength: 1.0,
+        cloudCoverage: 0.48,
+        cloudAltitudeRatio: 0.16,
+        windSpeed: 1.0,
+        tempOffsetC: 0,
+        easing: [0.0, 0.0, 1.0, 1.0],
+      },
+      {
+        id: 'env_kf_end',
+        timeSec: durationSec,
+        sunElevationDeg: 18,
+        sunAzimuthDeg: 78,
+        atmoDensity: 1.05,
+        scatterStrength: 1.1,
+        cloudCoverage: 0.55,
+        cloudAltitudeRatio: 0.16,
+        windSpeed: 1.15,
+        tempOffsetC: 0,
+        easing: [0.42, 0.0, 0.58, 1.0],
+      },
+    ],
+    eventTrack: [],
+    postFxTrack: [
+      {
+        id: 'pfx_kf_0',
+        timeSec: 0,
+        lutPreset: 'natural',
+        lutIntensity: 0.85,
+        exposure: 1.12,
+        contrast: 1.04,
+        saturation: 1.05,
+        bloomStrength: 0.34,
+        vignette: 0.18,
+        filmGrain: 0.02,
+        chromaticAberration: 0.0,
+        aspectMask: 'none',
+        easing: [0.42, 0.0, 0.58, 1.0],
+      },
+    ],
+  };
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
 function smoothstep01(t: number): number {
@@ -204,6 +565,17 @@ function normalize3(x: number, y: number, z: number): [number, number, number] {
   const len = Math.hypot(x, y, z);
   if (len < 1e-8) return [0, 1, 0];
   return [x / len, y / len, z / len];
+}
+
+function cross3(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number],
+): [number, number, number] {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
 }
 
 function lerp3(
@@ -247,6 +619,81 @@ function catmullRom3(
 function sphericalDir(latRad: number, lonRad: number): [number, number, number] {
   const cosL = Math.cos(latRad);
   return [cosL * Math.cos(lonRad), Math.sin(latRad), cosL * Math.sin(lonRad)];
+}
+
+function rotateAroundAxis3(
+  v: readonly [number, number, number],
+  axis: readonly [number, number, number],
+  angleRad: number,
+): [number, number, number] {
+  if (Math.abs(angleRad) < 1e-6) return [v[0], v[1], v[2]];
+  const k = normalize3(axis[0], axis[1], axis[2]);
+  const cosA = Math.cos(angleRad);
+  const sinA = Math.sin(angleRad);
+  const kDotV = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+  const kCrossV = cross3(k, v);
+  return normalize3(
+    v[0] * cosA + kCrossV[0] * sinA + k[0] * kDotV * (1 - cosA),
+    v[1] * cosA + kCrossV[1] * sinA + k[1] * kDotV * (1 - cosA),
+    v[2] * cosA + kCrossV[2] * sinA + k[2] * kDotV * (1 - cosA),
+  );
+}
+
+/**
+ * Evaluates a standard cubic-bezier(x1, y1, x2, y2) timing function for normalized x in [0, 1].
+ * Supports overshoot control points where y1/y2 may exceed [0, 1].
+ */
+export function evaluateCubicBezierEasing(
+  bezier: CubicBezier4 | undefined,
+  tRaw: number,
+): number {
+  const xTarget = clamp(tRaw, 0, 1);
+  if (xTarget <= 0) return 0;
+  if (xTarget >= 1) return 1;
+  const [x1r, y1, x2r, y2] = bezier ?? [0.42, 0, 0.58, 1];
+  const x1 = clamp(x1r, 0, 1);
+  const x2 = clamp(x2r, 0, 1);
+  if (Math.abs(x1 - y1) < 1e-4 && Math.abs(x2 - y2) < 1e-4) {
+    return xTarget;
+  }
+
+  const sampleCurveX = (u: number) => {
+    const inv = 1 - u;
+    return 3 * inv * inv * u * x1 + 3 * inv * u * u * x2 + u * u * u;
+  };
+  const sampleCurveDerivX = (u: number) => {
+    const inv = 1 - u;
+    return 3 * inv * inv * x1 + 6 * inv * u * (x2 - x1) + 3 * u * u * (1 - x2);
+  };
+  const sampleCurveY = (u: number) => {
+    const inv = 1 - u;
+    return 3 * inv * inv * u * y1 + 3 * inv * u * u * y2 + u * u * u;
+  };
+
+  let u = xTarget;
+  for (let i = 0; i < 6; i++) {
+    const err = sampleCurveX(u) - xTarget;
+    if (Math.abs(err) < 1e-6) break;
+    const dx = sampleCurveDerivX(u);
+    if (Math.abs(dx) < 1e-6) break;
+    u = clamp(u - err / dx, 0, 1);
+  }
+  // Fallback bisection if Newton stalled
+  let lo = 0;
+  let hi = 1;
+  let errCheck = sampleCurveX(u) - xTarget;
+  if (Math.abs(errCheck) > 1e-4) {
+    u = xTarget;
+    for (let i = 0; i < 16; i++) {
+      const xv = sampleCurveX(u);
+      errCheck = xv - xTarget;
+      if (Math.abs(errCheck) < 1e-5) break;
+      if (xv < xTarget) lo = u;
+      else hi = u;
+      u = 0.5 * (lo + hi);
+    }
+  }
+  return sampleCurveY(u);
 }
 
 /**
@@ -331,15 +778,12 @@ export function evaluateDirectorPose(
       R0 * 0.25,
     );
     const dMax = Math.max(R0 * clamp(plan.planetEndDistMult, 1.35, 7.0), dMin * 4);
-    // Log-space progression gives equal visual airtime across micro -> cliff -> continent -> globe
     const desiredDist = dMin * Math.pow(dMax / dMin, s);
     const optics = computeDetailCameraOptics(desiredDist, R0, voxel, baseFov);
 
-    // Gradually blend look target from the exact micro surface block to the planet center (0,0,0)
     const centerBlend = smoothstep01((s - 0.32) / 0.58);
     const lookAt = lerp3(anchor.targetPoint, [0, 0, 0], centerBlend);
 
-    // Subtle dramatic tilt & azimuth rotation during the macroscopic phase so the shot feels alive
     const startTiltRad = 0.34;
     const endElevRad = (clamp(plan.orbitElevationDeg, -75, 75) * Math.PI) / 180;
     const sweepRad = (plan.orbitSweepDeg * 0.35 * Math.PI) / 180 * smoothstep01((s - 0.15) / 0.85);
@@ -347,7 +791,6 @@ export function evaluateDirectorPose(
     const startAzimuth = Math.atan2(targetN[2], targetN[0]);
     const startLat = Math.asin(clamp(targetN[1], -0.999, 0.999));
 
-    // Close-up direction leans slightly backward along tangent away from normal for depth parallax
     const microViewDir = normalize3(
       targetN[0] * Math.cos(startTiltRad) - basisAtTarget.forward[0] * Math.sin(startTiltRad),
       targetN[1] * Math.cos(startTiltRad) - basisAtTarget.forward[1] * Math.sin(startTiltRad),
@@ -362,7 +805,6 @@ export function evaluateDirectorPose(
       microViewDir[2] + (macroDir[2] - microViewDir[2]) * centerBlend,
     );
 
-    // Distance from lookAt point along camDir: at micro end use physicalDist, at macro end use dMax from center
     const camDistFromLook = optics.physicalDist + (dMax - optics.physicalDist) * centerBlend;
     const position: [number, number, number] = [
       lookAt[0] + camDir[0] * camDistFromLook,
@@ -370,7 +812,6 @@ export function evaluateDirectorPose(
       lookAt[2] + camDir[2] * camDistFromLook,
     ];
 
-    // Smoothly transition up-vector from local surface normal tangent frame to planetary north [0, 1, 0]
     const microUp = normalize3(
       basisAtTarget.forward[0] * Math.cos(startTiltRad) + targetN[0] * Math.sin(startTiltRad),
       basisAtTarget.forward[1] * Math.cos(startTiltRad) + targetN[1] * Math.sin(startTiltRad),
@@ -382,7 +823,6 @@ export function evaluateDirectorPose(
       microUp[2] + (0 - microUp[2]) * centerBlend,
     );
 
-    // Ensure non-degenerate up vs camDir
     const dotUpDir = Math.abs(up[0] * camDir[0] + up[1] * camDir[1] + up[2] * camDir[2]);
     const safeUp: [number, number, number] =
       dotUpDir > 0.985 ? targetRight : up;
@@ -436,8 +876,6 @@ export function evaluateDirectorPose(
     };
   }
 
-  // 'surface_flyover': Smooth great-circle low-altitude flyover following planetary curvature
-  const orbitNormal = normalize3(targetRight[0], targetRight[1], targetRight[2]);
   const tangentFwd = basisAtTarget.forward;
   const arcRad = ((clamp(plan.orbitSweepDeg || 160, 15, 720)) * Math.PI) / 180 * u;
   const cosA = Math.cos(arcRad);
@@ -454,7 +892,6 @@ export function evaluateDirectorPose(
     tangentFwd[2] * cosA - targetN[2] * sinA,
   );
 
-  // Sample terrain ahead & below so low flyover clears peaks cleanly
   const surfHere = anchor.sampleSurfaceRadius
     ? anchor.sampleSurfaceRadius(curDir[0], curDir[1], curDir[2])
     : R0;
@@ -480,8 +917,6 @@ export function evaluateDirectorPose(
     lookDir[2] * (surfAhead + alt * 0.15),
   ];
 
-  // Keep slight lateral stability using orbitNormal only as reference, up = local gravity normal
-  void orbitNormal;
   return {
     position,
     lookAt,
@@ -493,6 +928,553 @@ export function evaluateDirectorPose(
   };
 }
 
-export function computePlanFrameCount(plan: DirectorShotPlan): number {
-  return Math.max(2, Math.round(clamp(plan.durationSec, 0.25, 120) * clamp(plan.fps, 1, 300)));
+/**
+ * Evaluates the Camera & Lens keyframe track at absolute time `timeSec`.
+ */
+export function evaluateCameraTrackPose(
+  rawTrack: ReadonlyArray<DirectorCameraKeyframe>,
+  timeSec: number,
+  anchor: DirectorSceneAnchor,
+): DirectorCameraPose {
+  const R0 = Math.max(anchor.baseRadius, 0.05);
+  const voxel = Math.max(anchor.nativeVoxelSize, 1e-8);
+  if (rawTrack.length === 0) {
+    return {
+      position: [...anchor.currentPos],
+      lookAt: [...anchor.currentLookAt],
+      up: normalize3(anchor.currentUp[0], anchor.currentUp[1], anchor.currentUp[2]),
+      fovDeg: clamp(anchor.currentFovDeg || 52, 3, 115),
+      streamFocus: [...anchor.targetPoint],
+      streamDist: Math.max(
+        voxel,
+        Math.hypot(
+          anchor.currentPos[0] - anchor.currentLookAt[0],
+          anchor.currentPos[1] - anchor.currentLookAt[1],
+          anchor.currentPos[2] - anchor.currentLookAt[2],
+        ),
+      ),
+      sunAzimuthDeltaDeg: 0,
+      focusDist: R0,
+      aperture: 2.8,
+      rollDeg: 0,
+    };
+  }
+
+  const kfs = [...rawTrack].sort((a, b) => a.timeSec - b.timeSec);
+  const applyModifiers = (
+    kfPos: [number, number, number],
+    kfLook: [number, number, number],
+    kfUp: [number, number, number],
+    fovDeg: number,
+    focusDist: number,
+    aperture: number,
+    rollDeg: number,
+    shakeAmp: number,
+    shakeFreq: number,
+  ): DirectorCameraPose => {
+    const viewFwd = normalize3(
+      kfLook[0] - kfPos[0],
+      kfLook[1] - kfPos[1],
+      kfLook[2] - kfPos[2],
+    );
+    let pos = kfPos;
+    let look = kfLook;
+
+    if (shakeAmp > 1e-4) {
+      const f = Math.max(0.5, shakeFreq);
+      const disp = shakeAmp * R0 * 0.015;
+      const sx = Math.sin(timeSec * f * 6.283 + 1.1) * disp;
+      const sy = Math.cos(timeSec * f * 8.17 + 2.4) * disp * 0.75;
+      const sz = Math.sin(timeSec * f * 5.13 + 4.2) * disp;
+      pos = [pos[0] + sx, pos[1] + sy, pos[2] + sz];
+      look = [look[0] + sx * 0.35, look[1] + sy * 0.35, look[2] + sz * 0.35];
+    }
+
+    const rolledUp = rotateAroundAxis3(
+      normalize3(kfUp[0], kfUp[1], kfUp[2]),
+      viewFwd,
+      (rollDeg * Math.PI) / 180,
+    );
+    const focusDir = normalize3(look[0], look[1], look[2]);
+    const surfR = anchor.sampleSurfaceRadius
+      ? anchor.sampleSurfaceRadius(focusDir[0], focusDir[1], focusDir[2])
+      : R0;
+    const dist = Math.hypot(pos[0] - look[0], pos[1] - look[1], pos[2] - look[2]);
+    return {
+      position: pos,
+      lookAt: look,
+      up: rolledUp,
+      fovDeg: clamp(fovDeg, 3, 115),
+      streamFocus: [focusDir[0] * surfR, focusDir[1] * surfR, focusDir[2] * surfR],
+      streamDist: Math.max(voxel, dist),
+      sunAzimuthDeltaDeg: 0,
+      focusDist,
+      aperture,
+      rollDeg,
+    };
+  };
+
+  if (kfs.length === 1 || timeSec <= kfs[0].timeSec) {
+    const k = kfs[0];
+    return applyModifiers(
+      [...k.position],
+      [...k.lookAt],
+      [...k.up],
+      k.fovDeg,
+      k.focusDist,
+      k.aperture,
+      k.rollDeg,
+      k.shakeAmp,
+      k.shakeFreq,
+    );
+  }
+  const last = kfs[kfs.length - 1];
+  if (timeSec >= last.timeSec) {
+    return applyModifiers(
+      [...last.position],
+      [...last.lookAt],
+      [...last.up],
+      last.fovDeg,
+      last.focusDist,
+      last.aperture,
+      last.rollDeg,
+      last.shakeAmp,
+      last.shakeFreq,
+    );
+  }
+
+  let idx = 0;
+  for (let i = 0; i < kfs.length - 1; i++) {
+    if (timeSec >= kfs[i].timeSec && timeSec <= kfs[i + 1].timeSec) {
+      idx = i;
+      break;
+    }
+  }
+  const k1 = kfs[idx];
+  const k2 = kfs[idx + 1];
+  const span = Math.max(1e-5, k2.timeSec - k1.timeSec);
+  const rawLocalT = clamp((timeSec - k1.timeSec) / span, 0, 1);
+
+  if (k1.interpMode === 'hold') {
+    return applyModifiers(
+      [...k1.position],
+      [...k1.lookAt],
+      [...k1.up],
+      k1.fovDeg,
+      k1.focusDist,
+      k1.aperture,
+      k1.rollDeg,
+      k1.shakeAmp,
+      k1.shakeFreq,
+    );
+  }
+
+  const easedT = evaluateCubicBezierEasing(k1.easing, rawLocalT);
+  const k0 = kfs[Math.max(0, idx - 1)];
+  const k3 = kfs[Math.min(kfs.length - 1, idx + 2)];
+
+  const pos =
+    k1.interpMode === 'linear'
+      ? lerp3(k1.position, k2.position, easedT)
+      : catmullRom3(k0.position, k1.position, k2.position, k3.position, easedT);
+  const look =
+    k1.interpMode === 'linear'
+      ? lerp3(k1.lookAt, k2.lookAt, easedT)
+      : catmullRom3(k0.lookAt, k1.lookAt, k2.lookAt, k3.lookAt, easedT);
+  const up =
+    k1.interpMode === 'linear'
+      ? lerp3(k1.up, k2.up, easedT)
+      : catmullRom3(k0.up, k1.up, k2.up, k3.up, easedT);
+  const fov =
+    k1.interpMode === 'linear'
+      ? lerp(k1.fovDeg, k2.fovDeg, easedT)
+      : catmullRomScalar(k0.fovDeg, k1.fovDeg, k2.fovDeg, k3.fovDeg, easedT);
+
+  return applyModifiers(
+    pos,
+    look,
+    up,
+    fov,
+    lerp(k1.focusDist, k2.focusDist, easedT),
+    lerp(k1.aperture, k2.aperture, easedT),
+    lerp(k1.rollDeg, k2.rollDeg, easedT),
+    lerp(k1.shakeAmp, k2.shakeAmp, easedT),
+    lerp(k1.shakeFreq, k2.shakeFreq, easedT),
+  );
+}
+
+/**
+ * Evaluates the Sun, Atmosphere & Cloud keyframe track at `timeSec`.
+ */
+export function evaluateEnvironmentTrack(
+  rawTrack: ReadonlyArray<DirectorEnvKeyframe>,
+  timeSec: number,
+  fallback?: Partial<EvaluatedEnvState>,
+): EvaluatedEnvState {
+  const base: EvaluatedEnvState = {
+    sunElevationDeg: fallback?.sunElevationDeg ?? 28,
+    sunAzimuthDeg: fallback?.sunAzimuthDeg ?? 28,
+    atmoDensity: fallback?.atmoDensity ?? 1.0,
+    scatterStrength: fallback?.scatterStrength ?? 1.0,
+    cloudCoverage: fallback?.cloudCoverage ?? 0.48,
+    cloudAltitudeRatio: fallback?.cloudAltitudeRatio ?? 0.16,
+    windSpeed: fallback?.windSpeed ?? 1.0,
+    tempOffsetC: fallback?.tempOffsetC ?? 0,
+  };
+  if (rawTrack.length === 0) return base;
+  const kfs = [...rawTrack].sort((a, b) => a.timeSec - b.timeSec);
+  if (kfs.length === 1 || timeSec <= kfs[0].timeSec) {
+    const k = kfs[0];
+    return {
+      sunElevationDeg: k.sunElevationDeg,
+      sunAzimuthDeg: k.sunAzimuthDeg,
+      atmoDensity: k.atmoDensity,
+      scatterStrength: k.scatterStrength,
+      cloudCoverage: k.cloudCoverage,
+      cloudAltitudeRatio: k.cloudAltitudeRatio,
+      windSpeed: k.windSpeed,
+      tempOffsetC: k.tempOffsetC,
+    };
+  }
+  const last = kfs[kfs.length - 1];
+  if (timeSec >= last.timeSec) {
+    return {
+      sunElevationDeg: last.sunElevationDeg,
+      sunAzimuthDeg: last.sunAzimuthDeg,
+      atmoDensity: last.atmoDensity,
+      scatterStrength: last.scatterStrength,
+      cloudCoverage: last.cloudCoverage,
+      cloudAltitudeRatio: last.cloudAltitudeRatio,
+      windSpeed: last.windSpeed,
+      tempOffsetC: last.tempOffsetC,
+    };
+  }
+
+  let idx = 0;
+  for (let i = 0; i < kfs.length - 1; i++) {
+    if (timeSec >= kfs[i].timeSec && timeSec <= kfs[i + 1].timeSec) {
+      idx = i;
+      break;
+    }
+  }
+  const a = kfs[idx];
+  const b = kfs[idx + 1];
+  const span = Math.max(1e-5, b.timeSec - a.timeSec);
+  const t = evaluateCubicBezierEasing(a.easing, (timeSec - a.timeSec) / span);
+  return {
+    sunElevationDeg: lerp(a.sunElevationDeg, b.sunElevationDeg, t),
+    sunAzimuthDeg: lerp(a.sunAzimuthDeg, b.sunAzimuthDeg, t),
+    atmoDensity: Math.max(0, lerp(a.atmoDensity, b.atmoDensity, t)),
+    scatterStrength: Math.max(0, lerp(a.scatterStrength, b.scatterStrength, t)),
+    cloudCoverage: clamp(lerp(a.cloudCoverage, b.cloudCoverage, t), 0, 1.2),
+    cloudAltitudeRatio: clamp(lerp(a.cloudAltitudeRatio, b.cloudAltitudeRatio, t), 0.04, 0.45),
+    windSpeed: clamp(lerp(a.windSpeed, b.windSpeed, t), 0, 5),
+    tempOffsetC: lerp(a.tempOffsetC, b.tempOffsetC, t),
+  };
+}
+
+/**
+ * Evaluates the Post-Processing & Color Grading track at `timeSec`.
+ */
+export function evaluatePostFxTrack(
+  rawTrack: ReadonlyArray<DirectorPostFxKeyframe>,
+  timeSec: number,
+): EvaluatedPostFxState {
+  const defaults: EvaluatedPostFxState = {
+    lutPreset: 'natural',
+    lutIntensity: 0.85,
+    exposure: 1.12,
+    contrast: 1.0,
+    saturation: 1.0,
+    bloomStrength: 0.34,
+    vignette: 0.16,
+    filmGrain: 0.0,
+    chromaticAberration: 0.0,
+    aspectMask: 'none',
+  };
+  if (rawTrack.length === 0) return defaults;
+  const kfs = [...rawTrack].sort((a, b) => a.timeSec - b.timeSec);
+  if (kfs.length === 1 || timeSec <= kfs[0].timeSec) {
+    const k = kfs[0];
+    return {
+      lutPreset: k.lutPreset,
+      lutIntensity: k.lutIntensity,
+      exposure: k.exposure,
+      contrast: k.contrast,
+      saturation: k.saturation,
+      bloomStrength: k.bloomStrength,
+      vignette: k.vignette,
+      filmGrain: k.filmGrain,
+      chromaticAberration: k.chromaticAberration,
+      aspectMask: k.aspectMask,
+    };
+  }
+  const last = kfs[kfs.length - 1];
+  if (timeSec >= last.timeSec) {
+    return {
+      lutPreset: last.lutPreset,
+      lutIntensity: last.lutIntensity,
+      exposure: last.exposure,
+      contrast: last.contrast,
+      saturation: last.saturation,
+      bloomStrength: last.bloomStrength,
+      vignette: last.vignette,
+      filmGrain: last.filmGrain,
+      chromaticAberration: last.chromaticAberration,
+      aspectMask: last.aspectMask,
+    };
+  }
+
+  let idx = 0;
+  for (let i = 0; i < kfs.length - 1; i++) {
+    if (timeSec >= kfs[i].timeSec && timeSec <= kfs[i + 1].timeSec) {
+      idx = i;
+      break;
+    }
+  }
+  const a = kfs[idx];
+  const b = kfs[idx + 1];
+  const span = Math.max(1e-5, b.timeSec - a.timeSec);
+  const t = evaluateCubicBezierEasing(a.easing, (timeSec - a.timeSec) / span);
+  return {
+    lutPreset: t >= 0.5 ? b.lutPreset : a.lutPreset,
+    lutIntensity: clamp(lerp(a.lutIntensity, b.lutIntensity, t), 0, 1.5),
+    exposure: clamp(lerp(a.exposure, b.exposure, t), 0.2, 3.0),
+    contrast: clamp(lerp(a.contrast, b.contrast, t), 0.5, 2.0),
+    saturation: clamp(lerp(a.saturation, b.saturation, t), 0.0, 2.2),
+    bloomStrength: clamp(lerp(a.bloomStrength, b.bloomStrength, t), 0.0, 1.8),
+    vignette: clamp(lerp(a.vignette, b.vignette, t), 0.0, 0.95),
+    filmGrain: clamp(lerp(a.filmGrain, b.filmGrain, t), 0.0, 0.35),
+    chromaticAberration: clamp(lerp(a.chromaticAberration, b.chromaticAberration, t), 0.0, 1.0),
+    aspectMask: t >= 0.5 ? b.aspectMask : a.aspectMask,
+  };
+}
+
+export interface LutGradingCoefficients {
+  shadowTint: [number, number, number];
+  highlightTint: [number, number, number];
+  saturationScale: number;
+  contrastScale: number;
+}
+
+export function getLutColorMatrixParams(preset: DirectorLutPreset): LutGradingCoefficients {
+  switch (preset) {
+    case 'cinema_teal_orange':
+      return {
+        shadowTint: [0.84, 1.04, 1.16],
+        highlightTint: [1.14, 1.01, 0.86],
+        saturationScale: 1.08,
+        contrastScale: 1.1,
+      };
+    case 'sci_fi_cyan':
+      return {
+        shadowTint: [0.82, 0.98, 1.18],
+        highlightTint: [0.92, 1.06, 1.15],
+        saturationScale: 0.92,
+        contrastScale: 1.08,
+      };
+    case 'noir_high_contrast':
+      return {
+        shadowTint: [0.92, 0.93, 0.98],
+        highlightTint: [1.05, 1.03, 0.99],
+        saturationScale: 0.28,
+        contrastScale: 1.28,
+      };
+    case 'solar_amber':
+      return {
+        shadowTint: [1.05, 0.93, 0.82],
+        highlightTint: [1.18, 1.06, 0.82],
+        saturationScale: 1.16,
+        contrastScale: 1.06,
+      };
+    case 'thermal_falsecolor':
+      return {
+        shadowTint: [0.68, 0.78, 1.35],
+        highlightTint: [1.32, 0.88, 0.62],
+        saturationScale: 1.45,
+        contrastScale: 1.18,
+      };
+    case 'natural':
+    default:
+      return {
+        shadowTint: [1.0, 1.0, 1.0],
+        highlightTint: [1.0, 1.0, 1.0],
+        saturationScale: 1.0,
+        contrastScale: 1.0,
+      };
+  }
+}
+
+/**
+ * Bakes any procedural shot action (micro-to-planet, 360 orbit, spiral, flyover, etc.)
+ * into editable NLE keyframes on a DirectorTimelineProject so users can tweak every node & easing curve.
+ */
+export function bakeShotActionIntoProject(
+  project: DirectorTimelineProject,
+  action: DirectorActionType,
+  plan: DirectorShotPlan,
+  anchor: DirectorSceneAnchor,
+  currentEnv: EvaluatedEnvState,
+  sampleCount = 9,
+): DirectorTimelineProject {
+  const count = clamp(Math.round(sampleCount), 3, 24);
+  const dur = Math.max(0.5, plan.durationSec);
+  const cameraTrack: DirectorCameraKeyframe[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const u = i / (count - 1);
+    const pose = evaluateDirectorPose(plan, u, anchor);
+    const dist = Math.hypot(
+      pose.position[0] - pose.lookAt[0],
+      pose.position[1] - pose.lookAt[1],
+      pose.position[2] - pose.lookAt[2],
+    );
+    cameraTrack.push({
+      id: `baked_cam_${i}_${Date.now().toString(36).slice(-3)}`,
+      label:
+        i === 0
+          ? '起点'
+          : i === count - 1
+            ? '终景'
+            : `${DIRECTOR_ACTIONS.find((a) => a.id === action)?.label.slice(0, 4) ?? '节点'} #${i + 1}`,
+      timeSec: Number((u * dur).toFixed(3)),
+      position: pose.position,
+      lookAt: pose.lookAt,
+      up: pose.up,
+      fovDeg: Number(pose.fovDeg.toFixed(2)),
+      focusDist: Number(Math.max(0.1, dist).toFixed(3)),
+      aperture: 2.8,
+      rollDeg: 0,
+      shakeAmp: 0,
+      shakeFreq: 4,
+      interpMode: 'catmull_rom',
+      easing: [0.0, 0.0, 1.0, 1.0],
+    });
+  }
+
+  const envTrack: DirectorEnvKeyframe[] = [
+    {
+      id: `baked_env_0_${Date.now().toString(36).slice(-3)}`,
+      timeSec: 0,
+      sunElevationDeg: currentEnv.sunElevationDeg,
+      sunAzimuthDeg: currentEnv.sunAzimuthDeg,
+      atmoDensity: currentEnv.atmoDensity,
+      scatterStrength: currentEnv.scatterStrength,
+      cloudCoverage: currentEnv.cloudCoverage,
+      cloudAltitudeRatio: currentEnv.cloudAltitudeRatio,
+      windSpeed: currentEnv.windSpeed,
+      tempOffsetC: currentEnv.tempOffsetC,
+      easing: [0.42, 0.0, 0.58, 1.0],
+    },
+    {
+      id: `baked_env_1_${Date.now().toString(36).slice(-3)}`,
+      timeSec: dur,
+      sunElevationDeg: currentEnv.sunElevationDeg,
+      sunAzimuthDeg: currentEnv.sunAzimuthDeg + plan.sunSweepDeg,
+      atmoDensity: currentEnv.atmoDensity,
+      scatterStrength: currentEnv.scatterStrength,
+      cloudCoverage: currentEnv.cloudCoverage,
+      cloudAltitudeRatio: currentEnv.cloudAltitudeRatio,
+      windSpeed: currentEnv.windSpeed,
+      tempOffsetC: currentEnv.tempOffsetC,
+      easing: [0.42, 0.0, 0.58, 1.0],
+    },
+  ];
+
+  return {
+    ...project,
+    updatedAt: Date.now(),
+    durationSec: dur,
+    fps: plan.fps,
+    width: plan.width,
+    height: plan.height,
+    format: plan.format,
+    inTimeSec: 0,
+    outTimeSec: dur,
+    simTimeScale: plan.simTimeScale,
+    cleanFrame: plan.cleanFrame,
+    forceMaxVoxelDetail: plan.forceMaxVoxelDetail,
+    offlineQuality: plan.offlineQuality ?? project.offlineQuality,
+    cameraTrack,
+    envTrack,
+  };
+}
+
+export function formatSmpteTimecode(timeSec: number, fps: number): string {
+  const safeFps = Math.max(1, Math.round(fps));
+  const safeT = Math.max(0, timeSec);
+  const totalFrames = Math.floor(safeT * safeFps + 1e-6);
+  const ff = totalFrames % safeFps;
+  const totalSeconds = Math.floor(totalFrames / safeFps);
+  const ss = totalSeconds % 60;
+  const mm = Math.floor(totalSeconds / 60) % 60;
+  const hh = Math.floor(totalSeconds / 3600);
+  const pad2 = (n: number) => String(n).padStart(2, '0');
+  const padF = safeFps >= 100 ? String(ff).padStart(3, '0') : pad2(ff);
+  return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}:${padF}`;
+}
+
+export function computePlanFrameCount(plan: Pick<DirectorShotPlan, 'durationSec' | 'fps'>): number {
+  return Math.max(2, Math.round(clamp(plan.durationSec, 0.25, 300) * clamp(plan.fps, 1, 300)));
+}
+
+export function computeProjectFrameRange(project: DirectorTimelineProject): {
+  totalFrames: number;
+  startFrame: number;
+  endFrame: number;
+  fps: number;
+} {
+  const fps = clamp(Math.round(project.fps), 1, 300);
+  const totalFrames = Math.max(2, Math.round(clamp(project.durationSec, 0.25, 300) * fps));
+  const inTime = clamp(project.inTimeSec, 0, project.durationSec);
+  const outTime = clamp(project.outTimeSec, inTime + 1 / fps, project.durationSec);
+  const startFrame = clamp(Math.floor(inTime * fps + 1e-6), 0, totalFrames - 2);
+  const endFrame = clamp(Math.min(totalFrames - 1, Math.round(outTime * fps) - 1), startFrame + 1, totalFrames - 1);
+  return { totalFrames, startFrame, endFrame, fps };
+}
+
+export function serializeDirectorProjectJson(project: DirectorTimelineProject): string {
+  return JSON.stringify(
+    {
+      schema: 'terrasphere-director-project-v2',
+      project,
+    },
+    null,
+    2,
+  );
+}
+
+export function parseDirectorProjectJson(raw: string): DirectorTimelineProject | null {
+  try {
+    const parsed = JSON.parse(raw) as {
+      schema?: string;
+      project?: Partial<DirectorTimelineProject>;
+    };
+    const p = parsed?.project ?? (parsed as unknown as Partial<DirectorTimelineProject>);
+    if (!p || !Array.isArray(p.cameraTrack) || !Array.isArray(p.envTrack)) {
+      return null;
+    }
+    const base = createDefaultDirectorProject();
+    return {
+      ...base,
+      ...p,
+      id: p.id || `proj_${Date.now().toString(36)}`,
+      name: p.name || '导入导演工程',
+      updatedAt: Date.now(),
+      durationSec: clamp(Number(p.durationSec) || 8, 0.5, 300),
+      fps: clamp(Math.round(Number(p.fps) || 60), 1, 300),
+      width: clamp(Math.round(Number(p.width) || 1920), 64, 8192),
+      height: clamp(Math.round(Number(p.height) || 1080), 64, 8192),
+      inTimeSec: clamp(Number(p.inTimeSec) || 0, 0, Number(p.durationSec) || 8),
+      outTimeSec: clamp(Number(p.outTimeSec) || Number(p.durationSec) || 8, 0.25, 300),
+      checkpointIntervalFrames: clamp(Math.round(Number(p.checkpointIntervalFrames) || 24), 4, 240),
+      offlineQuality: p.offlineQuality ?? base.offlineQuality,
+      cameraTrack: p.cameraTrack,
+      envTrack: p.envTrack,
+      eventTrack: Array.isArray(p.eventTrack) ? p.eventTrack : [],
+      postFxTrack: Array.isArray(p.postFxTrack) && p.postFxTrack.length > 0 ? p.postFxTrack : base.postFxTrack,
+    };
+  } catch {
+    return null;
+  }
 }

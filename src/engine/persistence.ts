@@ -1,3 +1,4 @@
+import { CoordSystemId } from './coordinates';
 import { FluidSnapshot } from './fluidSim';
 import { encodeSeedCode, PlanetSeedConfig, VoxelPlanetSnapshot } from './voxelPlanet';
 
@@ -42,6 +43,7 @@ export interface StoredUserPrefs {
   touchEnabled?: boolean;
   perspectiveFov?: number;
   playerScale?: number;
+  coordSystem?: CoordSystemId;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -163,6 +165,8 @@ export function loadStoredPrefs(): StoredUserPrefs {
       lod1Dist: parsed.lod1Dist,
       touchEnabled: parsed.touchEnabled,
       perspectiveFov: parsed.perspectiveFov,
+      playerScale: parsed.playerScale,
+      coordSystem: parsed.coordSystem,
     };
   } catch {
     return { autoSaveEnabled: true };

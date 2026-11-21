@@ -52,25 +52,32 @@ import { MapsModal } from './components/MapsModal';
 import { AtmosphereThermalPanel } from './components/AtmosphereThermalPanel';
 import { GenerationProgressOverlay } from './components/GenerationProgressOverlay';
 import {
-  DirectorScreenshotResult,
-  DirectorStudioDrawer,
-} from './components/DirectorStudioDrawer';
+  DirectorCinemaStudio,
+  ProgramRect,
+} from './components/DirectorCinemaStudio';
 import {
-  createDefaultDirectorPlan,
-  DirectorShotPlan,
-  ScreenshotFormat,
+  createDefaultDirectorProject,
+  DirectorTimelineProject,
 } from './engine/director';
 import {
   createDefaultBackendDiagnostic,
   createDefaultPerfSnapshot,
 } from './engine/perfMonitor';
-import {
-  DEFAULT_RENDER_QUALITY,
-  OfflineAccumSamples,
-  OfflineQualityOverride,
-  ShadowQualityLevel,
-} from './engine/renderQuality';
+import { DEFAULT_RENDER_QUALITY } from './engine/renderQuality';
 import { clampPlayerScale, DEFAULT_PLAYER_SCALE } from './engine/cameraMath';
+import {
+  CoordDatum,
+  lonLatRadiusToWorld,
+  worldToCoord,
+} from './engine/coordinates';
+import {
+  BoreholeLogReport,
+  GeologicalAttitude,
+  GeologicalTransectReport,
+  measureSurveyPolygonArea,
+  SurveyBenchmark,
+} from './engine/geologySurvey';
+import { SurveyPanel, SurveyPanelTab } from './components/SurveyPanel';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'firstPerson',
@@ -144,6 +151,9 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     terrainRenderMode: 'smooth',
     terrainOverlay: 'material',
     voxelEdges: true,
+    coordSystem: prefs.coordSystem ?? 'geo_dd',
+    showCoordGrid: false,
+    enuOrigin: [initialRadius ?? DEFAULT_PLANET_RADIUS, 0, 0],
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
     renderQuality: { ...DEFAULT_RENDER_QUALITY },
@@ -199,6 +209,14 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   tractorBeam: createIdleTractorTelemetry(),
   backendInfo: createDefaultBackendDiagnostic(),
   perf: createDefaultPerfSnapshot(),
+  playerCoord: worldToCoord([DEFAULT_PLANET_RADIUS + 1.4, 0, 0], 'geo_dd', {
+    planetRadius: DEFAULT_PLANET_RADIUS,
+    nativeVoxelSize: DEFAULT_SEED_CONFIG.radius / DEFAULT_SEED_CONFIG.voxelRadius,
+    enuOrigin: [DEFAULT_PLANET_RADIUS, 0, 0],
+  }),
+  hoveredCoord: null,
+  hoveredWorldPos: null,
+  hoveredAttitude: null,
 };
 
 export default function App() {
@@ -252,10 +270,26 @@ export default function App() {
   const [studioOpen, setStudioOpen] = useState(false);
   const [directorOpen, setDirectorOpen] = useState(false);
   const [directorPreviewing, setDirectorPreviewing] = useState(false);
-  const [directorPlan, setDirectorPlan] = useState<DirectorShotPlan>(createDefaultDirectorPlan);
+  const [directorProject, setDirectorProject] = useState<DirectorTimelineProject>(
+    () => createDefaultDirectorProject(),
+  );
+  const [directorProgramRect, setDirectorProgramRect] = useState<ProgramRect | null>(null);
   const [shotToast, setShotToast] = useState<string | null>(null);
   const [seedVersion, setSeedVersion] = useState(0);
   const [genProgress, setGenProgress] = useState<GenerationProgress | null>(null);
+  const [surveyOpen, setSurveyOpen] = useState(false);
+  const [surveyTab, setSurveyTab] = useState<SurveyPanelTab>('pins');
+  const [benchmarks, setBenchmarks] = useState<SurveyBenchmark[]>([]);
+  const [pendingTransectA, setPendingTransectA] = useState<[number, number, number] | null>(null);
+  const [transectReport, setTransectReport] = useState<GeologicalTransectReport | null>(null);
+  const [boreholeReport, setBoreholeReport] = useState<BoreholeLogReport | null>(null);
+  const [boreholeDepthRatio, setBoreholeDepthRatio] = useState<number>(0.55);
+  const [lockedAttitude, setLockedAttitude] = useState<GeologicalAttitude | null>(null);
+
+  const pendingTransectARef = useRef<[number, number, number] | null>(null);
+  pendingTransectARef.current = pendingTransectA;
+  const boreholeDepthRatioRef = useRef<number>(boreholeDepthRatio);
+  boreholeDepthRatioRef.current = boreholeDepthRatio;
 
   const allTools = useMemo(() => {
     const builtins = BUILTIN_TOOLS.map((t) => {
@@ -342,6 +376,55 @@ export default function App() {
     engine.setOnMaterialPicked((picked) => {
       setConfig((prev) => ({ ...prev, material: picked }));
     });
+    engine.setOnSurveyAction((action) => {
+      setSurveyOpen(true);
+      if (action.kind === 'surveyPin') {
+        setSurveyTab('pins');
+        setBenchmarks((prev) => {
+          const idx = prev.length + 1;
+          const code = `BM-${String(idx).padStart(2, '0')}`;
+          const next: SurveyBenchmark = {
+            id: `bm_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+            code,
+            name: `控制点 ${code}`,
+            createdAt: Date.now(),
+            worldPos: action.worldPos,
+            normal: action.normal,
+            elevationM: action.attitude.elevationM,
+            material: action.attitude.material,
+            slopeDeg: action.attitude.slopeDeg,
+            dipDirectionDeg: action.attitude.dipDirectionDeg,
+            strikeDeg: action.attitude.strikeDeg,
+            gravityMs2: action.attitude.gravityMs2,
+            tempC: action.attitude.tempC,
+            hasWater: action.hasWater,
+          };
+          return [...prev, next];
+        });
+      } else if (action.kind === 'surveyTransect') {
+        setSurveyTab('transect');
+        const startA = pendingTransectARef.current;
+        if (!startA) {
+          setPendingTransectA(action.worldPos);
+        } else {
+          const report = engine.sampleTransectBetween(startA, action.worldPos, 80);
+          setTransectReport(report);
+          setPendingTransectA(null);
+        }
+      } else if (action.kind === 'surveyBorehole') {
+        setSurveyTab('borehole');
+        const bh = engine.sampleBoreholeAt(
+          action.worldPos[0],
+          action.worldPos[1],
+          action.worldPos[2],
+          engine.planet.baseRadius * boreholeDepthRatioRef.current,
+        );
+        setBoreholeReport(bh);
+      } else if (action.kind === 'surveyClinometer') {
+        setSurveyTab('attitude');
+        setLockedAttitude(action.attitude);
+      }
+    });
 
     let cancelled = false;
 
@@ -407,6 +490,7 @@ export default function App() {
       touchEnabled,
       perspectiveFov: config.perspectiveFov,
       playerScale: config.playerScale,
+      coordSystem: config.coordSystem,
     });
   }, [
     autoSaveEnabled,
@@ -419,7 +503,19 @@ export default function App() {
     config.lod1Dist,
     config.perspectiveFov,
     config.playerScale,
+    config.coordSystem,
   ]);
+
+  // Sync 3D surveying pins/transect/borehole/clinometer overlays to engine
+  useEffect(() => {
+    engineRef.current?.updateSurveyOverlays(
+      benchmarks,
+      transectReport?.samples ?? [],
+      pendingTransectA,
+      boreholeReport,
+      lockedAttitude,
+    );
+  }, [benchmarks, boreholeReport, lockedAttitude, pendingTransectA, transectReport]);
 
   // Periodic IndexedDB autosave + tab-handoff snapshot refresh during active gameplay
   useEffect(() => {
@@ -447,11 +543,10 @@ export default function App() {
 
 
   const handleUpdateConfig = useCallback((partial: Partial<SandboxConfig>) => {
-    setConfig((prev) => {
-      const next = { ...prev, ...partial };
-      engineRef.current?.updateConfig(next);
-      return next;
-    });
+    const next = { ...configRef.current, ...partial };
+    configRef.current = next;
+    setConfig(next);
+    engineRef.current?.updateConfig(next);
   }, []);
 
   const handleSelectTool = useCallback(
@@ -699,13 +794,6 @@ export default function App() {
     [refreshSavesList],
   );
 
-  const handleUpdateDirectorPlan = useCallback(
-    (partial: Partial<DirectorShotPlan>) => {
-      setDirectorPlan((prev) => ({ ...prev, ...partial }));
-    },
-    [],
-  );
-
   const handleQuickScreenshot = useCallback(async () => {
     const eng = engineRef.current;
     if (!eng || !eng.hasWorld) return;
@@ -729,15 +817,6 @@ export default function App() {
     window.setTimeout(() => setShotToast(null), 2600);
   }, []);
 
-  const handleStartDirectorPreview = useCallback(() => {
-    const eng = engineRef.current;
-    if (!eng || !eng.hasWorld) return;
-    setDirectorPreviewing(true);
-    eng.startDirectorPreview(directorPlan, () => {
-      setDirectorPreviewing(false);
-    });
-  }, [directorPlan]);
-
   const handleStopDirectorPreview = useCallback(() => {
     engineRef.current?.stopDirectorPreview();
     setDirectorPreviewing(false);
@@ -753,7 +832,18 @@ export default function App() {
         return;
       }
 
+      if (e.code === 'F9') {
+        e.preventDefault();
+        setDirectorOpen((prev) => {
+          const next = !prev;
+          if (!next) setDirectorProgramRect(null);
+          return next;
+        });
+        return;
+      }
+
       if (e.code === 'Escape' || e.code === 'KeyP') {
+        if (directorOpen && e.code === 'KeyP') return;
         e.preventDefault();
         if (directorPreviewing && e.code === 'Escape') {
           handleStopDirectorPreview();
@@ -768,18 +858,25 @@ export default function App() {
           return;
         }
         if (directorOpen && e.code === 'Escape') {
-          setDirectorOpen(false);
+          if (!e.defaultPrevented) {
+            setDirectorOpen(false);
+            setDirectorProgramRect(null);
+          }
+          return;
+        }
+        if (surveyOpen && e.code === 'Escape') {
+          setSurveyOpen(false);
           return;
         }
         setPhase((prev) => (prev === 'playing' ? 'paused' : 'playing'));
         return;
       }
 
-      if (phaseRef.current !== 'playing') return;
+      if (phaseRef.current !== 'playing' || directorOpen) return;
 
-      if (e.code === 'F9') {
+      if (e.code === 'KeyU') {
         e.preventDefault();
-        setDirectorOpen((prev) => !prev);
+        setSurveyOpen((prev) => !prev);
       } else if (e.code === 'F10') {
         e.preventDefault();
         void handleQuickScreenshot();
@@ -882,7 +979,26 @@ export default function App() {
     handleUpdateConfig,
     mapsOpen,
     seedModalOpen,
+    surveyOpen,
   ]);
+
+  const surveyDatum: CoordDatum = useMemo(
+    () => ({
+      planetRadius: telemetry.planetRadius,
+      nativeVoxelSize: telemetry.nativeVoxelSize,
+      enuOrigin: config.enuOrigin,
+    }),
+    [config.enuOrigin, telemetry.nativeVoxelSize, telemetry.planetRadius],
+  );
+
+  const polygonReport = useMemo(
+    () =>
+      measureSurveyPolygonArea(
+        telemetry.planetRadius,
+        benchmarks.map((b) => b.worldPos),
+      ),
+    [benchmarks, telemetry.planetRadius],
+  );
 
   const voxelStats = useMemo(() => {
     void seedVersion;
@@ -941,12 +1057,26 @@ export default function App() {
 
   return (
     <main className="relative w-full h-full overflow-hidden bg-[#050810]">
-      {/* Isolated WebGPU/WebGL Canvas Mount */}
+      {/* Isolated WebGPU/WebGL Canvas Mount (Docks cleanly inside Program Monitor when Director Studio is active) */}
       <div
         ref={mountRef}
         data-testid="planet-canvas-mount"
-        className="absolute inset-0 w-full h-full"
-        style={{ touchAction: 'none' }}
+        className={
+          phase === 'playing' && directorOpen && directorProgramRect
+            ? 'fixed z-[32]'
+            : 'absolute inset-0 w-full h-full'
+        }
+        style={
+          phase === 'playing' && directorOpen && directorProgramRect
+            ? {
+                top: `${directorProgramRect.top}px`,
+                left: `${directorProgramRect.left}px`,
+                width: `${directorProgramRect.width}px`,
+                height: `${directorProgramRect.height}px`,
+                touchAction: 'none',
+              }
+            : { touchAction: 'none' }
+        }
       />
 
       {initError && (
@@ -972,7 +1102,7 @@ export default function App() {
         />
       )}
 
-      {phase === 'playing' && (
+      {phase === 'playing' && !directorOpen && (
         <GameHud
           telemetry={telemetry}
           config={config}
@@ -984,6 +1114,8 @@ export default function App() {
           directorPreviewing={directorPreviewing}
           debugOpen={debugOpen}
           mapsOpen={mapsOpen}
+          surveyOpen={surveyOpen}
+          surveyBenchmarkCount={benchmarks.length}
           atmosPanelOpen={atmosPanelOpen}
           dockOpen={dockOpen}
           touchEnabled={touchEnabled}
@@ -1005,11 +1137,140 @@ export default function App() {
           onResetPlanet={handleResetPlanet}
           onOpenSeedModal={() => setSeedModalOpen(true)}
           onToggleMaps={() => setMapsOpen((v) => !v)}
+          onToggleSurvey={() => setSurveyOpen((v) => !v)}
           onToggleAtmosPanel={() => setAtmosPanelOpen((v) => !v)}
           onToggleDebug={handleToggleDebug}
           onReselectLanding={() => engineRef.current?.reselectLandingSite()}
           onFocusCamera={() => engineRef.current?.focusCameraAtPointer()}
           onPause={() => setPhase('paused')}
+        />
+      )}
+
+      {phase === 'playing' && surveyOpen && (
+        <SurveyPanel
+          activeTab={surveyTab}
+          onChangeTab={setSurveyTab}
+          config={config}
+          telemetry={telemetry}
+          datum={surveyDatum}
+          benchmarks={benchmarks}
+          polygonReport={polygonReport}
+          pendingTransectA={pendingTransectA}
+          transect={transectReport}
+          borehole={boreholeReport}
+          boreholeDepthRatio={boreholeDepthRatio}
+          lockedAttitude={lockedAttitude}
+          onUpdateConfig={handleUpdateConfig}
+          onSelectSurveyTool={(toolId) => handleSelectToolById(toolId)}
+          onDropBenchmarkAtPlayer={() => {
+            const eng = engineRef.current;
+            if (!eng) return;
+            const pos = lonLatRadiusToWorld(
+              telemetry.playerLatDeg,
+              telemetry.playerLonDeg,
+              telemetry.planetRadius + telemetry.altitude,
+            );
+            const rLen = Math.hypot(pos[0], pos[1], pos[2]) || telemetry.planetRadius;
+            const surfR = eng.planet.findSurfaceRadiusAlongRay(
+              pos[0] / rLen,
+              pos[1] / rLen,
+              pos[2] / rLen,
+            );
+            const surfPos: [number, number, number] = [
+              (pos[0] / rLen) * surfR,
+              (pos[1] / rLen) * surfR,
+              (pos[2] / rLen) * surfR,
+            ];
+            const att = eng.sampleAttitudeAt(surfPos[0], surfPos[1], surfPos[2]);
+            const hasWater = eng.fluid.sampleWaterAt(surfPos[0], surfPos[1], surfPos[2]) > 0.02;
+            setBenchmarks((prev) => {
+              const code = `BM-${String(prev.length + 1).padStart(2, '0')}`;
+              return [
+                ...prev,
+                {
+                  id: `bm_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+                  code,
+                  name: `控制点 ${code}`,
+                  createdAt: Date.now(),
+                  worldPos: surfPos,
+                  normal: att.normal,
+                  elevationM: att.elevationM,
+                  material: att.material,
+                  slopeDeg: att.slopeDeg,
+                  dipDirectionDeg: att.dipDirectionDeg,
+                  strikeDeg: att.strikeDeg,
+                  gravityMs2: att.gravityMs2,
+                  tempC: att.tempC,
+                  hasWater,
+                },
+              ];
+            });
+          }}
+          onDeleteBenchmark={(id) =>
+            setBenchmarks((prev) => prev.filter((b) => b.id !== id))
+          }
+          onClearBenchmarks={() => setBenchmarks([])}
+          onResetTransect={() => {
+            setPendingTransectA(null);
+            setTransectReport(null);
+          }}
+          onSampleTransectPlayerToHover={() => {
+            const eng = engineRef.current;
+            if (!eng) return;
+            const posA = lonLatRadiusToWorld(
+              telemetry.playerLatDeg,
+              telemetry.playerLonDeg,
+              telemetry.planetRadius,
+            );
+            const posB =
+              telemetry.hoveredWorldPos ??
+              lonLatRadiusToWorld(
+                Math.max(-85, Math.min(85, telemetry.playerLatDeg + 18)),
+                telemetry.playerLonDeg + 42,
+                telemetry.planetRadius,
+              );
+            const rep = eng.sampleTransectBetween(posA, posB, 80);
+            setTransectReport(rep);
+            setPendingTransectA(null);
+          }}
+          onDrillBoreholeAtPlayer={() => {
+            const eng = engineRef.current;
+            if (!eng) return;
+            const pos = lonLatRadiusToWorld(
+              telemetry.playerLatDeg,
+              telemetry.playerLonDeg,
+              telemetry.planetRadius,
+            );
+            const bh = eng.sampleBoreholeAt(
+              pos[0],
+              pos[1],
+              pos[2],
+              eng.planet.baseRadius * boreholeDepthRatio,
+            );
+            setBoreholeReport(bh);
+          }}
+          onChangeBoreholeDepthRatio={(ratio) => {
+            setBoreholeDepthRatio(ratio);
+            const eng = engineRef.current;
+            if (eng && boreholeReport) {
+              const bh = eng.sampleBoreholeAt(
+                boreholeReport.collarPos[0],
+                boreholeReport.collarPos[1],
+                boreholeReport.collarPos[2],
+                eng.planet.baseRadius * ratio,
+              );
+              setBoreholeReport(bh);
+            }
+          }}
+          onSetEnuOrigin={(worldPos) => {
+            handleUpdateConfig({ enuOrigin: worldPos });
+            setShotToast('已更新 ENU 局部站心原点');
+            window.setTimeout(() => setShotToast(null), 2200);
+          }}
+          onTeleportToWorld={(worldPos) => {
+            engineRef.current?.teleportToWorldPos(worldPos[0], worldPos[1], worldPos[2]);
+          }}
+          onClose={() => setSurveyOpen(false)}
         />
       )}
 
@@ -1049,41 +1310,17 @@ export default function App() {
       )}
 
       {phase === 'playing' && directorOpen && engineRef.current && (
-        <DirectorStudioDrawer
-          plan={directorPlan}
-          previewing={directorPreviewing}
+        <DirectorCinemaStudio
+          engine={engineRef.current}
+          project={directorProject}
           hardwareCaps={engineRef.current.getDirectorHardwareCaps()}
-          viewportSize={{
-            width: Math.max(64, mountRef.current?.clientWidth || window.innerWidth),
-            height: Math.max(64, mountRef.current?.clientHeight || window.innerHeight),
+          onUpdateProject={(updater) => setDirectorProject((prev) => updater(prev))}
+          onReplaceProject={(next) => setDirectorProject(next)}
+          onProgramRectChange={setDirectorProgramRect}
+          onClose={() => {
+            setDirectorOpen(false);
+            setDirectorProgramRect(null);
           }}
-          onUpdatePlan={handleUpdateDirectorPlan}
-          onCaptureKeyframe={() =>
-            engineRef.current!.captureCameraKeyframe(
-              `机位 ${directorPlan.keyframes.length + 1}`,
-            )
-          }
-          onStartPreview={handleStartDirectorPreview}
-          onStopPreview={handleStopDirectorPreview}
-          onCaptureScreenshot={async (opts: {
-            width: number;
-            height: number;
-            format: ScreenshotFormat;
-            hideHelpers: boolean;
-            qualityOverride?: OfflineQualityOverride;
-            accumSamples?: OfflineAccumSamples;
-            rayTracing?: boolean;
-            volumetrics?: boolean;
-            shadowQuality?: ShadowQualityLevel;
-            pbrEnhanced?: boolean;
-          }): Promise<DirectorScreenshotResult> => {
-            const res = await engineRef.current!.captureDirectorScreenshot(opts);
-            return { ...res, format: opts.format };
-          }}
-          onRenderOfflineVideo={(onProgress, signal) =>
-            engineRef.current!.renderDirectorVideoOffline(directorPlan, onProgress, signal)
-          }
-          onClose={() => setDirectorOpen(false)}
         />
       )}
 
@@ -1099,6 +1336,9 @@ export default function App() {
           fluid={engineRef.current.fluid}
           telemetry={telemetry}
           config={config}
+          datum={surveyDatum}
+          benchmarks={benchmarks}
+          transect={transectReport}
           onTeleport={(latDeg, lonDeg) => {
             engineRef.current?.teleportToLatLon(latDeg, lonDeg);
             setMapsOpen(false);

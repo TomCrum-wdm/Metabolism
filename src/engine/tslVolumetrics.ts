@@ -794,3 +794,79 @@ export function buildVolumetricAtmoCompositeNode(
     return vec4(outRgb, baseSample.a);
   })();
 }
+
+export interface PostGradingCompositeParams {
+  colorNode: THREE.Node<'vec4'>;
+  exposureGainNode: THREE.UniformNode<'float'>;
+  contrastNode: THREE.UniformNode<'float'>;
+  saturationNode: THREE.UniformNode<'float'>;
+  lutIntensityNode: THREE.UniformNode<'float'>;
+  shadowTintNode: THREE.UniformNode<'vec3'>;
+  highlightTintNode: THREE.UniformNode<'vec3'>;
+  vignetteNode: THREE.UniformNode<'float'>;
+  filmGrainNode: THREE.UniformNode<'float'>;
+  simTimeNode: THREE.UniformNode<'float'>;
+}
+
+/**
+ * Cinema Color Grading, LUT Split-Toning, Optical Vignette & Deterministic Film Grain node.
+ * Executes directly at the end of Three.js RenderPipeline for identical Program Monitor & 8K Offline output.
+ */
+export function buildPostGradingCompositeNode(
+  params: PostGradingCompositeParams,
+): THREE.Node<'vec4'> {
+  const {
+    colorNode,
+    exposureGainNode,
+    contrastNode,
+    saturationNode,
+    lutIntensityNode,
+    shadowTintNode,
+    highlightTintNode,
+    vignetteNode,
+    filmGrainNode,
+    simTimeNode,
+  } = params;
+
+  return Fn(() => {
+    const src = colorNode;
+    const rgb = src.rgb.mul(max(exposureGainNode, float(0.1))).toVar();
+
+    // Contrast around perceptual midpoint
+    const c = tslClamp(contrastNode, 0.4, 2.2);
+    rgb.assign(rgb.sub(0.5).mul(c).add(0.5).saturate());
+
+    // Saturation
+    const luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    const sat = tslClamp(saturationNode, 0.0, 2.5);
+    rgb.assign(mix(vec3(luma, luma, luma), rgb, sat).saturate());
+
+    // LUT Split-Toning (shadow & highlight tint ramp blended by lutIntensity)
+    const lutMix = tslClamp(lutIntensityNode, 0.0, 1.4);
+    const toneWeight = smoothstep(0.12, 0.88, luma);
+    const lutTint = mix(shadowTintNode, highlightTintNode, toneWeight);
+    const graded = rgb.mul(lutTint).saturate();
+    rgb.assign(mix(rgb, graded, lutMix));
+
+    // Optical Lens Vignette
+    const centered = screenUV.sub(vec2(0.5, 0.5));
+    const dist2 = dot(centered, centered);
+    const vig = float(1.0).sub(
+      tslClamp(vignetteNode, 0.0, 1.0).mul(smoothstep(0.08, 0.52, dist2)),
+    );
+    rgb.mulAssign(vig);
+
+    // Deterministic Cinema Film Grain seeded by screenUV + simTime
+    const grainAmp = tslClamp(filmGrainNode, 0.0, 0.4);
+    If(grainAmp.greaterThan(0.002), () => {
+      const seed = dot(screenUV, vec2(12.9898, 78.233)).add(
+        fract(simTimeNode.mul(13.37)).mul(43.17),
+      );
+      const n = fract(sin(seed).mul(43758.5453)).sub(0.5);
+      rgb.addAssign(n.mul(grainAmp));
+    });
+
+    return vec4(rgb.saturate(), src.a);
+  })();
+}
+

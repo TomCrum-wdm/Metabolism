@@ -190,17 +190,33 @@ export async function saveRenderJobToDb(
   try {
     const db = await openDirectorDb();
     try {
+      const sanitizedAnchor = job.anchorSnapshot
+        ? {
+            baseRadius: job.anchorSnapshot.baseRadius,
+            nativeVoxelSize: job.anchorSnapshot.nativeVoxelSize,
+            targetPoint: [...job.anchorSnapshot.targetPoint] as [number, number, number],
+            targetNormal: [...job.anchorSnapshot.targetNormal] as [number, number, number],
+            currentPos: [...job.anchorSnapshot.currentPos] as [number, number, number],
+            currentLookAt: [...job.anchorSnapshot.currentLookAt] as [number, number, number],
+            currentUp: [...job.anchorSnapshot.currentUp] as [number, number, number],
+            currentFovDeg: job.anchorSnapshot.currentFovDeg,
+          }
+        : job.anchorSnapshot;
+      const sanitizedJob: RenderCheckpointJob = {
+        ...job,
+        anchorSnapshot: sanitizedAnchor,
+      };
       await new Promise<void>((resolve, reject) => {
         const tx = db.transaction(STORE_JOBS, 'readwrite');
-        tx.objectStore(STORE_JOBS).put(job);
+        tx.objectStore(STORE_JOBS).put(sanitizedJob);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error ?? new Error('Save job failed'));
       });
     } finally {
       db.close();
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    console.warn('[TerraSphere] 保存断点渲染任务至 IndexedDB 失败:', err);
   }
 }
 

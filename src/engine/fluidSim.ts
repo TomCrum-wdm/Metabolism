@@ -655,6 +655,96 @@ export class FluidSim {
   }
 
   /**
+   * Adjusts active SPH water particle count cleanly toward `targetCount` for dynamic
+   * Director waterVolume keyframing (expanding lakes/oceans via atmospheric rainfall or draining).
+   * Returns true if particle count changed so water mesh can be rebuilt.
+   */
+  public setTargetParticleCount(
+    planet: VoxelPlanet,
+    targetCountRaw: number,
+    seedHint = 1,
+  ): boolean {
+    const targetCount = Math.max(0, Math.min(MAX_FLUID_PARTICLES, Math.round(targetCountRaw)));
+    if (targetCount === this.activeCount) return false;
+
+    if (targetCount < this.activeCount) {
+      this.activeCount = targetCount;
+      if (this.tractorCapturedCount > 0) {
+        let cap = 0;
+        for (let i = 0; i < this.activeCount; i++) {
+          if (this.tractorFactor[i] > 0) cap++;
+        }
+        this.tractorCapturedCount = cap;
+      }
+      return true;
+    }
+
+    const toAdd = targetCount - this.activeCount;
+    const basins = planet.lakeBasinCenters;
+    const radScale = Math.max(planet.baseRadius / 13.0, 0.01);
+    let seed = ((planet.seedConfig.seed ^ (seedHint * 2654435761)) >>> 0) || 1337;
+    const rand = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+
+    for (let k = 0; k < toAdd; k++) {
+      let nx = 0;
+      let ny = 1;
+      let nz = 0;
+      if (basins.length > 0 && k % 3 !== 2) {
+        const [bx, by, bz] = basins[k % basins.length];
+        const bLen = Math.hypot(bx, by, bz) || 1;
+        const bnx = bx / bLen;
+        const bny = by / bLen;
+        const bnz = bz / bLen;
+        const ax = Math.abs(bny) < 0.9 ? 0 : 1;
+        const ay = Math.abs(bny) < 0.9 ? 1 : 0;
+        let tx = ay * bnz;
+        let ty = -ax * bnz;
+        let tz = ax * bny - ay * bnx;
+        const tLen = Math.hypot(tx, ty, tz) || 1;
+        tx /= tLen;
+        ty /= tLen;
+        tz /= tLen;
+        const ux = bny * tz - bnz * ty;
+        const uy = bnz * tx - bnx * tz;
+        const uz = bnx * ty - bny * tx;
+
+        const ang = rand() * Math.PI * 2;
+        const spread = (1.6 + rand() * 3.4) * radScale;
+        const dx = bnx + (tx * Math.cos(ang) + ux * Math.sin(ang)) * (spread / planet.baseRadius);
+        const dy = bny + (ty * Math.cos(ang) + uy * Math.sin(ang)) * (spread / planet.baseRadius);
+        const dz = bnz + (tz * Math.cos(ang) + uz * Math.sin(ang)) * (spread / planet.baseRadius);
+        const dLen = Math.hypot(dx, dy, dz) || 1;
+        nx = dx / dLen;
+        ny = dy / dLen;
+        nz = dz / dLen;
+      } else {
+        const u = rand() * 2 - 1;
+        const phi = rand() * Math.PI * 2;
+        const s = Math.sqrt(Math.max(0, 1 - u * u));
+        nx = s * Math.cos(phi);
+        ny = u;
+        nz = s * Math.sin(phi);
+      }
+      const rSurf = planet.findSurfaceRadiusAlongRay(nx, ny, nz);
+      const spawnR = rSurf + (0.14 + rand() * 0.25) * radScale;
+      this.spawnParticle(nx * spawnR, ny * spawnR, nz * spawnR, 0, 0, 0);
+    }
+
+    const settleParams: PlanetaryGravityParams = {
+      referenceRadius: planet.baseRadius,
+      surfaceGravity: 9.81,
+    };
+    const settleSteps = toAdd > 80 ? 6 : 2;
+    for (let s = 0; s < settleSteps; s++) {
+      this.step(1 / 60, planet, settleParams, 1);
+    }
+    return true;
+  }
+
+  /**
    * Emits a stream of water particles from a brush location (with slight radial jitter).
    */
   public emitStream(

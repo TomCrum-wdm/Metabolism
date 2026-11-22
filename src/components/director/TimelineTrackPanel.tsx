@@ -3,14 +3,18 @@ import {
   Camera,
   Flame,
   Plus,
+  Sliders,
   SlidersHorizontal,
   Sun,
   Trash2,
   ZoomIn,
 } from 'lucide-react';
 import {
+  DirectorParamId,
   DirectorTimelineProject,
   formatSmpteTimecode,
+  PARAM_TRACK_META,
+  VISUAL_FILTER_META,
   WORLD_EVENT_META,
 } from '../../engine/director';
 
@@ -19,6 +23,7 @@ export type SelectedTimelineItem =
   | { track: 'env'; id: string }
   | { track: 'event'; id: string }
   | { track: 'postfx'; id: string }
+  | { track: 'param'; paramId: DirectorParamId; id: string }
   | null;
 
 interface TimelineTrackPanelProps {
@@ -30,10 +35,12 @@ interface TimelineTrackPanelProps {
   onSetInOut: (inTimeSec: number, outTimeSec: number) => void;
   onSelectItem: (item: SelectedTimelineItem) => void;
   onMoveItemTime: (track: 'camera' | 'env' | 'event' | 'postfx', id: string, timeSec: number) => void;
+  onMoveParamKeyframeTime: (paramId: DirectorParamId, id: string, timeSec: number) => void;
   onAddCameraKeyframeAtPlayhead: () => void;
   onAddEnvKeyframeAtPlayhead: () => void;
   onAddEventAtPlayhead: () => void;
   onAddPostFxKeyframeAtPlayhead: () => void;
+  onAddParamKeyframeAtPlayhead: (paramId: DirectorParamId) => void;
   onDeleteSelectedItem: () => void;
 }
 
@@ -41,7 +48,8 @@ type DragTarget =
   | { kind: 'playhead' }
   | { kind: 'inHandle' }
   | { kind: 'outHandle' }
-  | { kind: 'item'; track: 'camera' | 'env' | 'event' | 'postfx'; id: string };
+  | { kind: 'item'; track: 'camera' | 'env' | 'event' | 'postfx'; id: string }
+  | { kind: 'paramItem'; paramId: DirectorParamId; id: string };
 
 export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
   project,
@@ -52,19 +60,26 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
   onSetInOut,
   onSelectItem,
   onMoveItemTime,
+  onMoveParamKeyframeTime,
   onAddCameraKeyframeAtPlayhead,
   onAddEnvKeyframeAtPlayhead,
   onAddEventAtPlayhead,
   onAddPostFxKeyframeAtPlayhead,
+  onAddParamKeyframeAtPlayhead,
   onDeleteSelectedItem,
 }) => {
   const [pxPerSec, setPxPerSec] = useState(96);
+  const [paramToAdd, setParamToAdd] = useState<DirectorParamId>('cloudCoverage');
   const laneScrollRef = useRef<HTMLDivElement | null>(null);
   const [dragTarget, setDragTarget] = useState<DragTarget | null>(null);
 
   const dur = Math.max(0.5, project.durationSec);
   const timelineWidthPx = Math.max(640, Math.round(dur * pxPerSec + 48));
   const minGap = 1 / Math.max(1, project.fps);
+
+  const activeParamTracks = PARAM_TRACK_META.filter(
+    (m) => (project.paramTracks?.[m.id]?.length ?? 0) > 0,
+  );
 
   const clientXToTime = (clientX: number): number => {
     const el = laneScrollRef.current;
@@ -85,6 +100,8 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
       onSetInOut(project.inTimeSec, Math.max(t, project.inTimeSec + minGap));
     } else if (dragTarget.kind === 'item') {
       onMoveItemTime(dragTarget.track, dragTarget.id, t);
+    } else if (dragTarget.kind === 'paramItem') {
+      onMoveParamKeyframeTime(dragTarget.paramId, dragTarget.id, t);
     }
   };
 
@@ -107,7 +124,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
   return (
     <section
       data-testid="director-timeline-panel"
-      className="h-[228px] shrink-0 border-t border-slate-800 bg-[#070a12] flex flex-col overflow-hidden"
+      className="h-[268px] shrink-0 border-t border-slate-800 bg-[#070a12] flex flex-col overflow-hidden"
     >
       {/* Timeline Sub-toolbar */}
       <div className="h-8 px-3 border-b border-slate-800/90 bg-[#0b101d] flex items-center justify-between gap-3 shrink-0 text-[11px]">
@@ -121,9 +138,43 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
           <span className="hidden md:inline font-mono-tabular text-[10px] text-slate-400 whitespace-nowrap">
             工作区间 I {project.inTimeSec.toFixed(2)}s — O {project.outTimeSec.toFixed(2)}s
           </span>
+          {activeParamTracks.length > 0 && (
+            <span className="font-mono-tabular text-[10px] text-purple-300 whitespace-nowrap">
+              · {activeParamTracks.length} 条单参数曲线轨
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          {/* Quick Per-Parameter Sub-Track Adder */}
+          <div className="flex items-center gap-1">
+            <select
+              data-testid="timeline-add-param-select"
+              value={paramToAdd}
+              disabled={disabled}
+              onChange={(e) => setParamToAdd(e.target.value as DirectorParamId)}
+              className="h-6 px-1.5 rounded-xs border border-slate-700 bg-[#0d1322] text-[10px] text-slate-200 max-w-[136px]"
+            >
+              {PARAM_TRACK_META.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              tabIndex={-1}
+              disabled={disabled}
+              data-testid="timeline-add-param-btn"
+              onClick={() => onAddParamKeyframeAtPlayhead(paramToAdd)}
+              title="为选定参数在当前播放头打上独立关键帧"
+              className="h-6 px-2 rounded-xs border border-purple-500/50 bg-purple-950/40 hover:bg-purple-900/60 text-purple-200 text-[10px] flex items-center gap-1 cursor-pointer whitespace-nowrap disabled:opacity-40"
+            >
+              <Plus className="w-3 h-3" />
+              <span>参数关键帧</span>
+            </button>
+          </div>
+
           {selectedItem && (
             <button
               type="button"
@@ -153,18 +204,18 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
         </div>
       </div>
 
-      {/* Main Split: Fixed Track Headers Left + Synchronized Scrollable Lanes Right */}
-      <div className="flex-1 min-h-0 flex overflow-hidden">
+      {/* Main Synchronized Vertical Body: Fixed Track Headers Left + Horizontal Scrollable Lanes Right */}
+      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden flex">
         {/* Track Headers Column */}
         <div className="w-48 shrink-0 border-r border-slate-800 bg-[#090d17] flex flex-col">
           {/* Ruler Header Spacer */}
-          <div className="h-7 px-2.5 border-b border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400">
+          <div className="h-7 px-2.5 border-b border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400 shrink-0">
             <span>轨道 / 节点操作</span>
             <span className="font-mono-tabular">{project.fps} FPS</span>
           </div>
 
           {/* Track 1 Header: Camera & Lens */}
-          <div className="flex-1 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5">
+          <div className="h-9 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5 shrink-0">
             <div className="flex items-center gap-1.5 min-w-0">
               <Camera className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
               <span className="text-[11px] text-slate-200 truncate">机位与光学</span>
@@ -187,7 +238,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
           </div>
 
           {/* Track 2 Header: Sun & Atmosphere */}
-          <div className="flex-1 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5">
+          <div className="h-9 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5 shrink-0">
             <div className="flex items-center gap-1.5 min-w-0">
               <Sun className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span className="text-[11px] text-slate-200 truncate">日照与气象</span>
@@ -210,7 +261,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
           </div>
 
           {/* Track 3 Header: Planetary Disasters & Events */}
-          <div className="flex-1 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5">
+          <div className="h-9 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5 shrink-0">
             <div className="flex items-center gap-1.5 min-w-0">
               <Flame className="w-3.5 h-3.5 text-rose-400 shrink-0" />
               <span className="text-[11px] text-slate-200 truncate">灾害与工程</span>
@@ -232,11 +283,11 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
             </button>
           </div>
 
-          {/* Track 4 Header: Post-FX & LUT */}
-          <div className="flex-1 px-2.5 flex items-center justify-between gap-1.5">
+          {/* Track 4 Header: Post-FX & Visual Filter */}
+          <div className="h-9 px-2.5 border-b border-slate-800/70 flex items-center justify-between gap-1.5 shrink-0">
             <div className="flex items-center gap-1.5 min-w-0">
               <SlidersHorizontal className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <span className="text-[11px] text-slate-200 truncate">调色与后期</span>
+              <span className="text-[11px] text-slate-200 truncate">调色与滤镜</span>
               <span className="text-[10px] font-mono-tabular text-slate-500">
                 {project.postFxTrack.length}
               </span>
@@ -247,13 +298,52 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
               disabled={disabled}
               data-testid="track-add-postfx-kf-btn"
               onClick={onAddPostFxKeyframeAtPlayhead}
-              title="在播放头位置添加 LUT 调色/光晕/颗粒关键帧"
+              title="在播放头位置添加 LUT 调色/视觉滤镜关键帧"
               className="h-5 px-1.5 rounded-xs border border-emerald-500/40 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-200 text-[10px] flex items-center gap-0.5 cursor-pointer whitespace-nowrap disabled:opacity-40"
             >
               <Plus className="w-3 h-3" />
               <span>调色</span>
             </button>
           </div>
+
+          {/* Active Per-Parameter Sub-Track Headers */}
+          {activeParamTracks.length > 0 ? (
+            activeParamTracks.map((meta) => {
+              const count = project.paramTracks?.[meta.id]?.length ?? 0;
+              return (
+                <div
+                  key={meta.id}
+                  data-testid={`param-track-header-${meta.id}`}
+                  className="h-7 px-2.5 border-b border-slate-800/60 bg-[#080c16] flex items-center justify-between gap-1 shrink-0"
+                >
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span
+                      className="w-2 h-2 rounded-xs shrink-0"
+                      style={{ backgroundColor: meta.colorHex }}
+                    />
+                    <span className="text-[10px] text-slate-300 truncate">{meta.label}</span>
+                    <span className="text-[9px] font-mono-tabular text-slate-500">{count}</span>
+                  </div>
+                  <button
+                    type="button"
+                    tabIndex={-1}
+                    disabled={disabled}
+                    data-testid={`param-track-add-${meta.id}`}
+                    onClick={() => onAddParamKeyframeAtPlayhead(meta.id)}
+                    title={`在播放头位置为「${meta.label}」添加关键帧`}
+                    className="h-4.5 px-1 rounded-xs border border-slate-700 hover:border-purple-400 text-[9px] text-slate-300 hover:text-white flex items-center cursor-pointer shrink-0 disabled:opacity-40"
+                  >
+                    <Plus className="w-2.5 h-2.5" />
+                  </button>
+                </div>
+              );
+            })
+          ) : (
+            <div className="h-7 px-2.5 bg-[#080c16] flex items-center gap-1.5 text-[10px] text-slate-500 shrink-0">
+              <Sliders className="w-3 h-3 shrink-0" />
+              <span className="truncate">单参数子轨 (可选上方添加)</span>
+            </div>
+          )}
         </div>
 
         {/* Scrollable Time Lanes */}
@@ -265,7 +355,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
           className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden relative bg-[#05070d]"
         >
           <div
-            className="h-full flex flex-col relative select-none"
+            className="flex flex-col relative select-none"
             style={{ width: `${timelineWidthPx}px` }}
           >
             {/* Active Work Area Band (In..Out) */}
@@ -335,7 +425,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
             </div>
 
             {/* Lane 1: Camera Keyframes */}
-            <div className="flex-1 border-b border-slate-800/70 relative">
+            <div className="h-9 border-b border-slate-800/70 relative shrink-0">
               {project.cameraTrack.length >= 2 && (
                 <div
                   className="absolute top-1/2 -translate-y-1/2 h-1 bg-cyan-500/25 rounded-xs pointer-events-none"
@@ -381,7 +471,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
             </div>
 
             {/* Lane 2: Environment / Sun Keyframes */}
-            <div className="flex-1 border-b border-slate-800/70 relative">
+            <div className="h-9 border-b border-slate-800/70 relative shrink-0">
               {project.envTrack.map((kf) => {
                 const isSel = selectedItem?.track === 'env' && selectedItem.id === kf.id;
                 return (
@@ -389,7 +479,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
                     key={kf.id}
                     type="button"
                     tabIndex={-1}
-                    title={`日照/大气 (${kf.timeSec.toFixed(2)}s · 仰角 ${Math.round(kf.sunElevationDeg)}° · 方位 ${Math.round(kf.sunAzimuthDeg)}°)`}
+                    title={`日照/大气 (${kf.timeSec.toFixed(2)}s · 仰角 ${Math.round(kf.sunElevationDeg)}° · 云量 ${Math.round(kf.cloudCoverage * 100)}%)`}
                     onClick={(e) => {
                       e.stopPropagation();
                       onSelectItem({ track: 'env', id: kf.id });
@@ -413,7 +503,7 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
             </div>
 
             {/* Lane 3: Planetary Disasters & Engineering Events */}
-            <div className="flex-1 border-b border-slate-800/70 relative">
+            <div className="h-9 border-b border-slate-800/70 relative shrink-0">
               {project.eventTrack.map((ev) => {
                 const meta = WORLD_EVENT_META.find((m) => m.type === ev.type);
                 const isSel = selectedItem?.track === 'event' && selectedItem.id === ev.id;
@@ -457,16 +547,20 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
               })}
             </div>
 
-            {/* Lane 4: Post-FX & LUT Keyframes */}
-            <div className="flex-1 relative">
+            {/* Lane 4: Post-FX, LUT & Visual Filter Keyframes */}
+            <div className="h-9 border-b border-slate-800/70 relative shrink-0">
               {project.postFxTrack.map((kf) => {
                 const isSel = selectedItem?.track === 'postfx' && selectedItem.id === kf.id;
+                const filterShort =
+                  kf.visualFilter && kf.visualFilter !== 'none'
+                    ? VISUAL_FILTER_META.find((m) => m.id === kf.visualFilter)?.shortLabel
+                    : null;
                 return (
                   <button
                     key={kf.id}
                     type="button"
                     tabIndex={-1}
-                    title={`调色 (${kf.timeSec.toFixed(2)}s · ${kf.lutPreset})`}
+                    title={`调色/滤镜 (${kf.timeSec.toFixed(2)}s · ${kf.lutPreset}${filterShort ? ' · ' + filterShort : ''})`}
                     onClick={(e) => {
                       e.stopPropagation();
                       onSelectItem({ track: 'postfx', id: kf.id });
@@ -486,10 +580,76 @@ export const TimelineTrackPanel: React.FC<TimelineTrackPanelProps> = ({
                     }`}
                   >
                     {kf.lutPreset.replace('_', ' ')}
+                    {filterShort ? ` · ${filterShort}` : ''}
                   </button>
                 );
               })}
             </div>
+
+            {/* Per-Parameter Keyframe Sub-Track Lanes */}
+            {activeParamTracks.length > 0 ? (
+              activeParamTracks.map((meta) => {
+                const kfs = project.paramTracks?.[meta.id] ?? [];
+                const minT = kfs.length > 0 ? Math.min(...kfs.map((k) => k.timeSec)) : 0;
+                const maxT = kfs.length > 0 ? Math.max(...kfs.map((k) => k.timeSec)) : 0;
+                return (
+                  <div
+                    key={meta.id}
+                    data-testid={`param-track-lane-${meta.id}`}
+                    className="h-7 border-b border-slate-800/60 bg-[#060912]/70 relative shrink-0"
+                  >
+                    {kfs.length >= 2 && (
+                      <div
+                        className="absolute top-1/2 -translate-y-1/2 h-0.5 opacity-45 pointer-events-none"
+                        style={{
+                          left: `${timeToLeftPx(minT)}px`,
+                          width: `${Math.max(4, (maxT - minT) * pxPerSec)}px`,
+                          backgroundColor: meta.colorHex,
+                        }}
+                      />
+                    )}
+                    {kfs.map((kf) => {
+                      const isSel =
+                        selectedItem?.track === 'param' &&
+                        selectedItem.paramId === meta.id &&
+                        selectedItem.id === kf.id;
+                      return (
+                        <button
+                          key={kf.id}
+                          type="button"
+                          tabIndex={-1}
+                          data-testid={`param-kf-${meta.id}-${kf.id}`}
+                          title={`${meta.label}: ${kf.value.toFixed(2)}${meta.unit} @ ${kf.timeSec.toFixed(2)}s`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onSelectItem({ track: 'param', paramId: meta.id, id: kf.id });
+                            onScrubTime(kf.timeSec);
+                          }}
+                          onPointerDown={(e) => {
+                            if (disabled) return;
+                            e.stopPropagation();
+                            onSelectItem({ track: 'param', paramId: meta.id, id: kf.id });
+                            setDragTarget({ kind: 'paramItem', paramId: meta.id, id: kf.id });
+                          }}
+                          style={{
+                            left: `${timeToLeftPx(kf.timeSec)}px`,
+                            backgroundColor: isSel ? '#ffffff' : meta.colorHex,
+                            borderColor: isSel ? meta.colorHex : '#05070d',
+                          }}
+                          className={`absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rotate-45 border cursor-grab active:cursor-grabbing ${
+                            isSel ? 'scale-125 shadow-[0_0_8px_rgba(255,255,255,0.8)]' : ''
+                          }`}
+                        />
+                      );
+                    })}
+                  </div>
+                );
+              })
+            ) : (
+              <div className="h-7 bg-[#060912]/40 flex items-center px-4 text-[10px] text-slate-600 shrink-0">
+                点击参数面板中的 ◆ 或上方「+ 参数关键帧」即可独立动画任意单个参数（云密度 / 太阳光强 / 水量 / 滤镜尺度等）
+              </div>
+            )}
 
             {/* Vertical Red Playhead Line across all lanes */}
             <div

@@ -41,23 +41,30 @@ import {
   DirectorEnvKeyframe,
   DirectorExportFormat,
   DirectorLutPreset,
+  DirectorParamId,
+  DirectorParamKeyframe,
   DirectorPostFxKeyframe,
   DirectorRenderProgress,
   DirectorSceneAnchor,
   DirectorShotPlan,
   DirectorTimelineProject,
+  DirectorVisualFilter,
   DirectorWorldEvent,
   DirectorWorldEventType,
   evaluateCameraTrackPose,
   evaluateEnvironmentTrack,
+  evaluateFullTimelineAtTime,
   evaluatePostFxTrack,
   formatSmpteTimecode,
   FPS_PRESETS,
   LUT_PRESET_META,
+  PARAM_TRACK_META,
   parseDirectorProjectJson,
   RESOLUTION_PRESETS,
   ScreenshotFormat,
   serializeDirectorProjectJson,
+  upsertParamKeyframe,
+  VISUAL_FILTER_META,
   WORLD_EVENT_META,
 } from '../engine/director';
 import {
@@ -353,11 +360,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
       currentUp: [0, 1, 0] as [number, number, number],
       currentFovDeg: 52,
     };
-    return {
-      pose: evaluateCameraTrackPose(project.cameraTrack, playheadSec, anchor),
-      env: evaluateEnvironmentTrack(project.envTrack, playheadSec),
-      pfx: evaluatePostFxTrack(project.postFxTrack, playheadSec),
-    };
+    return evaluateFullTimelineAtTime(project, anchor, playheadSec);
   }, [engine.planet.baseRadius, engine.planet.nativeVoxelSize, playheadSec, project]);
 
   const frameRange = useMemo(() => computeProjectFrameRange(project), [project]);
@@ -402,6 +405,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
       id: `env_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
       timeSec: Number(playheadSec.toFixed(3)),
       ...cur,
+      waterVolume: cur.waterVolume ?? undefined,
       easing: [0.42, 0, 0.58, 1],
     };
     onUpdateProject((prev) => ({
@@ -485,6 +489,20 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
           eventTrack: prev.eventTrack.filter((k) => k.id !== selectedItem.id),
         };
       }
+      if (selectedItem.track === 'param') {
+        const curList = prev.paramTracks?.[selectedItem.paramId] ?? [];
+        const nextList = curList.filter((k) => k.id !== selectedItem.id);
+        const nextParamTracks = { ...(prev.paramTracks ?? {}) };
+        if (nextList.length === 0) {
+          delete nextParamTracks[selectedItem.paramId];
+        } else {
+          nextParamTracks[selectedItem.paramId] = nextList;
+        }
+        return {
+          ...prev,
+          paramTracks: nextParamTracks,
+        };
+      }
       if (prev.postFxTrack.length <= 1) return prev;
       return {
         ...prev,
@@ -532,6 +550,137 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
     },
     [onUpdateProject, project.durationSec],
   );
+
+  const handleMoveParamKeyframeTime = useCallback(
+    (paramId: DirectorParamId, id: string, nextT: number) => {
+      const clamped = Number(Math.max(0, Math.min(project.durationSec, nextT)).toFixed(3));
+      onUpdateProject((prev) => {
+        const list = prev.paramTracks?.[paramId] ?? [];
+        return {
+          ...prev,
+          paramTracks: {
+            ...(prev.paramTracks ?? {}),
+            [paramId]: list
+              .map((k) => (k.id === id ? { ...k, timeSec: clamped } : k))
+              .sort((a, b) => a.timeSec - b.timeSec),
+          },
+        };
+      });
+    },
+    [onUpdateProject, project.durationSec],
+  );
+
+  const getEvaluatedParamValue = useCallback(
+    (paramId: DirectorParamId): number => {
+      const { pose, env, pfx } = evaluatedAtPlayhead;
+      switch (paramId) {
+        case 'cloudCoverage':
+          return env.cloudCoverage;
+        case 'cloudAltitudeRatio':
+          return env.cloudAltitudeRatio;
+        case 'solarIntensity':
+          return env.solarIntensity ?? 1.0;
+        case 'sunElevationDeg':
+          return env.sunElevationDeg;
+        case 'sunAzimuthDeg':
+          return env.sunAzimuthDeg;
+        case 'waterVolume':
+          return env.waterVolume ?? 1.0;
+        case 'atmoDensity':
+          return env.atmoDensity;
+        case 'scatterStrength':
+          return env.scatterStrength;
+        case 'windSpeed':
+          return env.windSpeed;
+        case 'tempOffsetC':
+          return env.tempOffsetC;
+        case 'cameraFovDeg':
+          return pose.fovDeg;
+        case 'cameraRollDeg':
+          return pose.rollDeg ?? 0;
+        case 'cameraShakeAmp':
+          return 0;
+        case 'exposure':
+          return pfx.exposure;
+        case 'contrast':
+          return pfx.contrast;
+        case 'saturation':
+          return pfx.saturation;
+        case 'bloomStrength':
+          return pfx.bloomStrength;
+        case 'vignette':
+          return pfx.vignette;
+        case 'filmGrain':
+          return pfx.filmGrain;
+        case 'filterIntensity':
+          return pfx.filterIntensity ?? 0.85;
+        case 'filterScale':
+          return pfx.filterScale ?? 1.0;
+      }
+    },
+    [evaluatedAtPlayhead],
+  );
+
+  const handleAddParamKeyframeAtPlayhead = useCallback(
+    (paramId: DirectorParamId, explicitValue?: number) => {
+      if (rendering) return;
+      const meta = PARAM_TRACK_META.find((m) => m.id === paramId);
+      const val = explicitValue ?? getEvaluatedParamValue(paramId);
+      const clampedT = Number(Math.max(0, Math.min(project.durationSec, playheadSec)).toFixed(3));
+      let createdId = '';
+      onUpdateProject((prev) => {
+        const nextList = upsertParamKeyframe(
+          prev.paramTracks?.[paramId],
+          clampedT,
+          val,
+          [0.42, 0.0, 0.58, 1.0],
+        );
+        const hit = nextList.find((k) => Math.abs(k.timeSec - clampedT) < 0.045) ?? nextList[0];
+        createdId = hit?.id ?? '';
+        return {
+          ...prev,
+          updatedAt: Date.now(),
+          paramTracks: {
+            ...(prev.paramTracks ?? {}),
+            [paramId]: nextList,
+          },
+        };
+      });
+      if (createdId) {
+        setSelectedItem({ track: 'param', paramId, id: createdId });
+      }
+      flashNotice(`已为「${meta?.label ?? paramId}」添加关键帧 (${val.toFixed(2)}${meta?.unit ?? ''}) @ ${clampedT.toFixed(2)}s`);
+    },
+    [flashNotice, getEvaluatedParamValue, onUpdateProject, playheadSec, project.durationSec, rendering],
+  );
+
+  const handleSeedGradientParamsPreset = useCallback(() => {
+    if (rendering) return;
+    const dur = Math.max(1.0, project.durationSec);
+    const mid = Number((dur * 0.5).toFixed(2));
+    onUpdateProject((prev) => ({
+      ...prev,
+      updatedAt: Date.now(),
+      paramTracks: {
+        ...(prev.paramTracks ?? {}),
+        cloudCoverage: [
+          { id: 'pk_demo_cloud_0', timeSec: 0, value: 0.15, easing: [0.42, 0, 0.58, 1] },
+          { id: 'pk_demo_cloud_1', timeSec: mid, value: 0.95, easing: [0.42, 0, 0.58, 1] },
+          { id: 'pk_demo_cloud_2', timeSec: dur, value: 1.85, easing: [0.42, 0, 0.58, 1] },
+        ],
+        solarIntensity: [
+          { id: 'pk_demo_sun_0', timeSec: 0, value: 0.45, easing: [0.42, 0, 0.58, 1] },
+          { id: 'pk_demo_sun_1', timeSec: dur, value: 3.1, easing: [0.42, 0, 0.58, 1] },
+        ],
+        waterVolume: [
+          { id: 'pk_demo_water_0', timeSec: 0, value: 0.35, easing: [0.42, 0, 0.58, 1] },
+          { id: 'pk_demo_water_1', timeSec: dur, value: 2.15, easing: [0.42, 0, 0.58, 1] },
+        ],
+      },
+    }));
+    setTimelineCameraLock(true);
+    flashNotice('已注入动态渐变演示轨：云量(0.15→1.85)、太阳(0.45×→3.1×)、水量(0.35×→2.15×)');
+  }, [flashNotice, onUpdateProject, project.durationSec, rendering]);
 
   // Studio local keyboard shortcuts
   useEffect(() => {
@@ -800,6 +949,22 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
         : null,
     [project.eventTrack, selectedItem],
   );
+  const selectedParamKf = useMemo(
+    () =>
+      selectedItem?.track === 'param'
+        ? (project.paramTracks?.[selectedItem.paramId] ?? []).find(
+            (k) => k.id === selectedItem.id,
+          ) ?? null
+        : null,
+    [project.paramTracks, selectedItem],
+  );
+  const selectedParamMeta = useMemo(
+    () =>
+      selectedItem?.track === 'param'
+        ? PARAM_TRACK_META.find((m) => m.id === selectedItem.paramId) ?? null
+        : null,
+    [selectedItem],
+  );
 
   // Closest/active env and postfx keyframes for Curve & Grading tab
   const activeEnvKf = useMemo(() => {
@@ -830,10 +995,11 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
 
   const activeCurveBezier: CubicBezier4 = useMemo(() => {
     if (selectedCamKf) return selectedCamKf.easing;
+    if (selectedParamKf) return selectedParamKf.easing;
     if (selectedItem?.track === 'env' && activeEnvKf) return activeEnvKf.easing;
     if (selectedItem?.track === 'postfx' && activePostFxKf) return activePostFxKf.easing;
     return project.cameraTrack[0]?.easing ?? [0.42, 0, 0.58, 1];
-  }, [activeEnvKf, activePostFxKf, project.cameraTrack, selectedCamKf, selectedItem]);
+  }, [activeEnvKf, activePostFxKf, project.cameraTrack, selectedCamKf, selectedItem, selectedParamKf]);
 
   const handleUpdateActiveCurve = (next: CubicBezier4) => {
     if (selectedCamKf) {
@@ -842,6 +1008,17 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
         cameraTrack: prev.cameraTrack.map((k) =>
           k.id === selectedCamKf.id ? { ...k, easing: next } : k,
         ),
+      }));
+    } else if (selectedItem?.track === 'param' && selectedParamKf) {
+      const pid = selectedItem.paramId;
+      onUpdateProject((prev) => ({
+        ...prev,
+        paramTracks: {
+          ...(prev.paramTracks ?? {}),
+          [pid]: (prev.paramTracks?.[pid] ?? []).map((k) =>
+            k.id === selectedParamKf.id ? { ...k, easing: next } : k,
+          ),
+        },
       }));
     } else if (selectedItem?.track === 'env' && activeEnvKf) {
       onUpdateProject((prev) => ({
@@ -1129,7 +1306,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                       value={bakeAction}
                       disabled={rendering}
                       onChange={(e) => setBakeAction(e.target.value as DirectorActionType)}
-                      className="h-5 px-1 rounded-xs border border-slate-700 bg-[#0d1322] text-[10px] text-slate-200 max-w-[140px]"
+                      className="h-5 px-1 rounded-xs border border-slate-700 bg-[#0d1322] text-[10px] text-slate-200 max-w-[104px]"
                     >
                       {DIRECTOR_ACTIONS.filter((a) => a.id !== 'keyframe_path').map((a) => (
                         <option key={a.id} value={a.id}>
@@ -1865,6 +2042,113 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                         <span>立即在节目视口试放此事件</span>
                       </button>
                     </div>
+                  ) : selectedItem?.track === 'param' && selectedParamKf && selectedParamMeta ? (
+                    /* Per-Parameter Keyframe Inspector */
+                    <div data-testid="param-keyframe-inspector" className="space-y-2.5">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                        <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                          <span
+                            className="w-2.5 h-2.5 rounded-xs inline-block"
+                            style={{ backgroundColor: selectedParamMeta.colorHex }}
+                          />
+                          <span>单参数关键帧 · {selectedParamMeta.label}</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleDeleteSelectedItem}
+                          className="h-6 px-2 rounded-xs border border-rose-500/40 bg-rose-950/40 text-rose-200 text-[10px] cursor-pointer"
+                        >
+                          删除节点
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="space-y-0.5 block">
+                          <span className="text-[10px] text-slate-400">关键帧时刻 (s)</span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={project.durationSec}
+                            step={0.05}
+                            value={selectedParamKf.timeSec}
+                            onChange={(e) =>
+                              handleMoveParamKeyframeTime(
+                                selectedParamMeta.id,
+                                selectedParamKf.id,
+                                Number(e.target.value),
+                              )
+                            }
+                            className="cad-num w-full h-7 px-2 rounded-xs border border-slate-700 bg-[#0d1322] text-white"
+                          />
+                        </label>
+                        <label className="space-y-0.5 block">
+                          <span className="text-[10px] text-slate-400">
+                            目标数值 {selectedParamMeta.unit ? `(${selectedParamMeta.unit})` : ''}
+                          </span>
+                          <input
+                            type="number"
+                            min={selectedParamMeta.min}
+                            max={selectedParamMeta.max}
+                            step={selectedParamMeta.step}
+                            value={selectedParamKf.value}
+                            onChange={(e) => {
+                              const nextVal = Math.max(
+                                selectedParamMeta.min,
+                                Math.min(selectedParamMeta.max, Number(e.target.value) || 0),
+                              );
+                              onUpdateProject((prev) => ({
+                                ...prev,
+                                paramTracks: {
+                                  ...(prev.paramTracks ?? {}),
+                                  [selectedParamMeta.id]: (prev.paramTracks?.[selectedParamMeta.id] ?? []).map((k) =>
+                                    k.id === selectedParamKf.id ? { ...k, value: nextVal } : k,
+                                  ),
+                                },
+                              }));
+                            }}
+                            className="cad-num w-full h-7 px-2 rounded-xs border border-slate-700 bg-[#0d1322] text-white"
+                          />
+                        </label>
+                      </div>
+
+                      <label className="space-y-1 block">
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-400">{selectedParamMeta.label} 数值滑杆</span>
+                          <span className="font-mono-tabular text-purple-200">
+                            {selectedParamKf.value.toFixed(2)}
+                            {selectedParamMeta.unit}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={selectedParamMeta.min}
+                          max={selectedParamMeta.max}
+                          step={selectedParamMeta.step}
+                          value={selectedParamKf.value}
+                          onChange={(e) => {
+                            const nextVal = Number(e.target.value);
+                            onUpdateProject((prev) => ({
+                              ...prev,
+                              paramTracks: {
+                                ...(prev.paramTracks ?? {}),
+                                [selectedParamMeta.id]: (prev.paramTracks?.[selectedParamMeta.id] ?? []).map((k) =>
+                                  k.id === selectedParamKf.id ? { ...k, value: nextVal } : k,
+                                ),
+                              },
+                            }));
+                          }}
+                          className="studio-slider"
+                        />
+                      </label>
+
+                      <button
+                        type="button"
+                        onClick={() => handleAddParamKeyframeAtPlayhead(selectedParamMeta.id)}
+                        className="w-full h-7 rounded-xs border border-purple-500/50 bg-purple-950/50 hover:bg-purple-900/60 text-purple-100 text-[10px] cursor-pointer"
+                      >
+                        + 在当前播放头 ({playheadSec.toFixed(2)}s) 追加关键帧
+                      </button>
+                    </div>
                   ) : (
                     /* Overview & Quick Add Palette when nothing selected */
                     <div className="space-y-3">
@@ -1895,7 +2179,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                           className="h-8 px-2 rounded-xs border border-emerald-500/40 bg-emerald-950/35 hover:bg-emerald-900/50 text-emerald-200 text-[10px] flex items-center justify-center gap-1 cursor-pointer"
                         >
                           <Plus className="w-3 h-3" />
-                          <span>插入 LUT 调色帧</span>
+                          <span>插入调色/滤镜帧</span>
                         </button>
                         <button
                           type="button"
@@ -1906,6 +2190,17 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                           <span>插入火山爆发</span>
                         </button>
                       </div>
+
+                      <button
+                        type="button"
+                        data-testid="director-seed-gradient-params-btn"
+                        disabled={rendering}
+                        onClick={handleSeedGradientParamsPreset}
+                        className="w-full h-8 px-2 rounded-xs border border-purple-500/50 bg-purple-950/40 hover:bg-purple-900/55 text-purple-100 text-[10px] font-medium flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-purple-300" />
+                        <span>一键注入渐变演示轨 (云渐密↑ · 日渐亮↑ · 水涨潮↑)</span>
+                      </button>
 
                       <div className="pt-2 border-t border-slate-800 space-y-1.5">
                         <div className="text-[10px] font-semibold text-slate-300">
@@ -1939,12 +2234,54 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                     onChange={handleUpdateActiveCurve}
                   />
 
-                  {/* Sun & Atmosphere Keyframe Section */}
+                  {/* Per-Parameter Keyframe Quick Strip */}
+                  <div className="p-2 rounded-xs border border-purple-500/35 bg-[#0b101d] space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="font-semibold text-purple-300">
+                        单参数独立关键帧 (点击 ◆ 立即打帧)
+                      </span>
+                      <button
+                        type="button"
+                        disabled={rendering}
+                        onClick={handleSeedGradientParamsPreset}
+                        className="h-5 px-1.5 rounded-xs border border-purple-500/50 bg-purple-950/60 hover:bg-purple-900/70 text-purple-200 text-[9px] cursor-pointer"
+                      >
+                        云↑ 日↑ 水↑ 预设
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(['cloudCoverage', 'solarIntensity', 'waterVolume'] as DirectorParamId[]).map((pid) => {
+                        const meta = PARAM_TRACK_META.find((m) => m.id === pid)!;
+                        const cnt = project.paramTracks?.[pid]?.length ?? 0;
+                        return (
+                          <button
+                            key={pid}
+                            type="button"
+                            disabled={rendering}
+                            data-testid={`quick-param-kf-${pid}`}
+                            onClick={() => handleAddParamKeyframeAtPlayhead(pid)}
+                            className={`h-6 px-1.5 rounded-xs border text-[10px] flex items-center justify-between cursor-pointer ${
+                              cnt > 0
+                                ? 'border-purple-400/70 bg-purple-950/50 text-white'
+                                : 'border-slate-800 bg-[#090d18] text-slate-300 hover:border-purple-400'
+                            }`}
+                          >
+                            <span className="truncate">{meta.label.slice(0, 4)}</span>
+                            <span className="font-mono-tabular text-[9px] text-purple-300">
+                              ◆{cnt > 0 ? cnt : '+'}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Sun, Atmosphere & Hydrologic Keyframe Section */}
                   {activeEnvKf && (
                     <div className="pt-2.5 border-t border-slate-800 space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="font-semibold text-amber-300">
-                          日照与大气气象轨 ({activeEnvKf.timeSec.toFixed(2)}s)
+                          日照、气象与水文轨 ({activeEnvKf.timeSec.toFixed(2)}s)
                         </span>
                         <button
                           type="button"
@@ -1956,124 +2293,78 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                       </div>
 
                       <div className="grid grid-cols-2 gap-2">
-                        <label className="space-y-0.5 block">
-                          <div className="flex justify-between text-[10px]">
-                            <span className="text-slate-400">太阳仰角</span>
-                            <span className="font-mono-tabular text-amber-200">
-                              {Math.round(activeEnvKf.sunElevationDeg)}°
-                            </span>
-                          </div>
-                          <input
-                            type="range"
-                            min={-15}
-                            max={85}
-                            step={1}
-                            value={activeEnvKf.sunElevationDeg}
-                            onChange={(e) => {
-                              const val = Number(e.target.value);
-                              onUpdateProject((prev) => ({
-                                ...prev,
-                                envTrack: prev.envTrack.map((k) =>
-                                  k.id === activeEnvKf.id
-                                    ? { ...k, sunElevationDeg: val }
-                                    : k,
-                                ),
-                              }));
-                            }}
-                            className="studio-slider"
-                          />
-                        </label>
-                        <label className="space-y-0.5 block">
-                          <div className="flex justify-between text-[10px]">
-                            <span className="text-slate-400">太阳方位角</span>
-                            <span className="font-mono-tabular text-amber-200">
-                              {Math.round(activeEnvKf.sunAzimuthDeg)}°
-                            </span>
-                          </div>
-                          <input
-                            type="range"
-                            min={-360}
-                            max={360}
-                            step={2}
-                            value={activeEnvKf.sunAzimuthDeg}
-                            onChange={(e) => {
-                              const val = Number(e.target.value);
-                              onUpdateProject((prev) => ({
-                                ...prev,
-                                envTrack: prev.envTrack.map((k) =>
-                                  k.id === activeEnvKf.id
-                                    ? { ...k, sunAzimuthDeg: val }
-                                    : k,
-                                ),
-                              }));
-                            }}
-                            className="studio-slider"
-                          />
-                        </label>
-                        <label className="space-y-0.5 block">
-                          <div className="flex justify-between text-[10px]">
-                            <span className="text-slate-400">大气散射密度</span>
-                            <span className="font-mono-tabular text-sky-200">
-                              {activeEnvKf.atmoDensity.toFixed(2)}
-                            </span>
-                          </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={2.5}
-                            step={0.05}
-                            value={activeEnvKf.atmoDensity}
-                            onChange={(e) => {
-                              const val = Number(e.target.value);
-                              onUpdateProject((prev) => ({
-                                ...prev,
-                                envTrack: prev.envTrack.map((k) =>
-                                  k.id === activeEnvKf.id
-                                    ? { ...k, atmoDensity: val }
-                                    : k,
-                                ),
-                              }));
-                            }}
-                            className="studio-slider"
-                          />
-                        </label>
-                        <label className="space-y-0.5 block">
-                          <div className="flex justify-between text-[10px]">
-                            <span className="text-slate-400">云层覆盖率</span>
-                            <span className="font-mono-tabular text-slate-200">
-                              {Math.round(activeEnvKf.cloudCoverage * 100)}%
-                            </span>
-                          </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={1.1}
-                            step={0.02}
-                            value={activeEnvKf.cloudCoverage}
-                            onChange={(e) => {
-                              const val = Number(e.target.value);
-                              onUpdateProject((prev) => ({
-                                ...prev,
-                                envTrack: prev.envTrack.map((k) =>
-                                  k.id === activeEnvKf.id
-                                    ? { ...k, cloudCoverage: val }
-                                    : k,
-                                ),
-                              }));
-                            }}
-                            className="studio-slider"
-                          />
-                        </label>
+                        {(
+                          [
+                            ['太阳仰角', 'sunElevationDeg', -15, 85, 1, '°', activeEnvKf.sunElevationDeg, 'text-amber-200'],
+                            ['太阳方位角', 'sunAzimuthDeg', -360, 360, 2, '°', activeEnvKf.sunAzimuthDeg, 'text-amber-200'],
+                            ['太阳光强', 'solarIntensity', 0.05, 4.5, 0.05, '×', evaluatedAtPlayhead.env.solarIntensity ?? 1.0, 'text-yellow-300'],
+                            ['大气散射密度', 'atmoDensity', 0, 2.5, 0.05, '', activeEnvKf.atmoDensity, 'text-sky-200'],
+                            ['云层覆盖密度', 'cloudCoverage', 0, 2.0, 0.02, '', evaluatedAtPlayhead.env.cloudCoverage, 'text-slate-200'],
+                            ['全局水量', 'waterVolume', 0, 2.5, 0.05, '×', evaluatedAtPlayhead.env.waterVolume ?? 1.0, 'text-cyan-300'],
+                          ] as const
+                        ).map(([lbl, key, min, max, step, unit, curVal, valColor]) => {
+                          const hasParamTrack = (project.paramTracks?.[key as DirectorParamId]?.length ?? 0) > 0;
+                          return (
+                            <label key={key} className="space-y-0.5 block">
+                              <div className="flex items-center justify-between text-[10px] gap-1">
+                                <span className="text-slate-400 truncate">{lbl}</span>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <span className={`font-mono-tabular ${valColor}`}>
+                                    {Number(curVal).toFixed(step >= 1 ? 0 : 2)}{unit}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    data-testid={`param-kf-btn-${key}`}
+                                    title={`在 ${playheadSec.toFixed(2)}s 为「${lbl}」打独立关键帧`}
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      handleAddParamKeyframeAtPlayhead(key as DirectorParamId, Number(curVal));
+                                    }}
+                                    className={`px-1 rounded-xs text-[9px] leading-tight cursor-pointer border ${
+                                      hasParamTrack
+                                        ? 'border-purple-400 bg-purple-950/70 text-purple-200'
+                                        : 'border-slate-700 bg-[#0d1322] text-slate-400 hover:text-white hover:border-purple-400'
+                                    }`}
+                                  >
+                                    ◆
+                                  </button>
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min={min}
+                                max={max}
+                                step={step}
+                                value={curVal}
+                                onChange={(e) => {
+                                  const val = Number(e.target.value);
+                                  if (key === 'waterVolume' || hasParamTrack) {
+                                    handleAddParamKeyframeAtPlayhead(key as DirectorParamId, val);
+                                  } else {
+                                    onUpdateProject((prev) => ({
+                                      ...prev,
+                                      envTrack: prev.envTrack.map((k) =>
+                                        k.id === activeEnvKf.id ? { ...k, [key]: val } : k,
+                                      ),
+                                    }));
+                                  }
+                                }}
+                                className="studio-slider"
+                              />
+                            </label>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
 
-                  {/* Post-FX & Color Grading Section */}
+                  {/* Post-FX, LUT & Artistic/Optical Visual Filters Section */}
                   {activePostFxKf && (
                     <div className="pt-2.5 border-t border-slate-800 space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="font-semibold text-emerald-300">
-                          后期调色 LUT 轨 ({activePostFxKf.timeSec.toFixed(2)}s)
+                          后期调色与视觉滤镜轨 ({activePostFxKf.timeSec.toFixed(2)}s)
                         </span>
                         <button
                           type="button"
@@ -2082,6 +2373,42 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                         >
                           + 在当前处新增
                         </button>
+                      </div>
+
+                      {/* Artistic & Scientific Visual Filter Grid */}
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-slate-400 block">
+                          艺术与科学视觉滤镜 (GPU TSL 后处理)
+                        </span>
+                        <div className="grid grid-cols-3 gap-1">
+                          {VISUAL_FILTER_META.map((fm) => {
+                            const active = (activePostFxKf.visualFilter ?? 'none') === fm.id;
+                            return (
+                              <button
+                                key={fm.id}
+                                type="button"
+                                data-testid={`director-filter-${fm.id}`}
+                                title={fm.desc}
+                                onClick={() => {
+                                  const val = fm.id as DirectorVisualFilter;
+                                  onUpdateProject((prev) => ({
+                                    ...prev,
+                                    postFxTrack: prev.postFxTrack.map((k) =>
+                                      k.id === activePostFxKf.id ? { ...k, visualFilter: val } : k,
+                                    ),
+                                  }));
+                                }}
+                                className={`h-6 px-1 rounded-xs border text-[10px] truncate cursor-pointer ${
+                                  active
+                                    ? 'border-purple-400 bg-purple-950/75 text-white font-medium'
+                                    : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                {fm.shortLabel}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
 
                       <div className="grid grid-cols-2 gap-2">
@@ -2135,40 +2462,68 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                       <div className="grid grid-cols-2 gap-2">
                         {(
                           [
-                            ['曝光增益', 'exposure', 0.4, 2.2, 0.02],
-                            ['对比度', 'contrast', 0.6, 1.8, 0.02],
-                            ['饱和度', 'saturation', 0.0, 2.0, 0.02],
-                            ['泛光 Bloom', 'bloomStrength', 0.0, 1.5, 0.02],
-                            ['暗角 Vignette', 'vignette', 0.0, 0.85, 0.02],
-                            ['胶片颗粒 Grain', 'filmGrain', 0.0, 0.25, 0.005],
+                            ['滤镜混合强度', 'filterIntensity', 0.0, 1.0, 0.02, evaluatedAtPlayhead.pfx.filterIntensity ?? 0.85],
+                            ['滤镜结构尺度', 'filterScale', 0.25, 3.0, 0.05, evaluatedAtPlayhead.pfx.filterScale ?? 1.0],
+                            ['曝光增益', 'exposure', 0.4, 2.2, 0.02, evaluatedAtPlayhead.pfx.exposure],
+                            ['对比度', 'contrast', 0.6, 1.8, 0.02, evaluatedAtPlayhead.pfx.contrast],
+                            ['饱和度', 'saturation', 0.0, 2.0, 0.02, evaluatedAtPlayhead.pfx.saturation],
+                            ['泛光 Bloom', 'bloomStrength', 0.0, 1.5, 0.02, evaluatedAtPlayhead.pfx.bloomStrength],
+                            ['暗角 Vignette', 'vignette', 0.0, 0.85, 0.02, evaluatedAtPlayhead.pfx.vignette],
+                            ['胶片颗粒 Grain', 'filmGrain', 0.0, 0.25, 0.005, evaluatedAtPlayhead.pfx.filmGrain],
                           ] as const
-                        ).map(([lbl, key, min, max, step]) => (
-                          <label key={key} className="space-y-0.5 block">
-                            <div className="flex justify-between text-[10px]">
-                              <span className="text-slate-400">{lbl}</span>
-                              <span className="font-mono-tabular text-emerald-200">
-                                {Number(activePostFxKf[key]).toFixed(2)}
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min={min}
-                              max={max}
-                              step={step}
-                              value={activePostFxKf[key]}
-                              onChange={(e) => {
-                                const v = Number(e.target.value);
-                                onUpdateProject((prev) => ({
-                                  ...prev,
-                                  postFxTrack: prev.postFxTrack.map((k) =>
-                                    k.id === activePostFxKf.id ? { ...k, [key]: v } : k,
-                                  ),
-                                }));
-                              }}
-                              className="studio-slider"
-                            />
-                          </label>
-                        ))}
+                        ).map(([lbl, key, min, max, step, curVal]) => {
+                          const hasParamTrack = (project.paramTracks?.[key as DirectorParamId]?.length ?? 0) > 0;
+                          return (
+                            <label key={key} className="space-y-0.5 block">
+                              <div className="flex items-center justify-between text-[10px] gap-1">
+                                <span className="text-slate-400 truncate">{lbl}</span>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <span className="font-mono-tabular text-emerald-200">
+                                    {Number(curVal).toFixed(2)}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    data-testid={`param-kf-btn-${key}`}
+                                    title={`在 ${playheadSec.toFixed(2)}s 为「${lbl}」打独立关键帧`}
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      handleAddParamKeyframeAtPlayhead(key as DirectorParamId, Number(curVal));
+                                    }}
+                                    className={`px-1 rounded-xs text-[9px] leading-tight cursor-pointer border ${
+                                      hasParamTrack
+                                        ? 'border-purple-400 bg-purple-950/70 text-purple-200'
+                                        : 'border-slate-700 bg-[#0d1322] text-slate-400 hover:text-white hover:border-purple-400'
+                                    }`}
+                                  >
+                                    ◆
+                                  </button>
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min={min}
+                                max={max}
+                                step={step}
+                                value={curVal}
+                                onChange={(e) => {
+                                  const v = Number(e.target.value);
+                                  if (hasParamTrack) {
+                                    handleAddParamKeyframeAtPlayhead(key as DirectorParamId, v);
+                                  } else {
+                                    onUpdateProject((prev) => ({
+                                      ...prev,
+                                      postFxTrack: prev.postFxTrack.map((k) =>
+                                        k.id === activePostFxKf.id ? { ...k, [key]: v } : k,
+                                      ),
+                                    }));
+                                  }
+                                }}
+                                className="studio-slider"
+                              />
+                            </label>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -2193,6 +2548,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                           <button
                             key={r.id}
                             type="button"
+                            data-testid={`director-res-${r.id}`}
                             disabled={rendering}
                             onClick={() =>
                               onUpdateProject((prev) => ({
@@ -2362,6 +2718,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                         <button
                           key={mode}
                           type="button"
+                          data-testid={`director-offline-mode-${mode}`}
                           disabled={rendering}
                           onClick={() =>
                             updateOfflineQuality({
@@ -2371,7 +2728,9 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
                                   ? 4
                                   : mode === 'cinematic'
                                     ? 2
-                                    : project.offlineQuality.accumSamples,
+                                    : 1,
+                              rayTracing: mode !== 'inherit',
+                              volumetrics: mode !== 'inherit',
                             })
                           }
                           className={`h-6 rounded-xs border text-[10px] cursor-pointer ${
@@ -2577,7 +2936,7 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
           </aside>
         </div>
 
-        {/* Bottom 4-Track NLE Timeline Dock */}
+        {/* Bottom Multi-Track & Per-Parameter NLE Timeline Dock */}
         <TimelineTrackPanel
           project={project}
           playheadSec={playheadSec}
@@ -2596,10 +2955,12 @@ export const DirectorCinemaStudio: React.FC<DirectorCinemaStudioProps> = ({
           }
           onSelectItem={(item) => setSelectedItem(item)}
           onMoveItemTime={handleMoveItemTime}
+          onMoveParamKeyframeTime={handleMoveParamKeyframeTime}
           onAddCameraKeyframeAtPlayhead={handleAddCameraKeyframeAtPlayhead}
           onAddEnvKeyframeAtPlayhead={handleAddEnvKeyframeAtPlayhead}
           onAddEventAtPlayhead={() => handleAddEventAtPlayhead('volcano')}
           onAddPostFxKeyframeAtPlayhead={handleAddPostFxKeyframeAtPlayhead}
+          onAddParamKeyframeAtPlayhead={(pid) => handleAddParamKeyframeAtPlayhead(pid)}
           onDeleteSelectedItem={handleDeleteSelectedItem}
         />
       </div>

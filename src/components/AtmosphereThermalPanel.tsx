@@ -1,6 +1,7 @@
 import React from 'react';
-import { Cloud, Flame, RotateCcw, Thermometer, Wind, X } from 'lucide-react';
+import { Cloud, Flame, RotateCcw, Sparkles, Thermometer, Wind, X } from 'lucide-react';
 import { AtmosphereConfig, DEFAULT_ATMOS_CONFIG } from '../engine/atmosphere';
+import { DirectorVisualFilter, VISUAL_FILTER_META } from '../engine/director';
 import { DEFAULT_THERMAL_CONFIG, ThermalConfig } from '../engine/thermal';
 import { TerrainOverlayMode, TerrainRenderMode } from '../engine/voxelPlanet';
 import { SandboxConfig, SandboxTelemetry } from '../engine/webgpuScene';
@@ -166,6 +167,75 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
           </div>
         </div>
 
+        {/* GPU TSL Visual Filters (Sandbox Live Stylization) */}
+        <div className="rounded-xs border border-slate-800 bg-[#060912] p-2 flex flex-col gap-1.5">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-1">
+            <span className="flex items-center gap-1 font-semibold text-purple-300">
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>实时艺术与光学视觉滤镜</span>
+            </span>
+            <span className="text-[10px] font-mono-tabular text-slate-400">
+              {VISUAL_FILTER_META.find((m) => m.id === (config.visualFilter ?? 'none'))?.shortLabel ?? '原始光学'}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
+            {VISUAL_FILTER_META.map((fm) => {
+              const active = (config.visualFilter ?? 'none') === fm.id;
+              return (
+                <button
+                  key={fm.id}
+                  type="button"
+                  data-testid={`sandbox-filter-${fm.id}`}
+                  title={fm.desc}
+                  onClick={() =>
+                    onUpdateConfig({
+                      visualFilter: fm.id as DirectorVisualFilter,
+                    })
+                  }
+                  className={`h-6 px-1 rounded-xs border text-[10px] truncate cursor-pointer ${
+                    active
+                      ? 'border-purple-400 bg-purple-950/70 text-white font-medium'
+                      : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {fm.shortLabel}
+                </button>
+              );
+            })}
+          </div>
+          {(config.visualFilter ?? 'none') !== 'none' && (
+            <div className="grid grid-cols-2 gap-x-2 pt-1">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-slate-400">滤镜混合强度</span>
+                <NumericCadInput
+                  value={config.filterIntensity ?? 0.85}
+                  minValid={0}
+                  sliderMin={0}
+                  sliderMax={1}
+                  sliderStep={0.02}
+                  onChangeValue={(v) =>
+                    onUpdateConfig({ filterIntensity: Math.max(0, Math.min(1, v)) })
+                  }
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-slate-400">晶格/结构尺度</span>
+                <NumericCadInput
+                  value={config.filterScale ?? 1.0}
+                  minValid={0.25}
+                  unit="x"
+                  sliderMin={0.25}
+                  sliderMax={3.0}
+                  sliderStep={0.05}
+                  onChangeValue={(v) =>
+                    onUpdateConfig({ filterScale: Math.max(0.25, Math.min(3.0, v)) })
+                  }
+                />
+              </label>
+            </div>
+          )}
+        </div>
+
         {/* Atmosphere & Cloud Deck Controls */}
         <div className="rounded-xs border border-slate-800 bg-[#060912] p-2 flex flex-col gap-1.5">
           <div className="flex items-center justify-between border-b border-slate-800 pb-1">
@@ -245,7 +315,7 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
                 minValid={0}
                 testId="atmos-cloud-input"
                 sliderMin={0}
-                sliderMax={1.2}
+                sliderMax={2.0}
                 sliderStep={0.02}
                 onChangeValue={(v) => patchAtmos({ cloudCover: v })}
               />

@@ -157,6 +157,9 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
     renderQuality: { ...DEFAULT_RENDER_QUALITY },
+    visualFilter: 'none',
+    filterIntensity: 0.85,
+    filterScale: 1.0,
   };
 }
 
@@ -432,6 +435,12 @@ export default function App() {
       .init()
       .then(async () => {
         if (cancelled) return;
+        const effectiveRq = engine.getEffectiveRenderQuality();
+        setConfig((prev) => {
+          const next = { ...prev, renderQuality: effectiveRq };
+          configRef.current = next;
+          return next;
+        });
         // If opened from another tab via IndexedDB handoff slot, restore full sculpted state asynchronously
         if (launchParams.slotId) {
           let payload = await loadPlanetFromDb(launchParams.slotId);
@@ -1090,7 +1099,7 @@ export default function App() {
         </div>
       )}
 
-      {phase === 'title' && (
+      {phase === 'title' && !genProgress?.active && (
         <TitleOverlay
           saves={saves}
           initialSeedConfig={launchParams.seedConfig}

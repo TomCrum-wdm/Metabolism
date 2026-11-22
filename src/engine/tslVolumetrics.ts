@@ -22,14 +22,17 @@ import {
   isBackgroundDepth,
   length,
   log2,
+  luminance,
   max,
   min,
   mix,
+  mod,
   normalWorld,
   normalWorldGeometry,
   normalize,
   pow,
   positionWorld,
+  screenSize,
   screenUV,
   select,
   sin,
@@ -42,6 +45,7 @@ import {
   vec3,
   vec4,
 } from 'three/tsl';
+import type { DirectorVisualFilter } from './director';
 
 export interface TerrainSubVoxelPbrParams {
   isBlockyNode: THREE.UniformNode<'float'>;
@@ -588,6 +592,7 @@ export interface VolumetricAtmoCompositeParams {
   atmoScatterEnabledNode: THREE.UniformNode<'float'>;
   volStepsNode: THREE.UniformNode<'float'>;
   contactShadowNode: THREE.UniformNode<'float'>;
+  solarIntensityNode?: THREE.UniformNode<'float'>;
 }
 
 /**
@@ -612,6 +617,7 @@ export function buildVolumetricAtmoCompositeNode(
     atmoScatterEnabledNode,
     volStepsNode,
     contactShadowNode,
+    solarIntensityNode,
   } = params;
 
   return Fn(() => {
@@ -770,7 +776,10 @@ export function buildVolumetricAtmoCompositeNode(
               .negate(),
           );
 
-          const sunColor = vec3(1.0, 0.94, 0.84).mul(1.65);
+          const sunGain = solarIntensityNode
+            ? tslClamp(solarIntensityNode, 0.05, 4.5)
+            : float(1.0);
+          const sunColor = vec3(1.0, 0.94, 0.84).mul(1.65).mul(sunGain);
           const inScattered = rayleighScatter
             .mul(betaR)
             .mul(phaseR)
@@ -869,4 +878,178 @@ export function buildPostGradingCompositeNode(
     return vec4(rgb.saturate(), src.a);
   })();
 }
+
+export interface VisualFilterCompositeParams {
+  texNode: THREE.TextureNode;
+  filterMode: DirectorVisualFilter;
+  filterModeNode: THREE.UniformNode<'float'>;
+  filterIntensityNode: THREE.UniformNode<'float'>;
+  filterScaleNode: THREE.UniformNode<'float'>;
+  simTimeNode: THREE.UniformNode<'float'>;
+}
+
+/**
+ * Artistic & Scientific GPU Visual Filters (WebGPU & WebGL2 compatible TSL).
+ * Compiles ONLY the active `filterMode` subgraph so fragment cost & JIT compilation stay ultra-fast.
+ */
+export function buildVisualFilterNode(
+  params: VisualFilterCompositeParams,
+): THREE.Node<'vec4'> {
+  const {
+    texNode,
+    filterMode,
+    filterIntensityNode,
+    filterScaleNode,
+    simTimeNode,
+  } = params;
+
+  if (filterMode === 'none') {
+    return texNode;
+  }
+
+  return Fn(() => {
+    const uvCoord = screenUV;
+    const baseSample = texNode.sample(uvCoord);
+    const intensity = tslClamp(filterIntensityNode, 0.0, 1.0).toVar();
+    const scale = tslClamp(filterScaleNode, 0.25, 3.0).toVar();
+    const sSize = max(screenSize, vec2(64.0, 64.0)).toVar();
+    const texel = vec2(1.0, 1.0).div(sSize).toVar();
+    const outRgb = baseSample.rgb.toVar();
+
+    const sampleSafe = (u: THREE.Node<'vec2'>) =>
+      texNode.sample(tslClamp(u, vec2(0.001, 0.001), vec2(0.999, 0.999))).rgb;
+
+    if (filterMode === 'constructivism') {
+      // Mode 1: Constructivism (构成主义: avant-garde posterized tonal blocks, diagonal stripe hatching, ink contours)
+      const stepUv = texel.mul(scale.mul(1.45));
+      const lL = luminance(sampleSafe(uvCoord.add(vec2(stepUv.x.negate(), 0.0))));
+      const lR = luminance(sampleSafe(uvCoord.add(vec2(stepUv.x, 0.0))));
+      const lT = luminance(sampleSafe(uvCoord.add(vec2(0.0, stepUv.y.negate()))));
+      const lB = luminance(sampleSafe(uvCoord.add(vec2(0.0, stepUv.y))));
+
+      const gx = lR.sub(lL).mul(2.0);
+      const gy = lB.sub(lT).mul(2.0);
+      const edge = sqrt(gx.mul(gx).add(gy.mul(gy)));
+      const inkMask = smoothstep(0.11, 0.32, edge);
+
+      const c = baseSample.rgb;
+      const lum = luminance(c);
+      const warmSignal = smoothstep(0.02, 0.22, c.r.sub(c.b));
+      const coolSignal = smoothstep(0.02, 0.22, c.b.sub(c.r));
+
+      const colShadowInk = vec3(0.08, 0.085, 0.105);
+      const colSlate = mix(vec3(0.16, 0.23, 0.31), vec3(0.14, 0.30, 0.42), coolSignal);
+      const colAccent = mix(vec3(0.84, 0.21, 0.16), vec3(0.90, 0.64, 0.20), warmSignal);
+      const colParchment = vec3(0.94, 0.90, 0.82);
+
+      const band01 = mix(colShadowInk, colSlate, smoothstep(0.13, 0.19, lum));
+      const band12 = mix(band01, colAccent, smoothstep(0.36, 0.43, lum));
+      const poster = mix(band12, colParchment, smoothstep(0.68, 0.75, lum)).toVar();
+
+      // Diagonal structural stripe hatching in shadow/midtone planes
+      const diagCoord = uvCoord.x.mul(sSize.x).add(uvCoord.y.mul(sSize.y)).div(max(scale.mul(4.5), float(1.5)));
+      const stripe = step(0.58, fract(diagCoord));
+      const midMask = smoothstep(0.12, 0.22, lum).mul(float(1.0).sub(smoothstep(0.45, 0.60, lum)));
+      poster.assign(mix(poster, poster.mul(0.62), stripe.mul(midMask).mul(0.65)));
+
+      const styled = mix(poster, vec3(0.04, 0.04, 0.05), inkMask.mul(0.92)).saturate();
+      outRgb.assign(mix(baseSample.rgb, styled, intensity));
+    } else if (filterMode === 'minimalism') {
+      // Mode 2: Minimalism (极简化: smooth flat luminance planes & hairline silhouette contours)
+      const d = texel.mul(scale.mul(2.2));
+      const c0 = baseSample.rgb;
+      const c1 = sampleSafe(uvCoord.add(vec2(d.x, 0.0)));
+      const c2 = sampleSafe(uvCoord.sub(vec2(d.x, 0.0)));
+      const c3 = sampleSafe(uvCoord.add(vec2(0.0, d.y)));
+      const c4 = sampleSafe(uvCoord.sub(vec2(0.0, d.y)));
+      const smoothed = c0.mul(0.36).add(c1.add(c2).add(c3).add(c4).mul(0.16));
+
+      const lS = luminance(smoothed);
+      const grad = abs(luminance(c1).sub(luminance(c2))).add(abs(luminance(c3).sub(luminance(c4))));
+      const hairline = smoothstep(0.09, 0.26, grad);
+
+      const quantLuma = floor(lS.mul(5.0).add(0.42)).div(5.0);
+      const safeLuma = max(lS, float(0.02));
+      const flatTone = smoothed.mul(quantLuma.div(safeLuma));
+      const calmColor = mix(vec3(quantLuma, quantLuma, quantLuma), flatTone, float(0.72));
+      const styled = mix(calmColor, vec3(0.12, 0.14, 0.18), hairline.mul(0.48)).saturate();
+      outRgb.assign(mix(baseSample.rgb, styled, intensity));
+    } else if (filterMode === 'compound_eye') {
+      // Mode 3: Compound Eye (昆虫复眼: hexagonal ommatidia microlens array with per-facet refraction & dispersion)
+      const aspect = sSize.x.div(sSize.y);
+      const gridDensity = float(32.0).div(scale);
+      const p = uvCoord.sub(0.5).mul(vec2(aspect, 1.0)).mul(gridDensity);
+
+      const r = vec2(1.0, 1.7320508);
+      const h = r.mul(0.5);
+      const a = mod(p, r).sub(h);
+      const b = mod(p.sub(h), r).sub(h);
+      const useA = dot(a, a).lessThan(dot(b, b));
+      const gv = select(useA, a, b);
+
+      const absGv = abs(gv);
+      const hexDist = max(absGv.x, dot(absGv, vec2(0.5, 0.8660254)));
+      const facetIdPos = p.sub(gv);
+      const centerUv = facetIdPos.div(vec2(aspect, 1.0).mul(gridDensity)).add(0.5);
+
+      const lensOffset = gv.div(vec2(aspect, 1.0).mul(gridDensity)).mul(0.55);
+      const sampleUvG = centerUv.add(lensOffset);
+      const sampleUvR = centerUv.add(lensOffset.mul(1.26));
+      const sampleUvB = centerUv.add(lensOffset.mul(0.74));
+
+      const ommatidiumRgb = vec3(
+        sampleSafe(sampleUvR).r,
+        sampleSafe(sampleUvG).g,
+        sampleSafe(sampleUvB).b,
+      ).toVar();
+
+      const rimDark = smoothstep(0.37, 0.495, hexDist);
+      const domeGlow = float(1.0).sub(tslClamp(length(gv).mul(1.35), 0.0, 1.0)).mul(0.12);
+      ommatidiumRgb.assign(
+        mix(ommatidiumRgb.add(domeGlow), vec3(0.03, 0.04, 0.055), rimDark.mul(0.88)).saturate(),
+      );
+      outRgb.assign(mix(baseSample.rgb, ommatidiumRgb, intensity));
+    } else if (filterMode === 'integral') {
+      // Mode 4: Optical Integral (光学积分: directional azimuthal path integral over temporal accumulation buffer)
+      const rad1 = texel.mul(scale.mul(2.4));
+      const rad2 = texel.mul(scale.mul(5.2));
+      const spin = simTimeNode.mul(0.35);
+
+      const acc = baseSample.rgb.mul(0.36).toVar();
+      Loop(4, ({ i }) => {
+        const ang = float(i).mul(1.5707963).add(spin);
+        const dir = vec2(cos(ang), sin(ang));
+        const s1 = sampleSafe(uvCoord.add(dir.mul(rad1)));
+        const s2 = sampleSafe(uvCoord.add(dir.mul(rad2)));
+        acc.addAssign(s1.mul(0.10).add(s2.mul(0.06)));
+      });
+
+      const lum = luminance(acc);
+      const bloomLift = acc.mul(float(1.0).add(smoothstep(0.35, 1.1, lum).mul(0.38)));
+      const integrated = mix(baseSample.rgb, bloomLift.saturate(), float(0.85));
+      outRgb.assign(mix(baseSample.rgb, integrated, intensity));
+    } else if (filterMode === 'halftone') {
+      // Mode 5: Halftone Print (印刷网点: rotated screen dot matrix halftone)
+      const pitch = max(scale.mul(6.0), float(2.5));
+      const px = uvCoord.mul(sSize);
+      const rotX = px.x.mul(0.8829).sub(px.y.mul(0.4695));
+      const rotY = px.x.mul(0.4695).add(px.y.mul(0.8829));
+      const cellUv = fract(vec2(rotX, rotY).div(pitch)).sub(0.5);
+      const dist = length(cellUv);
+
+      const c = baseSample.rgb;
+      const lum = luminance(c);
+      const dotRadius = sqrt(tslClamp(float(1.0).sub(lum), 0.02, 0.96)).mul(0.52);
+      const inkMask = float(1.0).sub(smoothstep(dotRadius.sub(0.06), dotRadius.add(0.06), dist));
+
+      const paperCol = mix(vec3(0.95, 0.93, 0.89), c.add(0.28).saturate(), float(0.35));
+      const inkCol = c.mul(0.42);
+      const styled = mix(paperCol, inkCol, inkMask).saturate();
+      outRgb.assign(mix(baseSample.rgb, styled, intensity));
+    }
+
+    return vec4(outRgb.saturate(), baseSample.a);
+  })();
+}
+
 

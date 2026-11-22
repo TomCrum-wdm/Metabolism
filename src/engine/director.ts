@@ -43,6 +43,96 @@ export type DirectorLutPreset =
 
 export type DirectorAspectMask = 'none' | '2.39:1' | '16:9' | '9:16';
 
+export type DirectorVisualFilter =
+  | 'none'
+  | 'constructivism'
+  | 'minimalism'
+  | 'compound_eye'
+  | 'integral'
+  | 'halftone';
+
+export type DirectorParamId =
+  | 'cloudCoverage'
+  | 'cloudAltitudeRatio'
+  | 'solarIntensity'
+  | 'sunElevationDeg'
+  | 'sunAzimuthDeg'
+  | 'waterVolume'
+  | 'atmoDensity'
+  | 'scatterStrength'
+  | 'windSpeed'
+  | 'tempOffsetC'
+  | 'cameraFovDeg'
+  | 'cameraRollDeg'
+  | 'cameraShakeAmp'
+  | 'exposure'
+  | 'contrast'
+  | 'saturation'
+  | 'bloomStrength'
+  | 'vignette'
+  | 'filmGrain'
+  | 'filterIntensity'
+  | 'filterScale';
+
+export interface DirectorParamKeyframe {
+  id: string;
+  timeSec: number;
+  value: number;
+  easing: CubicBezier4;
+}
+
+export type DirectorParamTracksMap = Partial<Record<DirectorParamId, DirectorParamKeyframe[]>>;
+
+export interface DirectorParamMeta {
+  id: DirectorParamId;
+  label: string;
+  unit: string;
+  category: 'env' | 'camera' | 'postfx';
+  min: number;
+  max: number;
+  step: number;
+  colorHex: string;
+}
+
+export const PARAM_TRACK_META: ReadonlyArray<DirectorParamMeta> = [
+  { id: 'cloudCoverage', label: '云层覆盖密度', unit: '', category: 'env', min: 0, max: 2.0, step: 0.02, colorHex: '#e2e8f0' },
+  { id: 'solarIntensity', label: '太阳光强亮度', unit: '×', category: 'env', min: 0.05, max: 4.5, step: 0.05, colorHex: '#fbbf24' },
+  { id: 'waterVolume', label: '全局液态水量', unit: '×', category: 'env', min: 0.0, max: 2.5, step: 0.05, colorHex: '#38bdf8' },
+  { id: 'sunElevationDeg', label: '太阳仰角', unit: '°', category: 'env', min: -15, max: 85, step: 1, colorHex: '#f59e0b' },
+  { id: 'sunAzimuthDeg', label: '太阳方位角', unit: '°', category: 'env', min: -360, max: 360, step: 2, colorHex: '#fb923c' },
+  { id: 'atmoDensity', label: '大气散射密度', unit: 'atm', category: 'env', min: 0, max: 2.5, step: 0.05, colorHex: '#60a5fa' },
+  { id: 'scatterStrength', label: '瑞利散射强度', unit: '×', category: 'env', min: 0, max: 3.0, step: 0.05, colorHex: '#818cf8' },
+  { id: 'cloudAltitudeRatio', label: '云层高度比', unit: 'R₀', category: 'env', min: 0.04, max: 0.45, step: 0.01, colorHex: '#cbd5e1' },
+  { id: 'windSpeed', label: '大气风速倍率', unit: '×', category: 'env', min: 0, max: 5.0, step: 0.1, colorHex: '#2dd4bf' },
+  { id: 'tempOffsetC', label: '温度偏移基准', unit: '°C', category: 'env', min: -80, max: 80, step: 1, colorHex: '#f87171' },
+  { id: 'cameraFovDeg', label: '镜头视角 FOV', unit: '°', category: 'camera', min: 10, max: 105, step: 0.5, colorHex: '#22d3ee' },
+  { id: 'cameraRollDeg', label: '荷兰倾角 Roll', unit: '°', category: 'camera', min: -45, max: 45, step: 0.5, colorHex: '#06b6d4' },
+  { id: 'cameraShakeAmp', label: '手持震动强度', unit: '', category: 'camera', min: 0, max: 3.0, step: 0.05, colorHex: '#67e8f9' },
+  { id: 'exposure', label: '曝光增益', unit: '', category: 'postfx', min: 0.35, max: 2.5, step: 0.02, colorHex: '#34d399' },
+  { id: 'contrast', label: '对比度', unit: '', category: 'postfx', min: 0.5, max: 2.0, step: 0.02, colorHex: '#10b981' },
+  { id: 'saturation', label: '色彩饱和度', unit: '', category: 'postfx', min: 0.0, max: 2.2, step: 0.02, colorHex: '#4ade80' },
+  { id: 'bloomStrength', label: '辉光 Bloom', unit: '', category: 'postfx', min: 0.0, max: 1.6, step: 0.02, colorHex: '#a3e635' },
+  { id: 'vignette', label: '镜头暗角', unit: '', category: 'postfx', min: 0.0, max: 0.9, step: 0.02, colorHex: '#6ee7b7' },
+  { id: 'filmGrain', label: '胶片颗粒', unit: '', category: 'postfx', min: 0.0, max: 0.3, step: 0.005, colorHex: '#86efac' },
+  { id: 'filterIntensity', label: '视觉滤镜强度', unit: '', category: 'postfx', min: 0.0, max: 1.0, step: 0.02, colorHex: '#c084fc' },
+  { id: 'filterScale', label: '视觉滤镜尺度', unit: '×', category: 'postfx', min: 0.25, max: 3.0, step: 0.05, colorHex: '#e879f9' },
+];
+
+export const VISUAL_FILTER_META: ReadonlyArray<{
+  id: DirectorVisualFilter;
+  modeIndex: number;
+  label: string;
+  shortLabel: string;
+  desc: string;
+}> = [
+  { id: 'none', modeIndex: 0, label: '原始光学 (None)', shortLabel: '原始光学', desc: '关闭风格化滤镜，呈现纯粹物理光学渲染' },
+  { id: 'constructivism', modeIndex: 1, label: '构成主义 (Constructivism)', shortLabel: '构成主义', desc: '先锋派几何色块海报色调、斜向结构排线与高反差油墨轮廓' },
+  { id: 'minimalism', modeIndex: 2, label: '极简化 (Minimalism)', shortLabel: '极简化', desc: '高净度平滑均色分层、极简建筑留白与纤细地平线轮廓' },
+  { id: 'compound_eye', modeIndex: 3, label: '昆虫复眼 (Compound Eye)', shortLabel: '复眼', desc: '六边形微透镜阵列折射、独立小眼视角采样与棱镜色散' },
+  { id: 'integral', modeIndex: 4, label: '光学积分 (Integral)', shortLabel: '积分', desc: '帧间时间光积分与方位轨迹累积长曝光拖尾特效' },
+  { id: 'halftone', modeIndex: 5, label: '印刷网点 (Halftone)', shortLabel: '网点', desc: '波普网屏网点矩阵与出版级网格色彩分色' },
+];
+
 export interface ResolutionPreset {
   id: string;
   label: string;
@@ -51,6 +141,7 @@ export interface ResolutionPreset {
 }
 
 export const RESOLUTION_PRESETS: ReadonlyArray<ResolutionPreset> = [
+  { id: '720p', label: 'HD 720p', width: 1280, height: 720 },
   { id: '1080p', label: 'FHD 1080p', width: 1920, height: 1080 },
   { id: '1440p', label: '2K QHD', width: 2560, height: 1440 },
   { id: '4k', label: '4K UHD', width: 3840, height: 2160 },
@@ -227,12 +318,14 @@ export interface DirectorEnvKeyframe {
   timeSec: number;
   sunElevationDeg: number;
   sunAzimuthDeg: number;
+  solarIntensity?: number;
   atmoDensity: number;
   scatterStrength: number;
   cloudCoverage: number;
   cloudAltitudeRatio: number;
   windSpeed: number;
   tempOffsetC: number;
+  waterVolume?: number;
   easing: CubicBezier4;
 }
 
@@ -263,6 +356,9 @@ export interface DirectorPostFxKeyframe {
   filmGrain: number;
   chromaticAberration: number;
   aspectMask: DirectorAspectMask;
+  visualFilter?: DirectorVisualFilter;
+  filterIntensity?: number;
+  filterScale?: number;
   easing: CubicBezier4;
 }
 
@@ -319,6 +415,7 @@ export interface DirectorTimelineProject {
   envTrack: DirectorEnvKeyframe[];
   eventTrack: DirectorWorldEvent[];
   postFxTrack: DirectorPostFxKeyframe[];
+  paramTracks?: DirectorParamTracksMap;
 }
 
 export interface DirectorSceneAnchor {
@@ -356,12 +453,14 @@ export interface DirectorCameraPose {
 export interface EvaluatedEnvState {
   sunElevationDeg: number;
   sunAzimuthDeg: number;
+  solarIntensity: number;
   atmoDensity: number;
   scatterStrength: number;
   cloudCoverage: number;
   cloudAltitudeRatio: number;
   windSpeed: number;
   tempOffsetC: number;
+  waterVolume: number | null;
 }
 
 export interface EvaluatedPostFxState {
@@ -375,6 +474,9 @@ export interface EvaluatedPostFxState {
   filmGrain: number;
   chromaticAberration: number;
   aspectMask: DirectorAspectMask;
+  visualFilter: DirectorVisualFilter;
+  filterIntensity: number;
+  filterScale: number;
 }
 
 export interface RgbHistogramBins {
@@ -500,6 +602,7 @@ export function createDefaultDirectorProject(
         timeSec: 0,
         sunElevationDeg: 28,
         sunAzimuthDeg: 28,
+        solarIntensity: 1.0,
         atmoDensity: 1.0,
         scatterStrength: 1.0,
         cloudCoverage: 0.48,
@@ -513,6 +616,7 @@ export function createDefaultDirectorProject(
         timeSec: durationSec,
         sunElevationDeg: 18,
         sunAzimuthDeg: 78,
+        solarIntensity: 1.0,
         atmoDensity: 1.05,
         scatterStrength: 1.1,
         cloudCoverage: 0.55,
@@ -537,9 +641,13 @@ export function createDefaultDirectorProject(
         filmGrain: 0.02,
         chromaticAberration: 0.0,
         aspectMask: 'none',
+        visualFilter: 'none',
+        filterIntensity: 0.85,
+        filterScale: 1.0,
         easing: [0.42, 0.0, 0.58, 1.0],
       },
     ],
+    paramTracks: {},
   };
 }
 
@@ -1114,12 +1222,14 @@ export function evaluateEnvironmentTrack(
   const base: EvaluatedEnvState = {
     sunElevationDeg: fallback?.sunElevationDeg ?? 28,
     sunAzimuthDeg: fallback?.sunAzimuthDeg ?? 28,
+    solarIntensity: fallback?.solarIntensity ?? 1.0,
     atmoDensity: fallback?.atmoDensity ?? 1.0,
     scatterStrength: fallback?.scatterStrength ?? 1.0,
     cloudCoverage: fallback?.cloudCoverage ?? 0.48,
     cloudAltitudeRatio: fallback?.cloudAltitudeRatio ?? 0.16,
     windSpeed: fallback?.windSpeed ?? 1.0,
     tempOffsetC: fallback?.tempOffsetC ?? 0,
+    waterVolume: fallback?.waterVolume ?? null,
   };
   if (rawTrack.length === 0) return base;
   const kfs = [...rawTrack].sort((a, b) => a.timeSec - b.timeSec);
@@ -1128,12 +1238,14 @@ export function evaluateEnvironmentTrack(
     return {
       sunElevationDeg: k.sunElevationDeg,
       sunAzimuthDeg: k.sunAzimuthDeg,
+      solarIntensity: k.solarIntensity ?? base.solarIntensity,
       atmoDensity: k.atmoDensity,
       scatterStrength: k.scatterStrength,
-      cloudCoverage: k.cloudCoverage,
+      cloudCoverage: clamp(k.cloudCoverage, 0, 2.0),
       cloudAltitudeRatio: k.cloudAltitudeRatio,
       windSpeed: k.windSpeed,
       tempOffsetC: k.tempOffsetC,
+      waterVolume: k.waterVolume !== undefined ? k.waterVolume : base.waterVolume,
     };
   }
   const last = kfs[kfs.length - 1];
@@ -1141,12 +1253,14 @@ export function evaluateEnvironmentTrack(
     return {
       sunElevationDeg: last.sunElevationDeg,
       sunAzimuthDeg: last.sunAzimuthDeg,
+      solarIntensity: last.solarIntensity ?? base.solarIntensity,
       atmoDensity: last.atmoDensity,
       scatterStrength: last.scatterStrength,
-      cloudCoverage: last.cloudCoverage,
+      cloudCoverage: clamp(last.cloudCoverage, 0, 2.0),
       cloudAltitudeRatio: last.cloudAltitudeRatio,
       windSpeed: last.windSpeed,
       tempOffsetC: last.tempOffsetC,
+      waterVolume: last.waterVolume !== undefined ? last.waterVolume : base.waterVolume,
     };
   }
 
@@ -1161,15 +1275,28 @@ export function evaluateEnvironmentTrack(
   const b = kfs[idx + 1];
   const span = Math.max(1e-5, b.timeSec - a.timeSec);
   const t = evaluateCubicBezierEasing(a.easing, (timeSec - a.timeSec) / span);
+  const wA = a.waterVolume;
+  const wB = b.waterVolume;
+  const evalWater =
+    wA !== undefined && wB !== undefined
+      ? clamp(lerp(wA, wB, t), 0, 2.5)
+      : wA !== undefined
+        ? wA
+        : wB !== undefined
+          ? wB
+          : base.waterVolume;
+
   return {
     sunElevationDeg: lerp(a.sunElevationDeg, b.sunElevationDeg, t),
     sunAzimuthDeg: lerp(a.sunAzimuthDeg, b.sunAzimuthDeg, t),
+    solarIntensity: clamp(lerp(a.solarIntensity ?? base.solarIntensity, b.solarIntensity ?? base.solarIntensity, t), 0.05, 4.5),
     atmoDensity: Math.max(0, lerp(a.atmoDensity, b.atmoDensity, t)),
     scatterStrength: Math.max(0, lerp(a.scatterStrength, b.scatterStrength, t)),
-    cloudCoverage: clamp(lerp(a.cloudCoverage, b.cloudCoverage, t), 0, 1.2),
+    cloudCoverage: clamp(lerp(a.cloudCoverage, b.cloudCoverage, t), 0, 2.0),
     cloudAltitudeRatio: clamp(lerp(a.cloudAltitudeRatio, b.cloudAltitudeRatio, t), 0.04, 0.45),
     windSpeed: clamp(lerp(a.windSpeed, b.windSpeed, t), 0, 5),
     tempOffsetC: lerp(a.tempOffsetC, b.tempOffsetC, t),
+    waterVolume: evalWater,
   };
 }
 
@@ -1191,6 +1318,9 @@ export function evaluatePostFxTrack(
     filmGrain: 0.0,
     chromaticAberration: 0.0,
     aspectMask: 'none',
+    visualFilter: 'none',
+    filterIntensity: 0.85,
+    filterScale: 1.0,
   };
   if (rawTrack.length === 0) return defaults;
   const kfs = [...rawTrack].sort((a, b) => a.timeSec - b.timeSec);
@@ -1207,6 +1337,9 @@ export function evaluatePostFxTrack(
       filmGrain: k.filmGrain,
       chromaticAberration: k.chromaticAberration,
       aspectMask: k.aspectMask,
+      visualFilter: k.visualFilter ?? 'none',
+      filterIntensity: k.filterIntensity ?? 0.85,
+      filterScale: k.filterScale ?? 1.0,
     };
   }
   const last = kfs[kfs.length - 1];
@@ -1222,6 +1355,9 @@ export function evaluatePostFxTrack(
       filmGrain: last.filmGrain,
       chromaticAberration: last.chromaticAberration,
       aspectMask: last.aspectMask,
+      visualFilter: last.visualFilter ?? 'none',
+      filterIntensity: last.filterIntensity ?? 0.85,
+      filterScale: last.filterScale ?? 1.0,
     };
   }
 
@@ -1237,7 +1373,7 @@ export function evaluatePostFxTrack(
   const span = Math.max(1e-5, b.timeSec - a.timeSec);
   const t = evaluateCubicBezierEasing(a.easing, (timeSec - a.timeSec) / span);
   return {
-    lutPreset: t >= 0.5 ? b.lutPreset : a.lutPreset,
+    lutPreset: t > 0.5 ? b.lutPreset : a.lutPreset,
     lutIntensity: clamp(lerp(a.lutIntensity, b.lutIntensity, t), 0, 1.5),
     exposure: clamp(lerp(a.exposure, b.exposure, t), 0.2, 3.0),
     contrast: clamp(lerp(a.contrast, b.contrast, t), 0.5, 2.0),
@@ -1246,8 +1382,146 @@ export function evaluatePostFxTrack(
     vignette: clamp(lerp(a.vignette, b.vignette, t), 0.0, 0.95),
     filmGrain: clamp(lerp(a.filmGrain, b.filmGrain, t), 0.0, 0.35),
     chromaticAberration: clamp(lerp(a.chromaticAberration, b.chromaticAberration, t), 0.0, 1.0),
-    aspectMask: t >= 0.5 ? b.aspectMask : a.aspectMask,
+    aspectMask: t > 0.5 ? b.aspectMask : a.aspectMask,
+    visualFilter: t > 0.5 ? (b.visualFilter ?? 'none') : (a.visualFilter ?? 'none'),
+    filterIntensity: clamp(lerp(a.filterIntensity ?? 0.85, b.filterIntensity ?? 0.85, t), 0.0, 1.0),
+    filterScale: clamp(lerp(a.filterScale ?? 1.0, b.filterScale ?? 1.0, t), 0.25, 3.0),
   };
+}
+
+/**
+ * Evaluates a single-parameter keyframe channel independently with per-keyframe Cubic-Bezier easing.
+ */
+export function evaluateParameterTrack(
+  rawKfs: ReadonlyArray<DirectorParamKeyframe> | undefined,
+  timeSec: number,
+  fallbackValue: number,
+  minVal = -Infinity,
+  maxVal = Infinity,
+): number {
+  if (!rawKfs || rawKfs.length === 0) {
+    return clamp(fallbackValue, minVal, maxVal);
+  }
+  const kfs = [...rawKfs].sort((a, b) => a.timeSec - b.timeSec);
+  if (kfs.length === 1 || timeSec <= kfs[0].timeSec) {
+    return clamp(kfs[0].value, minVal, maxVal);
+  }
+  const last = kfs[kfs.length - 1];
+  if (timeSec >= last.timeSec) {
+    return clamp(last.value, minVal, maxVal);
+  }
+  let idx = 0;
+  for (let i = 0; i < kfs.length - 1; i++) {
+    if (timeSec >= kfs[i].timeSec && timeSec <= kfs[i + 1].timeSec) {
+      idx = i;
+      break;
+    }
+  }
+  const a = kfs[idx];
+  const b = kfs[idx + 1];
+  const span = Math.max(1e-5, b.timeSec - a.timeSec);
+  const eased = evaluateCubicBezierEasing(a.easing, (timeSec - a.timeSec) / span);
+  return clamp(lerp(a.value, b.value, eased), minVal, maxVal);
+}
+
+export function upsertParamKeyframe(
+  existing: ReadonlyArray<DirectorParamKeyframe> | undefined,
+  timeSec: number,
+  value: number,
+  easing: CubicBezier4 = [0.42, 0.0, 0.58, 1.0],
+): DirectorParamKeyframe[] {
+  const list = [...(existing ?? [])];
+  const nearIdx = list.findIndex((k) => Math.abs(k.timeSec - timeSec) < 0.04);
+  if (nearIdx >= 0) {
+    list[nearIdx] = { ...list[nearIdx], value, easing };
+  } else {
+    list.push({
+      id: `pk_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      timeSec: Number(Math.max(0, timeSec).toFixed(3)),
+      value,
+      easing,
+    });
+  }
+  return list.sort((a, b) => a.timeSec - b.timeSec);
+}
+
+/**
+ * Evaluates full synchronized NLE state (Camera + Env + PostFX), overlaying any active per-parameter channels.
+ */
+export function evaluateFullTimelineAtTime(
+  project: DirectorTimelineProject,
+  anchor: DirectorSceneAnchor,
+  timeSec: number,
+  envFallback?: Partial<EvaluatedEnvState>,
+): {
+  pose: DirectorCameraPose;
+  env: EvaluatedEnvState;
+  pfx: EvaluatedPostFxState;
+} {
+  const pose = evaluateCameraTrackPose(project.cameraTrack, timeSec, anchor);
+  const env = evaluateEnvironmentTrack(project.envTrack, timeSec, envFallback);
+  const pfx = evaluatePostFxTrack(project.postFxTrack, timeSec);
+  const pt = project.paramTracks;
+  if (!pt) {
+    return { pose, env, pfx };
+  }
+
+  const evalParam = (id: DirectorParamId, curVal: number): number => {
+    const kfs = pt[id];
+    if (!kfs || kfs.length === 0) return curVal;
+    const meta = PARAM_TRACK_META.find((m) => m.id === id);
+    return evaluateParameterTrack(
+      kfs,
+      timeSec,
+      curVal,
+      meta?.min ?? -Infinity,
+      meta?.max ?? Infinity,
+    );
+  };
+
+  // Overlay per-parameter Environment channels
+  env.cloudCoverage = evalParam('cloudCoverage', env.cloudCoverage);
+  env.cloudAltitudeRatio = evalParam('cloudAltitudeRatio', env.cloudAltitudeRatio);
+  env.solarIntensity = evalParam('solarIntensity', env.solarIntensity);
+  env.sunElevationDeg = evalParam('sunElevationDeg', env.sunElevationDeg);
+  env.sunAzimuthDeg = evalParam('sunAzimuthDeg', env.sunAzimuthDeg);
+  env.atmoDensity = evalParam('atmoDensity', env.atmoDensity);
+  env.scatterStrength = evalParam('scatterStrength', env.scatterStrength);
+  env.windSpeed = evalParam('windSpeed', env.windSpeed);
+  env.tempOffsetC = evalParam('tempOffsetC', env.tempOffsetC);
+  if (pt.waterVolume && pt.waterVolume.length > 0) {
+    env.waterVolume = evalParam('waterVolume', env.waterVolume ?? 1.0);
+  }
+
+  // Overlay per-parameter Camera optical overrides (FOV & Roll)
+  if (pt.cameraFovDeg && pt.cameraFovDeg.length > 0) {
+    pose.fovDeg = evalParam('cameraFovDeg', pose.fovDeg);
+  }
+  if (pt.cameraRollDeg && pt.cameraRollDeg.length > 0) {
+    const newRoll = evalParam('cameraRollDeg', pose.rollDeg ?? 0);
+    const deltaRoll = newRoll - (pose.rollDeg ?? 0);
+    if (Math.abs(deltaRoll) > 1e-4) {
+      const fwd = normalize3(
+        pose.lookAt[0] - pose.position[0],
+        pose.lookAt[1] - pose.position[1],
+        pose.lookAt[2] - pose.position[2],
+      );
+      pose.up = rotateAroundAxis3(pose.up, fwd, (deltaRoll * Math.PI) / 180);
+    }
+    pose.rollDeg = newRoll;
+  }
+
+  // Overlay per-parameter Post-FX & Visual Filter channels
+  pfx.exposure = evalParam('exposure', pfx.exposure);
+  pfx.contrast = evalParam('contrast', pfx.contrast);
+  pfx.saturation = evalParam('saturation', pfx.saturation);
+  pfx.bloomStrength = evalParam('bloomStrength', pfx.bloomStrength);
+  pfx.vignette = evalParam('vignette', pfx.vignette);
+  pfx.filmGrain = evalParam('filmGrain', pfx.filmGrain);
+  pfx.filterIntensity = evalParam('filterIntensity', pfx.filterIntensity);
+  pfx.filterScale = evalParam('filterScale', pfx.filterScale);
+
+  return { pose, env, pfx };
 }
 
 export interface LutGradingCoefficients {
@@ -1473,6 +1747,7 @@ export function parseDirectorProjectJson(raw: string): DirectorTimelineProject |
       envTrack: p.envTrack,
       eventTrack: Array.isArray(p.eventTrack) ? p.eventTrack : [],
       postFxTrack: Array.isArray(p.postFxTrack) && p.postFxTrack.length > 0 ? p.postFxTrack : base.postFxTrack,
+      paramTracks: p.paramTracks && typeof p.paramTracks === 'object' ? p.paramTracks : {},
     };
   } catch {
     return null;

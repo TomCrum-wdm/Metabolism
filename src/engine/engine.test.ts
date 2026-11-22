@@ -15,7 +15,7 @@ import {
   MaterialId,
   VoxelPlanet,
 } from './voxelPlanet';
-import { FluidSim } from './fluidSim';
+import { FluidSim, MAX_FLUID_PARTICLES } from './fluidSim';
 import {
   clampPlayerScale,
   computeCharacterScaleMetrics,
@@ -55,6 +55,8 @@ import {
   evaluateCubicBezierEasing,
   evaluateDirectorPose,
   evaluateEnvironmentTrack,
+  evaluateFullTimelineAtTime,
+  evaluateParameterTrack,
   evaluatePostFxTrack,
   formatSmpteTimecode,
   FPS_PRESETS,
@@ -62,6 +64,8 @@ import {
   parseDirectorProjectJson,
   RESOLUTION_PRESETS,
   serializeDirectorProjectJson,
+  upsertParamKeyframe,
+  VISUAL_FILTER_META,
 } from './director';
 import { buildTarArchive, WebmMuxer } from './webmMuxer';
 import {
@@ -2306,4 +2310,87 @@ test('Director NLE Multi-Track Engine: Cubic-Bezier easing, Camera/Env/PostFX tr
     20,
   );
 });
+
+test('Per-parameter keyframing (cloudCoverage, solarIntensity, waterVolume, visualFilter) and FluidSim.setTargetParticleCount work reversibly', () => {
+  const anchor: DirectorSceneAnchor = {
+    baseRadius: 13,
+    nativeVoxelSize: 13 / 64,
+    targetPoint: [0, 13, 0],
+    targetNormal: [0, 1, 0],
+    currentPos: [0, 26, 20],
+    currentLookAt: [0, 0, 0],
+    currentUp: [0, 1, 0],
+    currentFovDeg: 50,
+  };
+  const proj = createDefaultDirectorProject(anchor, 2026);
+  proj.durationSec = 4;
+  proj.fps = 30;
+  proj.postFxTrack[0].visualFilter = 'compound_eye';
+  proj.postFxTrack.push({
+    ...proj.postFxTrack[0],
+    id: 'pfx_1',
+    timeSec: 4,
+    visualFilter: 'constructivism',
+  });
+
+  // Upsert individual parameter keyframes on cloudCoverage, solarIntensity, waterVolume, filterScale
+  let cloudKfs = upsertParamKeyframe(undefined, 0, 0.2, [0, 0, 1, 1]);
+  cloudKfs = upsertParamKeyframe(cloudKfs, 4, 1.8, [0, 0, 1, 1]);
+  // Updating an existing timestamp within 0.04s replaces rather than duplicating
+  cloudKfs = upsertParamKeyframe(cloudKfs, 3.98, 1.9, [0, 0, 1, 1]);
+  assert.equal(cloudKfs.length, 2);
+
+  let sunKfs = upsertParamKeyframe(undefined, 0, 0.5, [0, 0, 1, 1]);
+  sunKfs = upsertParamKeyframe(sunKfs, 4, 3.5, [0, 0, 1, 1]);
+
+  let waterKfs = upsertParamKeyframe(undefined, 0, 0.4, [0, 0, 1, 1]);
+  waterKfs = upsertParamKeyframe(waterKfs, 4, 2.2, [0, 0, 1, 1]);
+
+  proj.paramTracks = {
+    cloudCoverage: cloudKfs,
+    solarIntensity: sunKfs,
+    waterVolume: waterKfs,
+    filterScale: upsertParamKeyframe(undefined, 2, 2.25, [0, 0, 1, 1]),
+  };
+
+  assert.ok(Math.abs(evaluateParameterTrack(cloudKfs, 2.0, 0.5, 0, 2.0) - 1.05) < 1e-4);
+
+  const mid = evaluateFullTimelineAtTime(proj, anchor, 2.0);
+  assert.ok(Math.abs(mid.env.cloudCoverage - 1.05) < 1e-4);
+  assert.ok(Math.abs((mid.env.solarIntensity ?? 0) - 2.0) < 1e-4);
+  assert.ok(Math.abs((mid.env.waterVolume ?? 0) - 1.3) < 1e-4);
+  assert.ok(Math.abs((mid.pfx.filterScale ?? 0) - 2.25) < 1e-4);
+  assert.equal(mid.pfx.visualFilter, 'compound_eye');
+
+  const late = evaluateFullTimelineAtTime(proj, anchor, 3.8);
+  assert.equal(late.pfx.visualFilter, 'constructivism');
+
+  // Verify JSON serialization preserves paramTracks & visualFilter
+  const json = serializeDirectorProjectJson(proj);
+  const parsed = parseDirectorProjectJson(json);
+  assert.ok(parsed !== null);
+  assert.equal(parsed!.paramTracks?.cloudCoverage?.length, 2);
+  assert.equal(parsed!.postFxTrack[1].visualFilter, 'constructivism');
+  assert.equal(VISUAL_FILTER_META.length, 6);
+
+  // Verify FluidSim.setTargetParticleCount precipitates and drains reversibly & clamps safely
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 4242, radius: 11 });
+  const fluid = new FluidSim();
+  fluid.seedInitialLakes(planet);
+  const baseCount = fluid.activeCount;
+  assert.ok(baseCount > 200);
+
+  const grew = fluid.setTargetParticleCount(planet, baseCount + 120, 7);
+  assert.equal(grew, true);
+  assert.equal(fluid.activeCount, Math.min(MAX_FLUID_PARTICLES, baseCount + 120));
+
+  const shrank = fluid.setTargetParticleCount(planet, 80, 7);
+  assert.equal(shrank, true);
+  assert.equal(fluid.activeCount, 80);
+
+  const clamped = fluid.setTargetParticleCount(planet, MAX_FLUID_PARTICLES + 500, 9);
+  assert.equal(clamped, true);
+  assert.equal(fluid.activeCount, MAX_FLUID_PARTICLES);
+});
+
 

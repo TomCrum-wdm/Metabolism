@@ -7,6 +7,7 @@ import {
   cameraPosition,
   clamp as tslClamp,
   color,
+  convertToTexture,
   cos,
   diffuseColor,
   dot,
@@ -36,6 +37,7 @@ import {
   vec4,
   vertexColor,
 } from 'three/tsl';
+import { afterImage } from 'three/addons/tsl/display/AfterImageNode.js';
 import { ao as gtao } from 'three/addons/tsl/display/GTAONode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { denoise } from 'three/addons/tsl/display/DenoiseNode.js';
@@ -124,13 +126,15 @@ import {
   DirectorSceneAnchor,
   DirectorShotPlan,
   DirectorTimelineProject,
+  DirectorVisualFilter,
   DirectorWorldEvent,
   EvaluatedPostFxState,
   evaluateCameraTrackPose,
   evaluateDirectorPose,
   evaluateEnvironmentTrack,
-  evaluatePostFxTrack,
+  evaluateFullTimelineAtTime,
   getLutColorMatrixParams,
+  VISUAL_FILTER_META,
   WORLD_EVENT_META,
 } from './director';
 import {
@@ -192,6 +196,7 @@ import {
 import {
   buildPostGradingCompositeNode,
   buildTerrainSubVoxelPbrBundle,
+  buildVisualFilterNode,
   buildVolumetricAtmoCompositeNode,
   buildWaterWaveNormalNode,
 } from './tslVolumetrics';
@@ -233,6 +238,11 @@ export interface GenerationProgress {
   seed: number;
   radius: number;
   voxelRadius: number;
+  phaseIndex?: number;
+  builtChunks?: number;
+  totalChunks?: number;
+  waterParticles?: number;
+  terrainVertices?: number;
 }
 
 export interface SandboxTelemetry {
@@ -309,6 +319,9 @@ export interface SandboxConfig {
   atmosphere: AtmosphereConfig;
   thermal: ThermalConfig;
   renderQuality: RenderQualityConfig;
+  visualFilter?: DirectorVisualFilter;
+  filterIntensity?: number;
+  filterScale?: number;
 }
 
 function detectSoftwareRenderer(): boolean {
@@ -391,6 +404,8 @@ export class PlanetarySandboxEngine {
   private legacyAtmoShellScaleNode = uniform(1.0);
 
   // Director NLE Color Grading & Film Finishing uniforms
+  private solarIntensityNode = uniform(1.0);
+  private activeSolarIntensity = 1.0;
   private postExposureGainNode = uniform(1.0);
   private postContrastNode = uniform(1.0);
   private postSaturationNode = uniform(1.0);
@@ -399,11 +414,22 @@ export class PlanetarySandboxEngine {
   private postHighlightTintNode = uniform(new THREE.Vector3(1.0, 1.0, 1.0));
   private postVignetteNode = uniform(0.0);
   private postFilmGrainNode = uniform(0.0);
+  private postFilterModeNode = uniform(0.0);
+  private postFilterIntensityNode = uniform(0.85);
+  private postFilterScaleNode = uniform(1.0);
+  private integralDampNode = uniform(0.86);
+  private activeVisualFilter: DirectorVisualFilter = 'none';
+  private activeFilterIntensity = 0.85;
+  private activeFilterScale = 1.0;
+  private directorWaterBaseCount: number | null = null;
   private activePostGradingEnabled = false;
   private activeBloomStrength = 0.34;
   private activeAspectMask: 'none' | '2.39:1' | '16:9' | '9:16' = 'none';
   private resizeObserver: ResizeObserver | null = null;
   private directorGizmoGroup: THREE.Group | null = null;
+  private genCoreGroup: THREE.Group | null = null;
+  private genCoreMesh: THREE.Mesh | null = null;
+  private genCageMesh: THREE.Mesh | null = null;
 
   // TSL Post-Processing RenderPipeline (SSGI + SSR + GTAO + Volumetric Scattering + Bloom + Grading)
   private renderPipeline: THREE.RenderPipeline | null = null;
@@ -788,6 +814,9 @@ export class PlanetarySandboxEngine {
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
     renderQuality: { ...DEFAULT_RENDER_QUALITY },
+    visualFilter: 'none',
+    filterIntensity: 0.85,
+    filterScale: 1.0,
   };
 
   private lastTime = 0;
@@ -1019,6 +1048,7 @@ export class PlanetarySandboxEngine {
 
     this.setupLighting();
     this.setupSpaceBackdrop();
+    this.setupGenerationCoreRig();
     this.setupMaterials();
     this.highResGroup = new THREE.Group();
     this.scene.add(this.highResGroup);
@@ -1387,9 +1417,10 @@ export class PlanetarySandboxEngine {
         .mul(0.5)
         .add(0.5);
       const fbm = n1.mul(0.68).add(n2.mul(0.32));
-      const thresh = float(1.0).sub(tslClamp(cloudCoverNode, 0.0, 1.3).mul(0.88));
-      return smoothstep(thresh.sub(0.14), thresh.add(0.22), fbm).mul(
-        tslClamp(cloudCoverNode, 0.0, 1.0),
+      const coverNorm = tslClamp(cloudCoverNode, 0.0, 2.0);
+      const thresh = float(1.0).sub(tslClamp(coverNorm.mul(0.55), 0.0, 0.98));
+      return smoothstep(thresh.sub(0.16), thresh.add(0.22), fbm).mul(
+        tslClamp(coverNorm, 0.0, 1.45),
       );
     });
 
@@ -1408,7 +1439,7 @@ export class PlanetarySandboxEngine {
     this.cloudShellMat.metalnessNode = float(0.0);
     this.cloudShellMat.opacityNode = Fn(() => {
       const c = cloudDensityField();
-      return c.mul(0.56).mul(atmoEnabledNode);
+      return tslClamp(c.mul(0.68), 0.0, 0.94).mul(atmoEnabledNode);
     })();
     this.cloudShellMat.transparent = true;
     this.cloudShellMat.depthWrite = false;
@@ -1448,6 +1479,30 @@ export class PlanetarySandboxEngine {
       });
     }
     this.scene.add(this.cloudPuffsMesh);
+  }
+
+  private setupGenerationCoreRig(): void {
+    this.genCoreGroup = new THREE.Group();
+    const coreGeo = new THREE.SphereGeometry(1, 32, 24);
+    const coreMat = new THREE.MeshStandardNodeMaterial();
+    coreMat.colorNode = color(0x38bdf8);
+    coreMat.emissiveNode = color(0x0ea5e9).mul(1.65);
+    coreMat.roughnessNode = float(0.28);
+    coreMat.metalnessNode = float(0.15);
+    this.genCoreMesh = new THREE.Mesh(coreGeo, coreMat);
+    this.genCoreGroup.add(this.genCoreMesh);
+
+    const cageGeo = new THREE.IcosahedronGeometry(1.16, 2);
+    const cageMat = new THREE.MeshBasicNodeMaterial();
+    cageMat.colorNode = color(0x7dd3fc);
+    cageMat.wireframe = true;
+    cageMat.transparent = true;
+    cageMat.opacity = 0.42;
+    this.genCageMesh = new THREE.Mesh(cageGeo, cageMat);
+    this.genCoreGroup.add(this.genCageMesh);
+
+    this.genCoreGroup.visible = false;
+    this.scene.add(this.genCoreGroup);
   }
 
   private createTerrainMaterial(): THREE.MeshPhysicalNodeMaterial {
@@ -4129,6 +4184,7 @@ export class PlanetarySandboxEngine {
     tasks.sort((a, b) => a.prio - b.prio);
 
     let sliceStart = performance.now();
+    let builtVerts = 0;
     for (let i = 0; i < tasks.length; i++) {
       if (shouldAbort()) return false;
       const { ci, cx, cy, cz, lod } = tasks[i];
@@ -4155,6 +4211,8 @@ export class PlanetarySandboxEngine {
         mesh.visible = true;
         this.scene.add(mesh);
         this.chunkMeshes[ci] = mesh;
+        builtVerts += data.vertexCount;
+        this.totalTerrainVertices = builtVerts;
       }
 
       if (performance.now() - sliceStart >= 8 || i === tasks.length - 1) {
@@ -4218,7 +4276,12 @@ export class PlanetarySandboxEngine {
         ? this.planet.seedConfig.voxelRadius
         : (targetSeed.voxelRadius ?? this.planet.seedConfig.voxelRadius);
 
-    const emit = (percent: number, stage: string, detail: string) => {
+    const emit = (
+      percent: number,
+      stage: string,
+      detail: string,
+      extra?: Partial<GenerationProgress>,
+    ) => {
       if (shouldAbort()) return;
       onProgress?.({
         active: true,
@@ -4228,50 +4291,130 @@ export class PlanetarySandboxEngine {
         seed: previewSeed,
         radius: previewRadius,
         voxelRadius: previewVoxelRes,
+        waterParticles: this.fluid.activeCount,
+        terrainVertices: this.totalTerrainVertices,
+        ...extra,
       });
     };
 
     try {
-      emit(2, '初始化地形参数场', '构建 3D 连续噪声与陨坑上下文');
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      let lastPreviewRenderMs = 0;
+      const renderGenFrame = (force = false) => {
+        if (!this.renderer || !this.scene || !this.camera || shouldAbort()) return;
+        const now = performance.now();
+        if (!force && now - lastPreviewRenderMs < (this.isSoftware ? 160 : 75)) return;
+        lastPreviewRenderMs = now;
+        this.simTimeSec += 0.04;
+        this.simTimeNode.value = this.simTimeSec;
+        this.titleAngle += 0.055;
+        if (this.genCoreGroup && this.genCoreGroup.visible) {
+          this.genCoreGroup.rotation.y += 0.08;
+          this.genCoreGroup.rotation.x = Math.sin(this.simTimeSec * 0.8) * 0.18;
+        }
+        const camR = Math.max(previewRadius, 4);
+        this.camera.position.set(
+          Math.cos(this.titleAngle) * 2.75 * camR,
+          0.82 * camR,
+          Math.sin(this.titleAngle) * 2.75 * camR,
+        );
+        this.camera.up.set(0, 1, 0);
+        this.camera.lookAt(0, 0, 0);
+        this.updateDynamicShadowFrustum(0, 0, 0, 2.75 * camR);
+        this.renderActiveScene();
+      };
+
+      // Clear previous terrain & activate visual planetary core accretion rig on open 3D canvas
+      this.clearHighResMeshes();
+      for (let i = 0; i < this.chunkMeshes.length; i++) {
+        const m = this.chunkMeshes[i];
+        if (m) {
+          this.scene?.remove(m);
+          m.geometry.dispose();
+          this.chunkMeshes[i] = null;
+        }
+      }
+      this.totalTerrainVertices = 0;
+      this.fluid.clear();
+      this.rebuildWaterMesh();
+      this.updateSplashInstances();
+      this.setPlanetRigVisible(false);
+      if (this.genCoreGroup) {
+        this.genCoreGroup.visible = true;
+        this.genCoreGroup.scale.setScalar(Math.max(previewRadius * 0.34, 0.5));
+      }
+
+      emit(2, '初始化地形参数场', '构建 3D 连续噪声与陨坑上下文', { phaseIndex: 0 });
+      renderGenFrame(true);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       if (shouldAbort()) return false;
 
       const okVoxel = await this.planet.generatePlanetAsync(
         targetSeed,
         (fraction, detail) => {
-          emit(4 + fraction * 36, '合成体素密度场', detail);
+          if (this.genCoreGroup) {
+            this.genCoreGroup.scale.setScalar(previewRadius * (0.34 + fraction * 0.62));
+          }
+          emit(4 + fraction * 36, '合成体素密度场', detail, { phaseIndex: 0 });
+          renderGenFrame();
         },
         shouldAbort,
       );
       if (!okVoxel || shouldAbort()) return false;
 
+      if (this.genCoreGroup) {
+        // Keep glowing planetary core visible beneath emerging crust chunks until surface seals
+        this.genCoreGroup.scale.setScalar(previewRadius * 0.72);
+      }
       this.rebuildChunkCenters();
       this.syncScaleDependentRig();
       this.resetPlayerToSpawn();
+      // Reveal atmosphere shells & incremental terrain emergence live in 3D
+      this.setPlanetRigVisible(true);
 
+      const estNonUniform = Math.max(1, this.planet.nonUniformChunks.reduce((acc, v) => acc + (v > 0 ? 1 : 0), 0));
       const okMesh = await this.rebuildAllChunksAsync((fraction, detail) => {
-        emit(40 + fraction * 28, '提取分块等值面几何', detail);
+        emit(40 + fraction * 28, '提取分块等值面几何', detail, {
+          phaseIndex: 1,
+          builtChunks: Math.round(fraction * estNonUniform),
+          totalChunks: estNonUniform,
+        });
+        renderGenFrame(fraction >= 0.99);
       }, shouldAbort);
       if (!okMesh || shouldAbort()) return false;
 
+      if (this.genCoreGroup) {
+        this.genCoreGroup.visible = false;
+      }
+
+      let lastWaterVisualMs = 0;
       const okFluid = await this.fluid.seedInitialLakesAsync(
         this.planet,
         (fraction, detail) => {
-          emit(68 + fraction * 16, '注水与静水压平衡', detail);
+          const now = performance.now();
+          if (now - lastWaterVisualMs >= 90 || fraction >= 0.99) {
+            this.rebuildWaterMesh();
+            this.updateSplashInstances();
+            lastWaterVisualMs = now;
+            renderGenFrame(fraction >= 0.99);
+          }
+          emit(68 + fraction * 16, '注水与静水压平衡', detail, {
+            phaseIndex: 2,
+          });
         },
         shouldAbort,
       );
       if (!okFluid || shouldAbort()) return false;
 
-      emit(85, '合成地表水体网格', '提取平滑水面与流体粒子');
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      if (shouldAbort()) return false;
-
+      emit(85, '合成地表水体网格', '提取平滑水面与流体粒子', { phaseIndex: 2 });
       this.rebuildWaterMesh();
       this.updateSplashInstances();
+      renderGenFrame(true);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      if (shouldAbort()) return false;
 
       const okHiRes = await this.prewarmHighResAsync((fraction, detail) => {
-        emit(86 + fraction * 13, '构建全视角高分辨率表面', detail);
+        emit(86 + fraction * 13, '构建全视角高分辨率表面', detail, { phaseIndex: 3 });
+        renderGenFrame();
       }, shouldAbort);
       if (!okHiRes || shouldAbort()) return false;
 
@@ -4283,9 +4426,12 @@ export class PlanetarySandboxEngine {
       if (this.renderer) {
         this.emitTelemetrySnapshot();
       }
-      emit(100, '星球生成完毕', '进入行星表面工作区');
+      emit(100, '星球生成完毕', '进入行星表面工作区', { phaseIndex: 3 });
       return true;
     } finally {
+      if (this.genCoreGroup) {
+        this.genCoreGroup.visible = false;
+      }
       if (this.generationToken === token) {
         this.isGenerating = false;
       }
@@ -4410,6 +4556,10 @@ export class PlanetarySandboxEngine {
     return this.planet.getVoxelStats();
   }
 
+  public getEffectiveRenderQuality(): RenderQualityConfig {
+    return { ...this.config.renderQuality };
+  }
+
   public exportSavePayload(id: string, name: string): PlanetSavePayload {
     return {
       id,
@@ -4495,7 +4645,14 @@ export class PlanetarySandboxEngine {
     this.scaleHeightNode.value = Math.max(0.02, atmo.scaleHeightRatio);
     this.greenhouseNode.value = computeGreenhouseBoostC(atmo);
 
-    this.solarRatioNode.value = Math.max(0.0, th.solarIrradiance / 1361.0);
+    this.solarRatioNode.value = Math.max(
+      0.0,
+      (th.solarIrradiance / 1361.0) * this.activeSolarIntensity,
+    );
+    this.solarIntensityNode.value = clamp(this.activeSolarIntensity, 0.05, 4.5);
+    if (this.sunLight && !this.directorTimelineLocked) {
+      this.sunLight.intensity = 3.25 * clamp(this.activeSolarIntensity, 0.05, 4.5);
+    }
     this.coreTempNode.value = th.coreTempC;
     this.lapseRateNode.value = th.lapseRateCPerScale;
 
@@ -4550,7 +4707,7 @@ export class PlanetarySandboxEngine {
     const scale = this.getPlanetScale();
     const visibleCount = Math.min(
       this.CLOUD_PUFF_COUNT,
-      Math.max(0, Math.round(clamp(atmo.cloudCover, 0, 1.3) * 64)),
+      Math.max(0, Math.round(clamp(atmo.cloudCover, 0, 2.0) * 44)),
     );
     this.cloudPuffsMesh.count = visibleCount;
 
@@ -4572,7 +4729,7 @@ export class PlanetarySandboxEngine {
       this._v2.set(dx, dy, dz).normalize();
       this._q1.setFromUnitVectors(upDefault, this._v2);
 
-      const puffScale = clamp(atmo.cloudCover * 0.75 + 0.35, 0.3, 1.35) * scale;
+      const puffScale = clamp(atmo.cloudCover * 0.72 + 0.32, 0.3, 1.85) * scale;
       this._s1.set(c.sx * puffScale, c.sy * puffScale, c.sz * puffScale);
       this._m4.compose(this._v1, this._q1, this._s1);
       this.cloudPuffsMesh.setMatrixAt(i, this._m4);
@@ -4946,9 +5103,20 @@ export class PlanetarySandboxEngine {
       });
     }
 
-    if (partial.renderQuality && this.renderer) {
-      this.applyShadowQualitySettings();
+    if (
+      (partial.renderQuality ||
+        partial.visualFilter !== undefined ||
+        partial.filterIntensity !== undefined ||
+        partial.filterScale !== undefined) &&
+      this.renderer
+    ) {
+      if (partial.renderQuality) {
+        this.applyShadowQualitySettings();
+      }
       this.syncRenderPipeline(this.isOfflineRendering);
+      if (!this.isOfflineRendering && !this.isGenerating) {
+        this.renderActiveScene();
+      }
     }
 
     this.syncEnvironmentUniforms();
@@ -5143,13 +5311,34 @@ export class PlanetarySandboxEngine {
   private syncRenderPipeline(isOffline: boolean, offlineRenderW = 1920): void {
     if (!this.renderer || !this.scene || !this.camera) return;
     const rq = this.config.renderQuality;
+    const effectiveFilter: DirectorVisualFilter =
+      this.activeVisualFilter !== 'none'
+        ? this.activeVisualFilter
+        : (this.config.visualFilter ?? 'none');
+    const effectiveFilterIntensity =
+      this.activeVisualFilter !== 'none'
+        ? this.activeFilterIntensity
+        : clamp(this.config.filterIntensity ?? 0.85, 0, 1);
+    const effectiveFilterScale =
+      this.activeVisualFilter !== 'none'
+        ? this.activeFilterScale
+        : clamp(this.config.filterScale ?? 1.0, 0.25, 3.0);
+
+    const filterMeta = VISUAL_FILTER_META.find((m) => m.id === effectiveFilter);
+    this.postFilterModeNode.value = filterMeta?.modeIndex ?? 0;
+    this.postFilterIntensityNode.value = effectiveFilterIntensity;
+    this.postFilterScaleNode.value = effectiveFilterScale;
+    this.integralDampNode.value = clamp(0.68 + effectiveFilterIntensity * 0.28, 0.55, 0.96);
+
     const hasVol = rq.volumetricFog || rq.atmoScattering || rq.contactShadows;
+    const hasFilter = effectiveFilter !== 'none';
     const hasAnyPost =
       rq.rayTracingMode !== 'off' ||
       rq.aoEnabled ||
       hasVol ||
       rq.bloomEnabled ||
-      this.activePostGradingEnabled;
+      this.activePostGradingEnabled ||
+      hasFilter;
 
     if (!hasAnyPost || this.pipelineFailed) {
       this.disposeRenderPipeline();
@@ -5158,12 +5347,14 @@ export class PlanetarySandboxEngine {
     }
 
     const resScaleCap = isOffline && offlineRenderW > 3840 ? 'hi6k' : isOffline ? 'hi' : 'live';
+    const filterBucket = `flt_${effectiveFilter}`;
     const desiredKey = [
       rq.rayTracingMode,
       rq.aoEnabled ? 'ao1' : 'ao0',
       hasVol ? 'vol1' : 'vol0',
       rq.bloomEnabled ? 'blm1' : 'blm0',
       this.activePostGradingEnabled ? 'pfx1' : 'pfx0',
+      filterBucket,
       resScaleCap,
     ].join('|');
 
@@ -5286,7 +5477,12 @@ export class PlanetarySandboxEngine {
         }
 
         if (rq.rayTracingMode === 'ssr' || rq.rayTracingMode === 'ssgi_ssr') {
-          const ssrPass = ssr(composedNode, scenePassDepth, scenePassNormal.xyz, {
+          const ssrPass = ssr(
+            composedNode,
+            scenePassDepth,
+            scenePassNormal as unknown as THREE.Node<'vec3'>,
+            {
+              metalnessNode: float(0.05),
             roughnessNode: scenePassRoughness.r,
             diffuseNode: scenePassDiffuse,
             binaryRefine: true,
@@ -5325,6 +5521,7 @@ export class PlanetarySandboxEngine {
           atmoScatterEnabledNode: this.atmoScatterEnabledNode,
           volStepsNode: this.volStepsNode,
           contactShadowNode: this.contactShadowNode,
+          solarIntensityNode: this.solarIntensityNode,
         });
       }
 
@@ -5346,6 +5543,29 @@ export class PlanetarySandboxEngine {
           highlightTintNode: this.postHighlightTintNode,
           vignetteNode: this.postVignetteNode,
           filmGrainNode: this.postFilmGrainNode,
+          simTimeNode: this.simTimeNode,
+        });
+      }
+
+      if (effectiveFilter === 'integral') {
+        const aiNode = afterImage(composedNode, this.integralDampNode);
+        this.pipelineDisposables.push(aiNode);
+        composedNode = buildVisualFilterNode({
+          texNode: aiNode.getTextureNode(),
+          filterMode: effectiveFilter,
+          filterModeNode: this.postFilterModeNode,
+          filterIntensityNode: this.postFilterIntensityNode,
+          filterScaleNode: this.postFilterScaleNode,
+          simTimeNode: this.simTimeNode,
+        });
+      } else if (effectiveFilter !== 'none') {
+        const texNode = convertToTexture(composedNode);
+        composedNode = buildVisualFilterNode({
+          texNode,
+          filterMode: effectiveFilter,
+          filterModeNode: this.postFilterModeNode,
+          filterIntensityNode: this.postFilterIntensityNode,
+          filterScaleNode: this.postFilterScaleNode,
           simTimeNode: this.simTimeNode,
         });
       }
@@ -5403,6 +5623,9 @@ export class PlanetarySandboxEngine {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    if (!this.isGenerating) {
+      this.renderActiveScene();
+    }
   };
 
   public getDirectorHardwareCaps(): {
@@ -6561,6 +6784,10 @@ export class PlanetarySandboxEngine {
     this.postFilmGrainNode.value = clamp(pfx.filmGrain, 0.0, 0.35);
     this.activeBloomStrength = clamp(pfx.bloomStrength, 0.0, 1.8);
     this.activeAspectMask = pfx.aspectMask;
+    const prevFilter = this.activeVisualFilter;
+    this.activeVisualFilter = pfx.visualFilter ?? 'none';
+    this.activeFilterIntensity = clamp(pfx.filterIntensity ?? 0.85, 0.0, 1.0);
+    this.activeFilterScale = clamp(pfx.filterScale ?? 1.0, 0.25, 3.0);
     if (this.activeBloomNode) {
       this.activeBloomNode.strength.value = this.activeBloomStrength;
     }
@@ -6573,11 +6800,22 @@ export class PlanetarySandboxEngine {
       pfx.vignette > 0.01 ||
       pfx.filmGrain > 0.005;
 
-    if (rebuildIfNeeded && needsNode !== this.activePostGradingEnabled) {
+    const filterBucketChanged = prevFilter !== this.activeVisualFilter;
+
+    if (rebuildIfNeeded && (needsNode !== this.activePostGradingEnabled || filterBucketChanged)) {
       this.activePostGradingEnabled = needsNode;
       this.syncRenderPipeline(this.isOfflineRendering);
     } else {
       this.activePostGradingEnabled = needsNode;
+      const meta = VISUAL_FILTER_META.find(
+        (m) => m.id === (this.activeVisualFilter !== 'none' ? this.activeVisualFilter : (this.config.visualFilter ?? 'none')),
+      );
+      this.postFilterModeNode.value = meta?.modeIndex ?? 0;
+      this.postFilterIntensityNode.value =
+        this.activeVisualFilter !== 'none' ? this.activeFilterIntensity : clamp(this.config.filterIntensity ?? 0.85, 0, 1);
+      this.postFilterScaleNode.value =
+        this.activeVisualFilter !== 'none' ? this.activeFilterScale : clamp(this.config.filterScale ?? 1.0, 0.25, 3.0);
+      this.integralDampNode.value = clamp(0.68 + this.postFilterIntensityNode.value * 0.28, 0.55, 0.96);
     }
   }
 
@@ -6592,7 +6830,11 @@ export class PlanetarySandboxEngine {
     this.postFilmGrainNode.value = 0.0;
     this.activeBloomStrength = 0.34;
     this.activeAspectMask = 'none';
-    if (this.activePostGradingEnabled) {
+    const hadDirectorFilter = this.activeVisualFilter !== 'none';
+    this.activeVisualFilter = 'none';
+    this.activeFilterIntensity = this.config.filterIntensity ?? 0.85;
+    this.activeFilterScale = this.config.filterScale ?? 1.0;
+    if (this.activePostGradingEnabled || hadDirectorFilter) {
       this.activePostGradingEnabled = false;
       this.syncRenderPipeline(this.isOfflineRendering);
     }
@@ -6796,11 +7038,26 @@ export class PlanetarySandboxEngine {
 
   public setDirectorTimelineLocked(locked: boolean): void {
     this.directorTimelineLocked = locked;
+    if (locked) {
+      this.directorWaterBaseCount = Math.max(
+        this.fluid.activeCount,
+        Math.round(560 * this.planet.seedConfig.waterFill),
+        320,
+      );
+    } else {
+      this.directorWaterBaseCount = null;
+      this.activeSolarIntensity = 1.0;
+      this.solarIntensityNode.value = 1.0;
+      if (this.sunLight) {
+        this.sunLight.intensity = 3.25;
+      }
+      this.syncEnvironmentUniforms();
+    }
   }
 
   /**
-   * Applies full NLE timeline state (Camera, Environment/Sun/Clouds, Post-FX LUTs, optional World Events)
-   * at `timeSec` for live Program Monitor scrubbing & playback.
+   * Applies full NLE timeline state (Camera, Environment/Sun/Clouds, Post-FX LUTs, optional World Events
+   * & per-parameter overrides including solarIntensity & waterVolume) at `timeSec`.
    */
   public applyDirectorTimelineAtTime(
     project: DirectorTimelineProject,
@@ -6818,10 +7075,10 @@ export class PlanetarySandboxEngine {
     pfx: EvaluatedPostFxState;
   } {
     const t = clamp(timeSec, 0, Math.max(0.25, project.durationSec));
-    const pose = evaluateCameraTrackPose(project.cameraTrack, t, anchor);
-    const env = evaluateEnvironmentTrack(project.envTrack, t, {
+    const { pose, env, pfx } = evaluateFullTimelineAtTime(project, anchor, t, {
       sunElevationDeg: this.config.sunElevationDeg,
       sunAzimuthDeg: this.config.sunAzimuthDeg,
+      solarIntensity: this.activeSolarIntensity,
       atmoDensity: this.config.atmosphere.surfacePressureAtm,
       scatterStrength: this.config.atmosphere.rayleighStrength,
       cloudCoverage: this.config.atmosphere.cloudCover,
@@ -6829,11 +7086,15 @@ export class PlanetarySandboxEngine {
       windSpeed: this.config.atmosphere.windSpeed,
       tempOffsetC: this.config.thermal.baseEquilibriumC + 18,
     });
-    const pfx = evaluatePostFxTrack(project.postFxTrack, t);
 
     if (options?.updateEnvironment !== false) {
       this.config.sunElevationDeg = env.sunElevationDeg;
       this.config.sunAzimuthDeg = env.sunAzimuthDeg;
+      this.activeSolarIntensity = clamp(env.solarIntensity, 0.05, 4.5);
+      this.solarIntensityNode.value = this.activeSolarIntensity;
+      if (this.sunLight) {
+        this.sunLight.intensity = 3.25 * this.activeSolarIntensity;
+      }
       this.config.atmosphere = {
         ...this.config.atmosphere,
         surfacePressureAtm: env.atmoDensity,
@@ -6848,6 +7109,25 @@ export class PlanetarySandboxEngine {
       };
       this.updateSunDirection();
       this.syncEnvironmentUniforms();
+
+      if (env.waterVolume !== null) {
+        const baseWater =
+          this.directorWaterBaseCount ??
+          Math.max(480, Math.round(560 * this.planet.seedConfig.waterFill));
+        const targetWater = Math.round(
+          clamp(baseWater * clamp(env.waterVolume, 0, 2.5), 0, MAX_FLUID_PARTICLES),
+        );
+        const waterChanged = this.fluid.setTargetParticleCount(
+          this.planet,
+          targetWater,
+          Math.round(t * 10) + 1,
+        );
+        if (waterChanged) {
+          this.rebuildWaterMesh();
+          this.updateSplashInstances();
+          this.waterMeshDirty = false;
+        }
+      }
     }
 
     if (options?.updatePostFx !== false) {
@@ -6894,6 +7174,10 @@ export class PlanetarySandboxEngine {
     this.camera.far = safeClips.far;
     this.camera.updateProjectionMatrix();
     this.lastHighResFocus.set(pose.streamFocus[0], pose.streamFocus[1], pose.streamFocus[2]);
+
+    if (!this.isOfflineRendering && !this.isGenerating && this.renderer) {
+      this.renderActiveScene();
+    }
 
     return { pose, env, pfx };
   }
@@ -7588,6 +7872,11 @@ export class PlanetarySandboxEngine {
       this.config.sunElevationDeg = savedSunElevation;
       this.config.atmosphere = savedAtmo;
       this.config.thermal = savedThermal;
+      this.activeSolarIntensity = 1.0;
+      this.solarIntensityNode.value = 1.0;
+      if (this.sunLight) {
+        this.sunLight.intensity = 3.25;
+      }
       this.resetDirectorPostGradingUniforms();
 
       this.renderer.setPixelRatio(savedPixelRatio);
@@ -9966,9 +10255,34 @@ export class PlanetarySandboxEngine {
   private scheduleNextFrame(): void {
     if (this.isDisposed) return;
     if (this.isSoftware) {
+      const backendAny = this.renderer?.backend as
+        | { gl?: WebGL2RenderingContext }
+        | undefined;
+      const gl = backendAny?.gl;
+      if (gl && typeof gl.fenceSync === 'function') {
+        const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        gl.flush();
+        const poll = () => {
+          if (this.isDisposed) {
+            if (sync) gl.deleteSync(sync);
+            return;
+          }
+          const state = sync ? gl.getSyncParameter(sync, gl.SYNC_STATUS) : gl.SIGNALED;
+          if (state === gl.UNSIGNALED) {
+            this.timerHandle = window.setTimeout(poll, 6);
+          } else {
+            if (sync) gl.deleteSync(sync);
+            this.timerHandle = window.setTimeout(() => {
+              this.frameHandle = requestAnimationFrame(this.tick);
+            }, 75);
+          }
+        };
+        this.timerHandle = window.setTimeout(poll, 6);
+        return;
+      }
       this.timerHandle = window.setTimeout(() => {
         this.frameHandle = requestAnimationFrame(this.tick);
-      }, 60);
+      }, 80);
     } else {
       this.frameHandle = requestAnimationFrame(this.tick);
     }
@@ -9993,9 +10307,13 @@ export class PlanetarySandboxEngine {
     if (!this.hasWorld || this.isGenerating) {
       this.simTimeSec += dt;
       this.simTimeNode.value = this.simTimeSec;
-      this.titleAngle += dt * 0.08;
+      this.titleAngle += dt * (this.isGenerating ? 0.35 : 0.08);
       if (this.starPoints) {
         this.starPoints.rotation.y = this.titleAngle * 0.12;
+      }
+      if (this.genCoreGroup && this.genCoreGroup.visible) {
+        this.genCoreGroup.rotation.y += dt * 0.65;
+        this.genCoreGroup.rotation.x = Math.sin(this.simTimeSec * 0.8) * 0.18;
       }
       if (this.moonGroup) {
         this.moonGroup.position.x = Math.cos(this.simTimeSec * 0.12) * -36 * scale;

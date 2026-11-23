@@ -200,6 +200,19 @@ import {
   buildVolumetricAtmoCompositeNode,
   buildWaterWaveNormalNode,
 } from './tslVolumetrics';
+import {
+  BifurcationSweepReport,
+  FvmComputeBackendKind,
+  FvmResolutionCells,
+  LagrangianBoundaryState,
+  MetabolismDemoMode,
+  MetabolismSimRunner,
+  MetabolismSummarySnapshot,
+  MetabolismVisualChannel,
+  MicroCalibrationRecord,
+  PlanetaryFeedbackConfig,
+  sampleFvmRenderColor,
+} from './metabolism';
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -287,6 +300,7 @@ export interface SandboxTelemetry {
   hoveredCoord: CoordReadout | null;
   hoveredWorldPos: [number, number, number] | null;
   hoveredAttitude: GeologicalAttitude | null;
+  metabolismSummary?: MetabolismSummarySnapshot;
 }
 
 export interface SandboxConfig {
@@ -322,6 +336,8 @@ export interface SandboxConfig {
   visualFilter?: DirectorVisualFilter;
   filterIntensity?: number;
   filterScale?: number;
+  metabolismChannel?: MetabolismVisualChannel;
+  showCouplingZones?: boolean;
 }
 
 function detectSoftwareRenderer(): boolean {
@@ -352,6 +368,7 @@ export class PlanetarySandboxEngine {
   public readonly planet: VoxelPlanet;
   public readonly fluid: FluidSim;
   public readonly sound: SoundEngine;
+  public readonly metabolism = new MetabolismSimRunner('open_autocatalytic');
 
   private renderer!: THREE.WebGPURenderer;
   private scene!: THREE.Scene;
@@ -381,7 +398,7 @@ export class PlanetarySandboxEngine {
   private planetRadiusNode = uniform(DEFAULT_PLANET_RADIUS);
   private isBlockyNode = uniform(0.0);
   private voxelEdgesNode = uniform(1.0);
-  private overlayModeNode = uniform(0.0); // 0=material, 1=temperature, 2=density, 3=lod
+  private overlayModeNode = uniform(0.0); // 0=material, 1=temperature, 2=density, 3=metabolism
   private atmoEnabledNode = uniform(1.0);
   private atmoDensityNode = uniform(1.0);
   private rayleighNode = uniform(1.0);
@@ -402,6 +419,13 @@ export class PlanetarySandboxEngine {
   private contactShadowNode = uniform(0.0);
   private bloomEnabledNode = uniform(1.0);
   private legacyAtmoShellScaleNode = uniform(1.0);
+  private gpuFvmActiveNode = uniform(0.0);
+  private gpuFvmChannelNode = uniform(0.0);
+  private metabHotspotPos0 = uniform(new THREE.Vector4(0, 0, 0, 1));
+  private metabHotspotPos1 = uniform(new THREE.Vector4(0, 0, 0, 1));
+  private metabHotspotPos2 = uniform(new THREE.Vector4(0, 0, 0, 1));
+  private metabHotspotPos3 = uniform(new THREE.Vector4(0, 0, 0, 1));
+  private metabHotspotDeltaC = uniform(new THREE.Vector4(0, 0, 0, 0));
 
   // Director NLE Color Grading & Film Finishing uniforms
   private solarIntensityNode = uniform(1.0);
@@ -489,6 +513,17 @@ export class PlanetarySandboxEngine {
   private chunkBoundsPos = new Float32Array(343 * 24 * 3);
   private chunkBoundsCol = new Float32Array(343 * 24 * 3);
   private chunkBoundsDirty = true;
+
+  // Read-only 《Metabolism》 Eulerian Field & PIC Coupling Zone AABB Overlays
+  private metabolismFieldPoints: THREE.Points | null = null;
+  private metabolismPointsPos = new Float32Array(13824 * 3);
+  private metabolismPointsCol = new Float32Array(13824 * 3);
+  private couplingZoneLines: THREE.LineSegments | null = null;
+  private couplingZonePos = new Float32Array(12 * 24 * 3);
+  private lastMetabolismVisualRevision = -1;
+  private lastMetabolismVisualOverlay: TerrainOverlayMode = 'material';
+  private lastMetabolismVisualChannel: MetabolismVisualChannel = 'species';
+  private readonly _metabRgb: [number, number, number] = [0, 0, 0];
 
   // Fluid rendering
   private waterMesh!: THREE.Mesh;
@@ -817,6 +852,8 @@ export class PlanetarySandboxEngine {
     visualFilter: 'none',
     filterIntensity: 0.85,
     filterScale: 1.0,
+    metabolismChannel: 'species',
+    showCouplingZones: false,
   };
 
   private lastTime = 0;
@@ -872,6 +909,9 @@ export class PlanetarySandboxEngine {
     this.sound.setMuted(this.config.muted);
 
     this.rebuildChunkCenters();
+    if (this.hasWorld) {
+      this.bindMetabolismToCurrentPlanet();
+    }
   }
 
   private getPlanetScale(): number {
@@ -1049,10 +1089,21 @@ export class PlanetarySandboxEngine {
     this.setupLighting();
     this.setupSpaceBackdrop();
     this.setupGenerationCoreRig();
+
+    // Auto-select WebGPU Compute (64^3 = 262k voxels) when hardware WebGPU is active; deterministic CPU fallback otherwise
+    const webGpuOk = this.backendDiagnostic.backend === 'WebGPU' && !this.isSoftware && !this.backendDiagnostic.isSoftwareRenderer;
+    this.metabolism.configureComputeBackend(
+      webGpuOk,
+      webGpuOk ? 64 : 24,
+      webGpuOk ? 'webgpu' : 'cpu',
+      this.renderer,
+    );
+
     this.setupMaterials();
     this.highResGroup = new THREE.Group();
     this.scene.add(this.highResGroup);
     this.setupChunkBoundsOverlay();
+    this.setupMetabolismOverlays();
     this.setupCoordGridOverlay();
     this.setupSurveyOverlayGroup();
     this.setupDirectorGizmoGroup();
@@ -1552,7 +1603,28 @@ export class PlanetarySandboxEngine {
       const altCool = max(0.0, altRatio).div(max(scaleHeightNode, 0.02)).mul(lapseRateNode);
       const coreDepth = tslClamp(float(0.98).sub(r.div(safeR0)).div(0.98), 0.0, 1.0);
       const geoHeat = pow(coreDepth, float(1.65)).mul(coreTempNode);
-      const tempC = float(-18.0).add(solarHeat).add(greenhouseNode).sub(min(float(95.0), altCool)).add(geoHeat);
+
+      // Bidirectional exothermic/endothermic reaction hotspot coupling in 3D thermal overlay
+      const h0D = length(p.sub(this.metabHotspotPos0.xyz));
+      const h0W = float(1.0).sub(smoothstep(0.0, max(this.metabHotspotPos0.w, 0.1), h0D));
+      const h1D = length(p.sub(this.metabHotspotPos1.xyz));
+      const h1W = float(1.0).sub(smoothstep(0.0, max(this.metabHotspotPos1.w, 0.1), h1D));
+      const h2D = length(p.sub(this.metabHotspotPos2.xyz));
+      const h2W = float(1.0).sub(smoothstep(0.0, max(this.metabHotspotPos2.w, 0.1), h2D));
+      const h3D = length(p.sub(this.metabHotspotPos3.xyz));
+      const h3W = float(1.0).sub(smoothstep(0.0, max(this.metabHotspotPos3.w, 0.1), h3D));
+      const metabHeatC = h0W
+        .mul(this.metabHotspotDeltaC.x)
+        .add(h1W.mul(this.metabHotspotDeltaC.y))
+        .add(h2W.mul(this.metabHotspotDeltaC.z))
+        .add(h3W.mul(this.metabHotspotDeltaC.w));
+
+      const tempC = float(-18.0)
+        .add(solarHeat)
+        .add(greenhouseNode)
+        .sub(min(float(95.0), altCool))
+        .add(geoHeat)
+        .add(metabHeatC);
 
       // Calibrated Coolwarm / Geothermal color ramp (-70°C .. +900°C)
       const cCold = color(0x2840b8);
@@ -1573,6 +1645,12 @@ export class PlanetarySandboxEngine {
       const isoLine = float(1.0).sub(smoothstep(0.0, 0.07, band)).mul(0.25);
       return col.add(vec3(isoLine)).saturate();
     });
+
+    // Zero-readback GPU Compute FVM StorageBuffer direct color sampler (only bound when WebGPU Compute solver exists)
+    const gpuSamplerNode =
+      this.metabolism.gpuSolver && this.backendDiagnostic.backend === 'WebGPU'
+        ? this.metabolism.gpuSolver.buildTerrainColorSampleFn(positionWorld, this.gpuFvmChannelNode)
+        : null;
 
     mat.colorNode = Fn(() => {
       const p = positionWorld;
@@ -1608,12 +1686,18 @@ export class PlanetarySandboxEngine {
       const materialStyled = mix(smoothCol, blockyCol, isBlockyNode);
       const subVoxelPbrStyled = pbrBundle.applyAlbedoPbr(materialStyled.rgb);
 
-      // Thermal & Strata Density Overlays
+      // Thermal, Strata Density & Read-Only Metabolism Field Overlays
       const thermalCol = computeThermalColor();
       const isThermal = smoothstep(0.5, 1.0, overlayModeNode).mul(
         float(1.0).sub(smoothstep(1.5, 2.0, overlayModeNode)),
       );
-      const isDensity = smoothstep(1.5, 2.0, overlayModeNode);
+      const isDensity = smoothstep(1.5, 2.0, overlayModeNode).mul(
+        float(1.0).sub(smoothstep(2.5, 3.0, overlayModeNode)),
+      );
+      const isMetabolism = smoothstep(2.5, 3.0, overlayModeNode);
+      const metabDirectCol = gpuSamplerNode
+        ? mix(base.rgb, gpuSamplerNode, this.gpuFvmActiveNode)
+        : base.rgb;
 
       const rRatio = radialDist.div(max(planetRadiusNode, 0.05));
       const ringBand = fract(rRatio.mul(10.0));
@@ -1624,6 +1708,7 @@ export class PlanetarySandboxEngine {
 
       let outCol = mix(subVoxelPbrStyled, thermalCol, isThermal);
       outCol = mix(outCol, densityCol, isDensity);
+      outCol = mix(outCol, metabDirectCol, isMetabolism);
       return outCol.saturate();
     })();
 
@@ -1641,7 +1726,13 @@ export class PlanetarySandboxEngine {
       const isThermal = smoothstep(0.5, 1.0, overlayModeNode).mul(
         float(1.0).sub(smoothstep(1.5, 2.0, overlayModeNode)),
       );
-      return mix(crystalGlow, computeThermalColor().mul(0.32), isThermal);
+      const isMetabolism = smoothstep(2.5, 3.0, overlayModeNode);
+      const metabEmCol = gpuSamplerNode
+        ? mix(vertexColor().rgb, gpuSamplerNode, this.gpuFvmActiveNode)
+        : vertexColor().rgb;
+      let em = mix(crystalGlow, computeThermalColor().mul(0.32), isThermal);
+      em = mix(em, metabEmCol.mul(0.3), isMetabolism);
+      return em;
     })();
 
     return mat;
@@ -1714,6 +1805,430 @@ export class PlanetarySandboxEngine {
     this.chunkBoundsLines.frustumCulled = false;
     this.chunkBoundsLines.visible = this.config.showChunkBounds;
     this.scene.add(this.chunkBoundsLines);
+  }
+
+  private setupMetabolismOverlays(): void {
+    // 1. Read-only Volumetric Field Point Cloud consuming FvmRenderFieldView
+    const pGeo = new THREE.BufferGeometry();
+    pGeo.setAttribute('position', new THREE.BufferAttribute(this.metabolismPointsPos, 3));
+    pGeo.setAttribute('color', new THREE.BufferAttribute(this.metabolismPointsCol, 3));
+    pGeo.setDrawRange(0, 0);
+    const pMat = new THREE.PointsNodeMaterial();
+    pMat.vertexColors = true;
+    pMat.sizeNode = float(3.4);
+    pMat.colorNode = vertexColor();
+    pMat.opacityNode = float(0.68);
+    pMat.transparent = true;
+    pMat.depthWrite = false;
+    this.metabolismFieldPoints = new THREE.Points(pGeo, pMat);
+    this.metabolismFieldPoints.frustumCulled = false;
+    this.metabolismFieldPoints.visible = false;
+    this.scene.add(this.metabolismFieldPoints);
+
+    // 2. PIC Lagrangian Coupling Zone AABB Wireframe Gizmo
+    const zGeo = new THREE.BufferGeometry();
+    zGeo.setAttribute('position', new THREE.BufferAttribute(this.couplingZonePos, 3));
+    zGeo.setDrawRange(0, 0);
+    const zMat = new THREE.LineBasicNodeMaterial();
+    zMat.colorNode = color(0x22d3ee);
+    zMat.opacityNode = float(0.88);
+    zMat.transparent = true;
+    this.couplingZoneLines = new THREE.LineSegments(zGeo, zMat);
+    this.couplingZoneLines.frustumCulled = false;
+    this.couplingZoneLines.visible = false;
+    this.scene.add(this.couplingZoneLines);
+
+    this.syncCouplingZoneLines();
+  }
+
+  private bindMetabolismToCurrentPlanet(): void {
+    const sunArr: [number, number, number] = [
+      this.sunDirUniform.x,
+      this.sunDirUniform.y,
+      this.sunDirUniform.z,
+    ];
+    this.metabolism.bindToPlanet(
+      this.planet,
+      sunArr,
+      this.config.atmosphere,
+      this.config.thermal,
+    );
+    // Attach the active EulerianFvmGrid onto VoxelPlanet so Chunk/Vox probes read live FVM state
+    this.planet.fvmGrid = this.metabolism.grid;
+    if (this.metabolism.computeBackend === 'webgpu' && this.metabolism.gpuSolver) {
+      this.rebuildTerrainMaterialBindings();
+    }
+    this.lastMetabolismVisualRevision = -1;
+    this.syncCouplingZoneLines();
+    this.syncMetabolismReadOnlyVisuals(true);
+  }
+
+  private syncCouplingZoneLines(): void {
+    if (!this.couplingZoneLines) return;
+    const zones = this.metabolism.couplingRegistry.listZones();
+    const show = Boolean(this.config.showCouplingZones) && this.hasWorld && zones.length > 0;
+    this.couplingZoneLines.visible = show;
+    if (!show) return;
+
+    let v = 0;
+    const maxBoxes = Math.min(zones.length, 12);
+    for (let zIdx = 0; zIdx < maxBoxes; zIdx++) {
+      const z = zones[zIdx];
+      const [x0, y0, z0] = z.aabbMin;
+      const [x1, y1, z1] = z.aabbMax;
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const dz = z1 - z0;
+      for (const e of BOX_EDGES) {
+        this.couplingZonePos[v * 3] = x0 + e[0] * dx;
+        this.couplingZonePos[v * 3 + 1] = y0 + e[1] * dy;
+        this.couplingZonePos[v * 3 + 2] = z0 + e[2] * dz;
+        v++;
+        this.couplingZonePos[v * 3] = x0 + e[3] * dx;
+        this.couplingZonePos[v * 3 + 1] = y0 + e[4] * dy;
+        this.couplingZonePos[v * 3 + 2] = z0 + e[5] * dz;
+        v++;
+      }
+    }
+    const posAttr = this.couplingZoneLines.geometry.getAttribute('position') as THREE.BufferAttribute;
+    posAttr.needsUpdate = true;
+    this.couplingZoneLines.geometry.setDrawRange(0, v);
+  }
+
+  private applyFvmColorsToMesh(
+    mesh: THREE.Mesh,
+    paintMetabolism: boolean,
+    channel: MetabolismVisualChannel,
+  ): void {
+    const posAttr = mesh.geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+    const colAttr = mesh.geometry.getAttribute('color') as THREE.BufferAttribute | undefined;
+    if (!posAttr || !colAttr) return;
+
+    const colArr = colAttr.array as Float32Array;
+    if (!mesh.userData.baseColors || (mesh.userData.baseColors as Float32Array).length !== colArr.length) {
+      mesh.userData.baseColors = new Float32Array(colArr);
+    }
+
+    if (!paintMetabolism) {
+      const base = mesh.userData.baseColors as Float32Array;
+      colArr.set(base);
+      colAttr.needsUpdate = true;
+      return;
+    }
+
+    const view = this.metabolism.getReadOnlyRenderView();
+    const posArr = posAttr.array as Float32Array;
+    const ox = mesh.position.x;
+    const oy = mesh.position.y;
+    const oz = mesh.position.z;
+    const count = posAttr.count;
+    const rgb = this._metabRgb;
+
+    for (let i = 0; i < count; i++) {
+      const wx = posArr[i * 3] + ox;
+      const wy = posArr[i * 3 + 1] + oy;
+      const wz = posArr[i * 3 + 2] + oz;
+      if (sampleFvmRenderColor(view, wx, wy, wz, channel, rgb)) {
+        colArr[i * 3] = rgb[0];
+        colArr[i * 3 + 1] = rgb[1];
+        colArr[i * 3 + 2] = rgb[2];
+      } else {
+        colArr[i * 3] = 0.14;
+        colArr[i * 3 + 1] = 0.18;
+        colArr[i * 3 + 2] = 0.24;
+      }
+    }
+    colAttr.needsUpdate = true;
+  }
+
+  /**
+   * Decoupled Read-Only Field Visualization Sync:
+   * Consumes FvmRenderFieldView snapshots strictly read-only to color terrain meshes
+   * and the volumetric atmosphere/reaction point field without blocking simulation.
+   */
+  private syncMetabolismReadOnlyVisuals(force = false): void {
+    if (!this.scene || !this.hasWorld) return;
+    const overlay = this.config.terrainOverlay;
+    const channel: MetabolismVisualChannel = this.config.metabolismChannel ?? 'species';
+    const isMetab = overlay === 'metabolism';
+    const gpuActive = this.metabolism.computeBackend === 'webgpu' && this.metabolism.gpuSolver !== null;
+    const snap = this.metabolism.getSummarySnapshot();
+    const curRev = snap.renderRevision;
+
+    this.gpuFvmActiveNode.value = gpuActive ? 1.0 : 0.0;
+    this.gpuFvmChannelNode.value =
+      channel === 'species' ? 0.0 : channel === 'energy' ? 1.0 : channel === 'phase' ? 2.0 : 3.0;
+
+    const modeChanged =
+      overlay !== this.lastMetabolismVisualOverlay ||
+      channel !== this.lastMetabolismVisualChannel;
+    const revChanged = curRev !== this.lastMetabolismVisualRevision;
+
+    if (!force && !modeChanged && (!isMetab || !revChanged)) {
+      return;
+    }
+
+    // In WebGPU Compute mode, terrain shaders read StorageBuffers directly with zero CPU readback!
+    // In CPU fallback mode, paint read-only vertex colors onto macro & high-res meshes.
+    if (!gpuActive && (isMetab || this.lastMetabolismVisualOverlay === 'metabolism')) {
+      for (const m of this.chunkMeshes) {
+        if (m) {
+          this.applyFvmColorsToMesh(m, isMetab, channel);
+        }
+      }
+      for (const m of this.highResMeshes.values()) {
+        this.applyFvmColorsToMesh(m, isMetab, channel);
+      }
+    } else if (gpuActive && this.lastMetabolismVisualOverlay === 'metabolism' && !isMetab) {
+      for (const m of this.chunkMeshes) {
+        if (m) this.applyFvmColorsToMesh(m, false, channel);
+      }
+      for (const m of this.highResMeshes.values()) {
+        this.applyFvmColorsToMesh(m, false, channel);
+      }
+    }
+
+    const view = this.metabolism.getReadOnlyRenderView();
+    if (this.metabolismFieldPoints) {
+      // Keep atmospheric plume points visible in CPU mode; in GPU mode, 3D GPU shader covers full surface directly
+      this.metabolismFieldPoints.visible = isMetab && !gpuActive;
+      if (isMetab && !gpuActive) {
+        const n = view.cellsPerAxis;
+        const r0 = this.planet.baseRadius;
+        const rgb = this._metabRgb;
+        let ptCount = 0;
+        const maxPts = Math.floor(this.metabolismPointsPos.length / 3);
+        const stride = n > 24 ? 2 : 1;
+
+        for (let iz = 0; iz < n; iz += stride) {
+          for (let iy = 0; iy < n; iy += stride) {
+            for (let ix = 0; ix < n; ix += stride) {
+              if (ptCount >= maxPts) break;
+              const idx = ix + iy * n + iz * n * n;
+              if (view.activeMask[idx] === 0) continue;
+              const wx = -view.worldHalf + (ix + 0.5) * view.voxelSize;
+              const wy = -view.worldHalf + (iy + 0.5) * view.voxelSize;
+              const wz = -view.worldHalf + (iz + 0.5) * view.voxelSize;
+              const r = Math.hypot(wx, wy, wz);
+              if (r < r0 * 0.96 || r > r0 * 1.2) continue;
+
+              sampleFvmRenderColor(view, wx, wy, wz, channel, rgb);
+              this.metabolismPointsPos[ptCount * 3] = wx;
+              this.metabolismPointsPos[ptCount * 3 + 1] = wy;
+              this.metabolismPointsPos[ptCount * 3 + 2] = wz;
+              this.metabolismPointsCol[ptCount * 3] = rgb[0];
+              this.metabolismPointsCol[ptCount * 3 + 1] = rgb[1];
+              this.metabolismPointsCol[ptCount * 3 + 2] = rgb[2];
+              ptCount++;
+            }
+          }
+        }
+        const pAttr = this.metabolismFieldPoints.geometry.getAttribute('position') as THREE.BufferAttribute;
+        const cAttr = this.metabolismFieldPoints.geometry.getAttribute('color') as THREE.BufferAttribute;
+        pAttr.needsUpdate = true;
+        cAttr.needsUpdate = true;
+        this.metabolismFieldPoints.geometry.setDrawRange(0, ptCount);
+      }
+    }
+
+    this.lastMetabolismVisualRevision = curRev;
+    this.lastMetabolismVisualOverlay = overlay;
+    this.lastMetabolismVisualChannel = channel;
+  }
+
+  private rebuildTerrainMaterialBindings(): void {
+    if (!this.renderer || !this.hasWorld) return;
+    const oldMat = this.terrainMaterial;
+    this.terrainMaterial = this.createTerrainMaterial();
+    this.highResGlobeMaterial = this.terrainMaterial;
+    this.highResHemiMaterial = this.terrainMaterial;
+    this.highResMidOuterMaterial = this.terrainMaterial;
+    this.highResMidMaterial = this.terrainMaterial;
+    this.highResNativeMaterial = this.terrainMaterial;
+    for (const m of this.chunkMeshes) {
+      if (m) m.material = this.terrainMaterial;
+    }
+    for (const m of this.highResMeshes.values()) {
+      m.material = this.terrainMaterial;
+    }
+    oldMat?.dispose();
+  }
+
+  private applyMetabolismThermalHotspots(metabHotspots: ThermalHotspot[]): void {
+    // Replace only 'metabolism'-tagged persistent hotspots while preserving brush/meteor/volcano event hotspots
+    for (let i = this.thermalHotspots.length - 1; i >= 0; i--) {
+      if (this.thermalHotspots[i].source === 'metabolism') {
+        this.thermalHotspots.splice(i, 1);
+      }
+    }
+    for (const h of metabHotspots) {
+      if (this.thermalHotspots.length >= 24) {
+        const idx = this.thermalHotspots.findIndex((item) => item.source !== 'metabolism');
+        if (idx >= 0) this.thermalHotspots.splice(idx, 1);
+        else break;
+      }
+      this.thermalHotspots.push(h);
+    }
+
+    // Update GPU shader hotspot uniforms (top 4 hotspots) so 3D thermal overlay reflects reaction exotherms live
+    const posUniforms = [
+      this.metabHotspotPos0,
+      this.metabHotspotPos1,
+      this.metabHotspotPos2,
+      this.metabHotspotPos3,
+    ];
+    const deltas = [0, 0, 0, 0];
+    for (let i = 0; i < 4; i++) {
+      const h = metabHotspots[i];
+      if (h) {
+        posUniforms[i].value.set(h.x, h.y, h.z, Math.max(0.1, h.radius));
+        deltas[i] = h.deltaC;
+      } else {
+        posUniforms[i].value.set(0, 0, 0, 1);
+        deltas[i] = 0;
+      }
+    }
+    this.metabHotspotDeltaC.value.set(deltas[0], deltas[1], deltas[2], deltas[3]);
+  }
+
+  private applyMetabolismMineralOp(op: {
+    wx: number;
+    wy: number;
+    wz: number;
+    radius: number;
+    mode: 'paint' | 'build' | 'carve';
+    strength: number;
+    material: MaterialId;
+  }): void {
+    this.planet.applyBrush(
+      op.wx,
+      op.wy,
+      op.wz,
+      op.mode,
+      op.radius,
+      op.strength,
+      op.material,
+      { rimMaterial: op.material },
+    );
+    this.updateChunksWithLod(12);
+    this.waterMeshDirty = true;
+  }
+
+  public getMetabolismSnapshot(): MetabolismSummarySnapshot {
+    return this.metabolism.getSummarySnapshot();
+  }
+
+  public setMetabolismMode(mode: MetabolismDemoMode): void {
+    this.metabolism.resetDemo(mode);
+    this.planet.fvmGrid = this.metabolism.grid;
+    this.applyMetabolismThermalHotspots([]);
+    this.syncCouplingZoneLines();
+    this.syncMetabolismReadOnlyVisuals(true);
+    this.emitTelemetrySnapshot();
+  }
+
+  public setMetabolismBackend(
+    cellsPerAxis: FvmResolutionCells,
+    backend: FvmComputeBackendKind,
+  ): void {
+    const webGpuOk =
+      this.backendDiagnostic.backend === 'WebGPU' &&
+      !this.isSoftware &&
+      !this.backendDiagnostic.isSoftwareRenderer;
+    const { changedShaderBinding } = this.metabolism.configureComputeBackend(
+      webGpuOk,
+      cellsPerAxis,
+      backend,
+      this.renderer,
+    );
+    if (changedShaderBinding) {
+      this.rebuildTerrainMaterialBindings();
+    }
+    this.syncMetabolismReadOnlyVisuals(true);
+    this.emitTelemetrySnapshot();
+  }
+
+  public setMetabolismRunning(running: boolean): void {
+    this.metabolism.running = running;
+    this.emitTelemetrySnapshot();
+  }
+
+  public stepMetabolismOnce(): void {
+    this.metabolism.stepOnce(this.metabolism.fixedDtSec);
+    this.syncMetabolismReadOnlyVisuals(true);
+    this.emitTelemetrySnapshot();
+  }
+
+  public setMetabolismParams(params: {
+    feedRatePerSec?: number;
+    exhaustRatePerSec?: number;
+    ambientTempK?: number;
+    timeScale?: number;
+  }): void {
+    if (params.feedRatePerSec !== undefined) {
+      this.metabolism.grid.feedRatePerSec = Math.max(0, params.feedRatePerSec);
+    }
+    if (params.exhaustRatePerSec !== undefined) {
+      this.metabolism.grid.exhaustRatePerSec = Math.max(0, params.exhaustRatePerSec);
+    }
+    if (params.ambientTempK !== undefined) {
+      const targetT = clamp(params.ambientTempK, 140, 2200);
+      this.metabolism.grid.ambientTempK = targetT;
+      this.metabolism.grid.temperatureK.fill(targetT);
+      this.metabolism.grid.syncInternalEnergyFromTemp();
+      this.metabolism.grid.revision++;
+      this.metabolism.grid.publishRenderSnapshot();
+    }
+    if (params.timeScale !== undefined) {
+      this.metabolism.timeScale = clamp(params.timeScale, 0.1, 8.0);
+    }
+    this.syncMetabolismReadOnlyVisuals(true);
+    this.emitTelemetrySnapshot();
+  }
+
+  public setMetabolismAutoCalibrate(enabled: boolean): void {
+    this.metabolism.autoCalibrateEnabled = enabled;
+    this.emitTelemetrySnapshot();
+  }
+
+  public setMetabolismFeedbackConfig(partial: Partial<PlanetaryFeedbackConfig>): void {
+    this.metabolism.feedbackConfig = {
+      ...this.metabolism.feedbackConfig,
+      ...partial,
+    };
+    if (!this.metabolism.feedbackConfig.thermalFeedbackEnabled) {
+      this.applyMetabolismThermalHotspots([]);
+    }
+    this.emitTelemetrySnapshot();
+  }
+
+  public runMetabolismMicroCalibration(zoneId?: string): MicroCalibrationRecord | null {
+    const rec = this.metabolism.runMicroCalibration(zoneId);
+    this.syncMetabolismReadOnlyVisuals(true);
+    this.emitTelemetrySnapshot();
+    return rec;
+  }
+
+  public injectMetabolismPerturbation(
+    speciesIndex = 1,
+    amountMolM3 = 1.6,
+  ): void {
+    const r0 = this.planet.baseRadius;
+    this.metabolism.injectPerturbation(0, r0 * 0.96, 0, speciesIndex, amountMolM3);
+    this.syncMetabolismReadOnlyVisuals(true);
+    this.emitTelemetrySnapshot();
+  }
+
+  public runMetabolismBifurcationSweep(): BifurcationSweepReport {
+    const report = this.metabolism.runAutocatalyticBifurcationSweep();
+    this.emitTelemetrySnapshot();
+    return report;
+  }
+
+  public testMetabolismPicHook(zoneId?: string): LagrangianBoundaryState | null {
+    const res = this.metabolism.testPicCouplingInterface(zoneId);
+    this.emitTelemetrySnapshot();
+    return res;
   }
 
   private setupCoordGridOverlay(): void {
@@ -2439,11 +2954,18 @@ export class PlanetarySandboxEngine {
         existing.material = targetMat;
         existing.position.set(ox, oy, oz);
         existing.castShadow = shouldCastShadow;
+        existing.userData.baseColors = undefined;
+        if (this.config.terrainOverlay === 'metabolism') {
+          this.applyFvmColorsToMesh(existing, true, this.config.metabolismChannel ?? 'species');
+        }
       } else {
         const mesh = new THREE.Mesh(geo, targetMat);
         mesh.position.set(ox, oy, oz);
         mesh.castShadow = shouldCastShadow;
         mesh.receiveShadow = true;
+        if (this.config.terrainOverlay === 'metabolism') {
+          this.applyFvmColorsToMesh(mesh, true, this.config.metabolismChannel ?? 'species');
+        }
         this.highResGroup.add(mesh);
         this.highResMeshes.set(item.key, mesh);
       }
@@ -2505,6 +3027,8 @@ export class PlanetarySandboxEngine {
       if (this.detailReticleRing) this.detailReticleRing.visible = false;
       if (this.tractorBeamGroup) this.tractorBeamGroup.visible = false;
       if (this.tractorStretchLine) this.tractorStretchLine.visible = false;
+      if (this.metabolismFieldPoints) this.metabolismFieldPoints.visible = false;
+      if (this.couplingZoneLines) this.couplingZoneLines.visible = false;
     }
   }
 
@@ -2596,10 +3120,17 @@ export class PlanetarySandboxEngine {
         if (existing) {
           existing.geometry.dispose();
           existing.geometry = geo;
+          existing.userData.baseColors = undefined;
+          if (this.config.terrainOverlay === 'metabolism') {
+            this.applyFvmColorsToMesh(existing, true, this.config.metabolismChannel ?? 'species');
+          }
         } else {
           const mesh = new THREE.Mesh(geo, this.terrainMaterial);
           mesh.castShadow = true;
           mesh.receiveShadow = true;
+          if (this.config.terrainOverlay === 'metabolism') {
+            this.applyFvmColorsToMesh(mesh, true, this.config.metabolismChannel ?? 'species');
+          }
           this.scene.add(mesh);
           this.chunkMeshes[ci] = mesh;
         }
@@ -4419,6 +4950,7 @@ export class PlanetarySandboxEngine {
       if (!okHiRes || shouldAbort()) return false;
 
       this.refreshGravityVisualizer();
+      this.bindMetabolismToCurrentPlanet();
 
       this.hasWorld = true;
       this.setPlanetRigVisible(true);
@@ -4504,6 +5036,7 @@ export class PlanetarySandboxEngine {
         sunAzimuthDeg: payload.sunAzimuthDeg ?? this.config.sunAzimuthDeg,
       });
       this.refreshGravityVisualizer();
+      this.bindMetabolismToCurrentPlanet();
       this.hasWorld = true;
       this.setPlanetRigVisible(true);
       this.telemetryTimer = 1;
@@ -4533,6 +5066,7 @@ export class PlanetarySandboxEngine {
     this.rebuildWaterMesh();
     this.updateSplashInstances();
     this.refreshGravityVisualizer();
+    this.bindMetabolismToCurrentPlanet();
     this.hasWorld = true;
     this.setPlanetRigVisible(true);
     this.telemetryTimer = 1;
@@ -4602,6 +5136,7 @@ export class PlanetarySandboxEngine {
       sunAzimuthDeg: payload.sunAzimuthDeg ?? this.config.sunAzimuthDeg,
     });
     this.refreshGravityVisualizer();
+    this.bindMetabolismToCurrentPlanet();
     this.hasWorld = true;
     this.setPlanetRigVisible(true);
     this.telemetryTimer = 1;
@@ -4634,7 +5169,9 @@ export class PlanetarySandboxEngine {
         ? 1.0
         : this.config.terrainOverlay === 'density'
           ? 2.0
-          : 0.0;
+          : this.config.terrainOverlay === 'metabolism'
+            ? 3.0
+            : 0.0;
 
     this.atmoEnabledNode.value = atmo.enabled ? 1.0 : 0.0;
     this.atmoDensityNode.value = atmo.surfacePressureAtm;
@@ -5120,6 +5657,8 @@ export class PlanetarySandboxEngine {
     }
 
     this.syncEnvironmentUniforms();
+    this.syncCouplingZoneLines();
+    this.syncMetabolismReadOnlyVisuals(false);
 
     if (this.config.terrainRenderMode !== prevRenderMode && this.scene) {
       this.rebuildAllChunks();
@@ -9074,6 +9613,7 @@ export class PlanetarySandboxEngine {
       this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * (isNuke ? 2.8 : 2.1), true, isNuke);
       this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
       this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.6, attrs.thermalDeltaC, 55);
+      this.metabolism.syncLocalTerrainPorosity(hit.x, hit.y, hit.z, effRad, this.planet);
       this.updateChunksWithLod(56);
       this.updateHighResStreaming(hit, 64);
       this.waterMeshDirty = true;
@@ -9104,6 +9644,7 @@ export class PlanetarySandboxEngine {
         !isMagma,
       );
       this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.0, attrs.thermalDeltaC, 50);
+      this.metabolism.syncLocalTerrainPorosity(hit.x, hit.y, hit.z, effRad, this.planet);
       this.updateChunksWithLod(36);
       this.updateHighResStreaming(hit, 48);
       this.waterMeshDirty = true;
@@ -9121,6 +9662,7 @@ export class PlanetarySandboxEngine {
       this.spawnShockwave(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, effRad * 1.9, false, false);
       this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
       this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.0, attrs.thermalDeltaC, 110);
+      this.metabolism.syncLocalTerrainPorosity(hit.x, hit.y, hit.z, effRad, this.planet);
       this.updateChunksWithLod(42);
       this.updateHighResStreaming(hit, 48);
       this.sound.playLightning();
@@ -9266,6 +9808,7 @@ export class PlanetarySandboxEngine {
       );
       this.spawnDebrisBurst(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, attrs.debrisCount);
       this.addThermalHotspot(hit.x, hit.y, hit.z, effRad * 2.2, attrs.thermalDeltaC, 35);
+      this.metabolism.syncLocalTerrainPorosity(hit.x, hit.y, hit.z, effRad, this.planet);
       this.updateChunksWithLod(52);
       this.updateHighResStreaming(hit, 56);
       this.waterMeshDirty = true;
@@ -9288,6 +9831,7 @@ export class PlanetarySandboxEngine {
           ez: hit.z + ((hit.nz + jz) / dLen) * len,
         });
       }
+      this.metabolism.syncLocalTerrainPorosity(hit.x, hit.y, hit.z, Math.max(effRad, len), this.planet);
       this.updateChunksWithLod(48);
       this.updateHighResStreaming(hit, 56);
       this.sound.playBuild();
@@ -9400,6 +9944,7 @@ export class PlanetarySandboxEngine {
         depMat,
         { shape: 'cylinder', ex, ey, ez },
       );
+      this.metabolism.syncLocalTerrainPorosity(hit.x, hit.y, hit.z, Math.max(effRad, len), this.planet);
       this.updateChunksWithLod(44);
       this.updateHighResStreaming(hit, 52);
       this.waterMeshDirty = true;
@@ -9427,6 +9972,7 @@ export class PlanetarySandboxEngine {
       depMat,
       { rimMaterial: rimMat },
     );
+    this.metabolism.syncLocalTerrainPorosity(bx, by, bz, effRad, this.planet);
     this.updateChunksWithLod(36);
     this.updateHighResStreaming(hit, 48);
     this.waterMeshDirty = true;
@@ -10487,6 +11033,14 @@ export class PlanetarySandboxEngine {
             escapeVelocityMs: computeEscapeVelocity(rCur, gravParams),
           };
         }
+        this.metabolism.advanceAsync(dt, 2);
+        this.metabolism.tickPlanetaryFeedback(
+          dt,
+          this.planet,
+          (hs) => this.applyMetabolismThermalHotspots(hs),
+          (op) => this.applyMetabolismMineralOp(op),
+        );
+        this.syncMetabolismReadOnlyVisuals(false);
         simStepMsThisFrame = performance.now() - simT0;
         this.simStepMsSmooth = this.simStepMsSmooth * 0.85 + simStepMsThisFrame * 0.15;
       } else if (this.waterMeshDirty) {
@@ -10846,6 +11400,7 @@ export class PlanetarySandboxEngine {
       hoveredCoord,
       hoveredWorldPos: this.lastHoveredWorldPos,
       hoveredAttitude: this.lastHoveredAttitude,
+      metabolismSummary: this.metabolism.getSummarySnapshot(),
     });
   }
 
@@ -10863,6 +11418,15 @@ export class PlanetarySandboxEngine {
     window.removeEventListener('blur', this.handleWindowBlur);
     window.removeEventListener('pointermove', this.handlePointerMove);
     window.removeEventListener('pointerup', this.handlePointerUp);
+
+    if (this.metabolismFieldPoints) {
+      this.metabolismFieldPoints.geometry.dispose();
+      (this.metabolismFieldPoints.material as THREE.Material).dispose();
+    }
+    if (this.couplingZoneLines) {
+      this.couplingZoneLines.geometry.dispose();
+      (this.couplingZoneLines.material as THREE.Material).dispose();
+    }
 
     if (this.renderer) {
       this.disposeRenderPipeline();

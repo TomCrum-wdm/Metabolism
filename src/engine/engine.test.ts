@@ -113,6 +113,26 @@ import {
   sampleBoreholeColumn,
   sampleGeologicalTransect,
 } from './geologySurvey';
+import {
+  buildFvmGridDescriptor,
+  compileReactionHypergraph,
+  createClosedEquilibriumHypergraph,
+  createOpenAutocatalyticHypergraph,
+  DEFAULT_PLANETARY_FEEDBACK_CONFIG,
+  EulerianFvmGrid,
+  evaluateFeedbackCandidatesFromCpuGrid,
+  evaluateSymmetricFluxReactionStepCpuReference,
+  evaluateTpWindowGate,
+  FVM_RESOLUTION_PRESETS,
+  MatterPhase,
+  MetabolismSimRunner,
+  PACKED_KINETICS_VEC4_COUNT,
+  packHypergraphKineticsVec4,
+  PicCouplingRegistry,
+  runLocalMicroCalibration,
+  sampleFvmRenderColor,
+  syncLocalBrushToCpuFvmGrid,
+} from './metabolism';
 
 const GRAVITY_PARAMS = {
   referenceRadius: DEFAULT_PLANET_RADIUS,
@@ -2392,5 +2412,399 @@ test('Per-parameter keyframing (cloudCoverage, solarIntensity, waterVolume, visu
   assert.equal(clamped, true);
   assert.equal(fluid.activeCount, MAX_FLUID_PARTICLES);
 });
+
+test('Metabolism Task 1 & 2: VoxelPlanet Chunk/Vox upgrades to Eulerian FVM control volumes and Reaction Hypergraph enforces numeric stoichiometry + T/P windows', () => {
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 202611, radius: 13 });
+  const beforeStats = planet.getVoxelStats();
+  const grid = planet.upgradeChunksToEulerianFvm({ boundaryMode: 'open' });
+
+  // Upgrading Vox control volumes must preserve existing graphical density/material layout
+  const afterStats = planet.getVoxelStats();
+  assert.equal(afterStats.densityBytes, beforeStats.densityBytes);
+  assert.equal(afterStats.materialBytes, beforeStats.materialBytes);
+  assert.ok(planet.fvmGrid === grid);
+
+  // Vox control volume at planet surface exposes speciesConc, internalEnergy, flux, phase
+  const surfIy = Math.floor(planet.worldToGrid(13.0));
+  const midAxis = Math.floor(planet.cellsPerAxis / 2);
+  const vox = planet.getVoxControlVolume(midAxis, surfIy, midAxis);
+  assert.ok(vox !== null);
+  assert.equal(vox!.active, true);
+  assert.ok(vox!.speciesConc instanceof Float32Array);
+  assert.equal(vox!.speciesConc.length, grid.hypergraph.numSpecies);
+  assert.equal(vox!.flux.length, 3);
+  assert.ok(vox!.internalEnergy > 0);
+  assert.ok(Object.values(MatterPhase).includes(vox!.phase));
+
+  // probeVoxelCell carries live fvmControlVolume telemetry
+  const probe = planet.probeVoxelCell(0, 13.0, 0);
+  assert.ok(probe.fvmControlVolume !== undefined);
+  assert.equal(probe.fvmControlVolume!.active, true);
+  assert.ok(probe.fvmControlVolume!.internalEnergy > 0);
+  assert.equal(probe.fvmControlVolume!.speciesConc.length, grid.hypergraph.numSpecies);
+
+  // Reaction Hypergraph: strictly numeric indices, stoichiometric mass balance, and T/P window gating
+  const openHyper = createOpenAutocatalyticHypergraph();
+  assert.equal(openHyper.isStoichMassConserved, true);
+  for (let r = 0; r < openHyper.numReactions; r++) {
+    assert.ok(
+      Math.abs(openHyper.stoichMassResiduals[r]) < 1e-6,
+      `Expected exact molar mass conservation for reaction ${r}`,
+    );
+  }
+
+  // Kernel never parses chemical formula strings: changing formulaTag to arbitrary strings produces identical compilation
+  const patchedSpecies = openHyper.species.map((s, idx) => ({
+    ...s,
+    formulaTag: `ARBITRARY_UI_TAG_${idx}`,
+  }));
+  const patchedRxns = openHyper.reactions.map((rx, idx) => ({
+    ...rx,
+    uiEquationLabel: `DO_NOT_PARSE_${idx}`,
+  }));
+  const recompiled = compileReactionHypergraph('recompiled', 'UI Label Only', patchedSpecies, patchedRxns);
+  assert.deepEqual(Array.from(recompiled.stoichMatrix), Array.from(openHyper.stoichMatrix));
+
+  // T/P validity window gating zeroes reactions outside [minTempK, maxTempK] x [minPressureAtm, maxPressureAtm]
+  const rxn0 = openHyper.reactions[0];
+  assert.equal(evaluateTpWindowGate(rxn0, 325, 1.2), 1);
+  assert.equal(evaluateTpWindowGate(rxn0, rxn0.minTempK - 40, 1.2), 0);
+  assert.equal(evaluateTpWindowGate(rxn0, 325, rxn0.maxPressureAtm + 50), 0);
+});
+
+test('Metabolism Task 3 & 4a: Fixed operator sequence (Flux -> Reaction) and Closed System relaxes to chemical equilibrium with strict mass conservation', () => {
+  const runner = new MetabolismSimRunner('closed_equilibrium', 1, 4.0, 3.0);
+  assert.equal(runner.grid.boundaryMode, 'closed');
+
+  const initTel = runner.grid.lastTelemetry;
+  const initMolesA = initTel.meanConcentrations[0];
+  const initStdA = initTel.speciesSpatialStdDev[0];
+  const initSigma = initTel.totalEntropyProdRate;
+  assert.ok(initStdA > 0.2, `Expected non-uniform initial spatial gradient, got std=${initStdA}`);
+  assert.ok(initSigma > 5.0, `Expected high initial non-equilibrium entropy production, got ${initSigma}`);
+
+  let maxRelErr = 0;
+  for (let i = 0; i < 420; i++) {
+    const tel = runner.stepOnce(0.08);
+    assert.equal(tel.conservation.conserved, true);
+    if (tel.conservation.relativeError > maxRelErr) {
+      maxRelErr = tel.conservation.relativeError;
+    }
+    assert.equal(tel.conservation.boundaryFeedMassKg, 0);
+    assert.equal(tel.conservation.boundaryExhaustMassKg, 0);
+  }
+  assert.ok(maxRelErr < 1e-5, `Expected strict closed-system mass conservation < 1e-5, got ${maxRelErr}`);
+
+  const endTel = runner.grid.lastTelemetry;
+  const endStdA = endTel.speciesSpatialStdDev[0];
+  assert.ok(endStdA < initStdA * 0.25, `Expected diffusion to smooth spatial gradient: ${endStdA} vs ${initStdA}`);
+  assert.ok(endTel.meanConcentrations[0] < initMolesA, 'Expected A to convert into B and C');
+  assert.ok(endTel.meanConcentrations[1] > 0.05 && endTel.meanConcentrations[2] > 0.05);
+  assert.ok(
+    endTel.totalEntropyProdRate < Math.min(0.5, initSigma * 0.01),
+    `Expected closed system entropy production to decay >99% toward equilibrium: ${initSigma} -> ${endTel.totalEntropyProdRate}`,
+  );
+});
+
+test('Metabolism Task 4b: Open dissipative autocatalytic system verifies mass balance and positive-feedback bifurcation', () => {
+  const runner = new MetabolismSimRunner('open_autocatalytic', 1, 4.0, 3.0);
+  assert.equal(runner.grid.boundaryMode, 'open');
+
+  // Verify per-step open-boundary mass accounting: M_postReact - M_pre == Feed - Exhaust
+  for (let i = 0; i < 40; i++) {
+    const tel = runner.stepOnce(0.05);
+    const c = tel.conservation;
+    assert.equal(c.conserved, true);
+    assert.ok(
+      c.relativeError < 1e-5,
+      `Expected open-system mass balance residual < 1e-5, got ${c.relativeError}`,
+    );
+  }
+
+  // Run bifurcation sweep across feed rate F in [0.04, 0.85]
+  const report = runner.runAutocatalyticBifurcationSweep();
+  assert.ok(report.points.length >= 10);
+  const lowPt = report.points[0];
+  const highPt = report.points[report.points.length - 1];
+
+  assert.equal(lowPt.regime, 'extinction', `Expected low-feed extinction branch at F=${lowPt.feedRatePerSec}`);
+  assert.equal(highPt.regime, 'dissipative_branch', `Expected active dissipative branch at F=${highPt.feedRatePerSec}`);
+  assert.ok(report.criticalFeedRate !== null, 'Expected a critical feed-rate bifurcation threshold');
+  assert.ok(
+    highPt.steadyAutocatalystX > lowPt.steadyAutocatalystX * 3.0,
+    `Expected positive-feedback amplification of X: ${lowPt.steadyAutocatalystX} -> ${highPt.steadyAutocatalystX}`,
+  );
+  assert.ok(
+    highPt.entropyProdRate > lowPt.entropyProdRate * 2.0,
+    `Expected sustained entropy production on dissipative branch: ${highPt.entropyProdRate}`,
+  );
+});
+
+test('Metabolism Task 5 & 6: PIC AABB Coupling Hooks calibrate macro kinetics without MD, and Read-Only Field Renderer decouples cleanly', () => {
+  const registry = new PicCouplingRegistry();
+  const zone = registry.registerZone({
+    id: 'hydrothermal_aabb',
+    label: '热泉耦合区',
+    scaleKind: 'molecular_md_calibration',
+    aabbMin: [-1.5, 2.0, -1.5],
+    aabbMax: [1.5, 3.8, 1.5],
+    active: true,
+    description: 'AABB test marker',
+  });
+
+  const grid = new EulerianFvmGrid({
+    chunksPerAxis: 1,
+    worldHalf: 4.0,
+    baseRadius: 3.0,
+    hypergraph: createOpenAutocatalyticHypergraph(),
+    boundaryMode: 'open',
+  });
+  grid.step(0.05);
+
+  const boundary = registry.fineGrainToLagrangian(zone, grid, grid.hypergraph);
+  assert.ok(boundary.sampledVoxCount > 0);
+  assert.equal(boundary.speciesConcentrationsMolM3.length, grid.hypergraph.numSpecies);
+  assert.equal(boundary.speciesGradientsMolM4.length, grid.hypergraph.numSpecies);
+
+  const diffScale = new Float64Array(grid.hypergraph.numSpecies).fill(1.0);
+  diffScale[1] = 1.35;
+  const patch = registry.coarseGrainToEulerian(
+    zone,
+    {
+      zoneId: zone.id,
+      microSampleSteps: 0,
+      effectiveDiffusivityScale: diffScale,
+      calibratedArrhenius: [{ reactionIndex: 0, effectiveForwardA: 1.45, effectiveForwardEaJ: 2450 }],
+    },
+    grid.hypergraph,
+  );
+  assert.equal(patch.diffusivityScaleApplied[1], 1.35);
+  assert.equal(grid.hypergraph.calibratedDiffusivityScale[1], 1.35);
+  assert.equal(grid.hypergraph.calibratedForwardA[0], 1.45);
+
+  // Read-only render field sampling must never mutate simulation revision or concentration arrays
+  const revBefore = grid.revision;
+  const view = grid.getReadOnlyRenderView();
+  const concCopyBefore = Float32Array.from(grid.speciesConc);
+  const rgb: [number, number, number] = [0, 0, 0];
+  for (const ch of ['species', 'energy', 'phase', 'flux'] as const) {
+    const ok = sampleFvmRenderColor(view, 0, 2.5, 0, ch, rgb);
+    assert.equal(ok, true);
+    assert.ok(rgb[0] >= 0 && rgb[1] >= 0 && rgb[2] >= 0);
+  }
+  assert.equal(grid.revision, revBefore);
+  assert.deepEqual(Array.from(grid.speciesConc), Array.from(concCopyBefore));
+});
+
+test('Metabolism Stage 2 Pillar 1: Million-voxel GPU presets, numeric kinetics packing & symmetric Ping-Pong stencil parity', () => {
+  // 1. Verify resolution presets up to 128^3 = 2,097,152 voxels
+  assert.equal(FVM_RESOLUTION_PRESETS[24].totalVoxels, 13_824);
+  assert.equal(FVM_RESOLUTION_PRESETS[64].totalVoxels, 262_144);
+  assert.equal(FVM_RESOLUTION_PRESETS[96].totalVoxels, 884_736);
+  assert.equal(FVM_RESOLUTION_PRESETS[128].totalVoxels, 2_097_152);
+  assert.equal(FVM_RESOLUTION_PRESETS[128].recommendedBackend, 'webgpu');
+
+  // 2. Verify numeric kinetics packing contains zero formula string dependency
+  const openHyper = createOpenAutocatalyticHypergraph();
+  const packedA = packHypergraphKineticsVec4(openHyper);
+  assert.equal(packedA.length, PACKED_KINETICS_VEC4_COUNT * 4);
+  const retagged = compileReactionHypergraph(
+    'retagged',
+    'Retagged',
+    openHyper.species.map((sp, i) => ({ ...sp, formulaTag: `X_TAG_${i}` })),
+    openHyper.reactions.map((rx, i) => ({ ...rx, uiEquationLabel: `NO_PARSE_${i}` })),
+  );
+  const packedB = packHypergraphKineticsVec4(retagged);
+  assert.deepEqual(Array.from(packedA), Array.from(packedB));
+
+  // 3. Exact symmetric 2-pass Ping-Pong stencil parity test (Closed Equilibrium)
+  const closedGrid = new EulerianFvmGrid({
+    chunksPerAxis: 1,
+    worldHalf: 4.0,
+    baseRadius: 3.0,
+    hypergraph: createClosedEquilibriumHypergraph(),
+    boundaryMode: 'closed',
+    ambientTempK: 325,
+    ambientPressureAtm: 1.0,
+  });
+  const n = closedGrid.cellsPerAxis;
+  const N = closedGrid.totalCells;
+  const statePing = new Float32Array(N * 4);
+  const statePong = new Float32Array(N * 4);
+  const auxPing = new Float32Array(N * 4);
+  const auxPong = new Float32Array(N * 4);
+  const velPor = new Float32Array(N * 4);
+  const meta = new Float32Array(N * 4);
+  const diag = new Float32Array(N * 4);
+
+  for (let iz = 0; iz < n; iz++) {
+    for (let iy = 0; iy < n; iy++) {
+      for (let ix = 0; ix < n; ix++) {
+        const idx = closedGrid.cellIndex(ix, iy, iz);
+        const [wx] = closedGrid.cellCenterWorld(ix, iy, iz);
+        const cA = wx >= 0 ? 1.85 : 0.35;
+        statePing[idx * 4 + 0] = cA;
+        statePing[idx * 4 + 1] = 0.05;
+        statePing[idx * 4 + 2] = 0.0;
+        const cpVol = 1800 + cA * 40 + 0.05 * 40;
+        statePing[idx * 4 + 3] = cpVol * 325;
+        auxPing[idx * 4 + 3] = 325;
+        velPor[idx * 4 + 3] = 0.72;
+        meta[idx * 4 + 0] = 1.0; // active
+        meta[idx * 4 + 3] = 1.0; // pressure atm
+      }
+    }
+  }
+
+  const desc = buildFvmGridDescriptor(closedGrid);
+  let maxErr = 0;
+  let firstEntropy = 0;
+  let lastEntropy = 0;
+  let firstMeanA = 0;
+  let lastMeanA = 0;
+
+  for (let s = 0; s < 120; s++) {
+    const res = evaluateSymmetricFluxReactionStepCpuReference(
+      desc,
+      closedGrid.hypergraph,
+      statePing,
+      statePong,
+      auxPing,
+      auxPong,
+      velPor,
+      meta,
+      diag,
+      {
+        dtSec: 0.06,
+        boundaryMode: 'closed',
+        feedRatePerSec: 0,
+        exhaustRatePerSec: 0,
+        feedConcentrationMolM3: 0,
+        ambientTempK: 325,
+      },
+    );
+    if (res.relativeError > maxErr) maxErr = res.relativeError;
+    if (s === 0) {
+      firstEntropy = res.totalEntropyProdRate;
+      firstMeanA = res.meanConcentrations[0];
+    }
+    lastEntropy = res.totalEntropyProdRate;
+    lastMeanA = res.meanConcentrations[0];
+    assert.ok(res.meanConcentrations.every((v) => Number.isFinite(v) && v >= 0));
+  }
+  assert.ok(maxErr < 1e-5, `Expected symmetric GPU-stencil parity mass conservation < 1e-5, got ${maxErr}`);
+  assert.ok(lastMeanA < firstMeanA, 'Closed stencil should convert species A toward B+C');
+  assert.ok(lastEntropy < firstEntropy * 0.15, `Closed entropy should decay toward equilibrium: ${firstEntropy} -> ${lastEntropy}`);
+});
+
+test('Metabolism Stage 2 Pillar 2: PIC AABB Local Micro-Calibrator updates macro diffusivity & Arrhenius kinetics without global MD', () => {
+  const runner = new MetabolismSimRunner('open_autocatalytic', 2, 10.0, 7.0);
+  runner.registerDefaultCouplingZones(7.0);
+  runner.stepOnce(0.05);
+
+  const zones = runner.couplingRegistry.listZones();
+  assert.ok(zones.length >= 1);
+  const zone = zones[0];
+
+  const baseA0 = runner.grid.hypergraph.calibratedForwardA[0];
+  const baseEa0 = runner.grid.hypergraph.calibratedForwardEaJ[0];
+
+  const { boundary, patch, record } = runLocalMicroCalibration(
+    zone,
+    runner.couplingRegistry,
+    runner.grid,
+    runner.grid.hypergraph,
+    { particleCount: 512, microSteps: 36, microDtSec: 0.0025, seed: 4242 },
+  );
+
+  assert.ok(boundary.sampledVoxCount > 0, 'Calibration must sample voxels strictly inside registered AABB');
+  assert.ok(record.msdHinderedOverFree > 0.15 && record.msdHinderedOverFree <= 1.45);
+  assert.ok(record.collisionEvents >= 0);
+  assert.equal(patch.diffusivityScaleApplied.length, runner.grid.hypergraph.numSpecies);
+  assert.ok(
+    runner.grid.hypergraph.calibratedForwardA[0] !== baseA0 ||
+      runner.grid.hypergraph.calibratedForwardEaJ[0] !== baseEa0,
+    'Calibrated macroscopic Arrhenius parameters must update on hypergraph',
+  );
+
+  // Runner integration entrypoint records calibration history cleanly
+  const rec2 = runner.runMicroCalibration(zone.id, {
+    particleCount: 256,
+    microSteps: 24,
+    microDtSec: 0.0025,
+    seed: 9999,
+  });
+  assert.ok(rec2 !== null);
+  assert.equal(runner.calibrationHistoryCount, 1);
+  assert.ok(runner.lastCalibrationRecord !== null);
+});
+
+test('Metabolism Stage 2 Pillar 3: Bidirectional Planetary Feedback (Exothermic Hotspots + Mineralization + Brush Porosity Sync)', () => {
+  const R = 13.0;
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, radius: R, voxelRadius: 18 });
+  const runner = new MetabolismSimRunner('open_autocatalytic', 3, planet.worldHalf, R);
+  runner.bindToPlanet(planet, [0.7, 0.5, 0.5], DEFAULT_ATMOS_CONFIG, DEFAULT_THERMAL_CONFIG);
+
+  // Locate a crustal surface voxel and boost local exothermic temperature & autocatalyst concentration
+  const hit = planet.raycastTerrain(0, R + 8, 0, 0, -1, 0, 24);
+  assert.ok(hit.hit, 'Should locate north pole terrain surface');
+
+  const n = runner.grid.cellsPerAxis;
+  let hotspotIx = Math.floor((hit.x + runner.grid.worldHalf) / runner.grid.voxelSize);
+  let hotspotIy = Math.floor((hit.y + runner.grid.worldHalf) / runner.grid.voxelSize);
+  let hotspotIz = Math.floor((hit.z + runner.grid.worldHalf) / runner.grid.voxelSize);
+  hotspotIx = Math.max(0, Math.min(n - 1, hotspotIx));
+  hotspotIy = Math.max(0, Math.min(n - 1, hotspotIy));
+  hotspotIz = Math.max(0, Math.min(n - 1, hotspotIz));
+  const cIdx = runner.grid.cellIndex(hotspotIx, hotspotIy, hotspotIz);
+  runner.grid.activeMask[cIdx] = 1;
+  runner.grid.temperatureK[cIdx] = runner.grid.ambientTempK + 180;
+  const S = runner.grid.hypergraph.numSpecies;
+  runner.grid.speciesConc[cIdx * S + 1] = 2.4; // High autocatalyst X
+
+  const accum = new Float32Array(runner.grid.totalCells);
+  const evalRes = evaluateFeedbackCandidatesFromCpuGrid(
+    runner.grid,
+    planet,
+    { ...DEFAULT_PLANETARY_FEEDBACK_CONFIG, thermalGain: 1.5, mineralizationRate: 2.0 },
+    accum,
+    0.8,
+  );
+
+  // 1. Exothermic hotspot emitted and heats thermal field
+  assert.ok(evalRes.hotspots.length >= 1, 'High metabolic temperature should emit persistent ThermalHotspots');
+  assert.equal(evalRes.hotspots[0].source, 'metabolism');
+  assert.ok(evalRes.peakDeltaC > 50);
+
+  const deltaC = computeHotspotDeltaC(evalRes.hotspots[0].x, evalRes.hotspots[0].y, evalRes.hotspots[0].z, evalRes.hotspots);
+  const coolTherm = sampleThermalField(
+    hit.x, hit.y, hit.z, R, [0.7, 0.5, 0.5], DEFAULT_ATMOS_CONFIG, DEFAULT_THERMAL_CONFIG, 0, MaterialId.Basalt, 0, 0,
+  );
+  const hotTherm = sampleThermalField(
+    hit.x, hit.y, hit.z, R, [0.7, 0.5, 0.5], DEFAULT_ATMOS_CONFIG, DEFAULT_THERMAL_CONFIG, 0, MaterialId.Basalt, 0, deltaC,
+  );
+  assert.ok(hotTherm.tempC > coolTherm.tempC + 20, 'Metabolic hotspot should measurably raise planetary surface temperature');
+
+  // 2. Mineralization operation emitted and writes back to VoxelPlanet material
+  assert.ok(evalRes.mineralOps.length >= 1, 'Supersaturated autocatalyst near surface should emit mineralization op');
+  const op = evalRes.mineralOps[0];
+  planet.applyBrush(op.wx, op.wy, op.wz, op.mode, op.radius, op.strength, op.material);
+  const sampledAfter = planet.sampleNearestMaterial(op.wx, op.wy, op.wz);
+  assert.ok(
+    sampledAfter === MaterialId.Crystal || sampledAfter === MaterialId.Basalt,
+    `Expected mineralized voxel at (${op.wx.toFixed(1)}, ${op.wy.toFixed(1)}, ${op.wz.toFixed(1)}) to become Crystal or Basalt, got ${sampledAfter}`,
+  );
+
+  // 3. Terrain sculpting brush excavates rock -> porosity refreshes upward cleanly
+  const southHit = planet.raycastTerrain(0, -R - 8, 0, 0, 1, 0, 24);
+  assert.ok(southHit.hit);
+  planet.applyBrush(southHit.x, southHit.y - 0.6, southHit.z, 'carve', 2.4, 2.2, MaterialId.Air);
+  const revBeforeSync = runner.grid.revision;
+  const syncedVoxels = syncLocalBrushToCpuFvmGrid(runner.grid, planet, southHit.x, southHit.y - 0.6, southHit.z, 2.4);
+  assert.ok(syncedVoxels > 0, 'Brush porosity sync should refresh affected FVM control volumes');
+  assert.ok(runner.grid.revision > revBeforeSync);
+});
+
+
 
 

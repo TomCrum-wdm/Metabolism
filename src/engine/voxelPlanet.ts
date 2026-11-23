@@ -6,6 +6,13 @@ import {
   TRI_TABLE,
 } from './marchingCubesTables';
 import { DEFAULT_PLANET_RADIUS } from './gravity';
+import {
+  EulerianFvmGrid,
+  FvmGridOptions,
+  SystemBoundaryMode,
+  VoxControlVolume,
+} from './metabolism/eulerianFvm';
+import { createOpenAutocatalyticHypergraph } from './metabolism/reactionHypergraph';
 
 export enum MaterialId {
   Air = 0,
@@ -47,7 +54,7 @@ export interface BrushApplyOptions {
 
 export type ChunkLodLevel = 0 | 1 | 2;
 export type TerrainRenderMode = 'smooth' | 'blocky';
-export type TerrainOverlayMode = 'material' | 'temperature' | 'density' | 'lod';
+export type TerrainOverlayMode = 'material' | 'temperature' | 'density' | 'lod' | 'metabolism';
 
 export interface PlanetSeedConfig {
   seed: number;
@@ -318,6 +325,7 @@ export interface VoxelCellProbe {
   centerMaterial: MaterialId;
   corners: VoxelCellCornerSample[];
   slice5x5: Array<{ dx: number; dz: number; density: number; material: MaterialId }>;
+  fvmControlVolume?: VoxControlVolume;
 }
 
 export interface SparseChunkSnapshot {
@@ -604,6 +612,7 @@ export class VoxelPlanet {
   public lakeBasinCenters: Array<[number, number, number]> = [];
   public hasGenerated = false;
   public voxelRevision = 0;
+  public fvmGrid: EulerianFvmGrid | null = null;
 
   constructor(
     seedOrConfig: number | Partial<PlanetSeedConfig> = 202611,
@@ -1606,6 +1615,15 @@ export class VoxelPlanet {
       }
     }
 
+    let fvmControlVolume: VoxControlVolume | undefined;
+    if (this.fvmGrid) {
+      const fn = this.fvmGrid.cellsPerAxis;
+      const fx = clamp(Math.floor((wx + this.fvmGrid.worldHalf) / this.fvmGrid.voxelSize), 0, fn - 1);
+      const fy = clamp(Math.floor((wy + this.fvmGrid.worldHalf) / this.fvmGrid.voxelSize), 0, fn - 1);
+      const fz = clamp(Math.floor((wz + this.fvmGrid.worldHalf) / this.fvmGrid.voxelSize), 0, fn - 1);
+      fvmControlVolume = this.fvmGrid.getVoxControlVolume(fx, fy, fz);
+    }
+
     return {
       worldPos: [wx, wy, wz],
       gridPos: [gx, gy, gz],
@@ -1619,7 +1637,88 @@ export class VoxelPlanet {
       centerMaterial: this.sampleNearestMaterial(wx, wy, wz),
       corners,
       slice5x5,
+      fvmControlVolume,
     };
+  }
+
+  /**
+   * Upgrades this VoxelPlanet's Chunk/Vox structure into an attached Eulerian Finite Volume
+   * control-volume grid without modifying graphical density/material arrays.
+   */
+  public upgradeChunksToEulerianFvm(
+    options?: Partial<Omit<FvmGridOptions, 'worldHalf' | 'baseRadius'>> & {
+      chunksPerAxis?: number;
+      boundaryMode?: SystemBoundaryMode;
+    },
+  ): EulerianFvmGrid {
+    const targetChunks =
+      options?.chunksPerAxis ?? (this.chunksPerAxis <= 3 ? this.chunksPerAxis : 3);
+    const hypergraph = options?.hypergraph ?? createOpenAutocatalyticHypergraph();
+    const grid = new EulerianFvmGrid({
+      chunksPerAxis: targetChunks,
+      worldHalf: this.worldHalf,
+      baseRadius: this.baseRadius,
+      hypergraph,
+      boundaryMode: options?.boundaryMode ?? 'open',
+      feedRatePerSec: options?.feedRatePerSec,
+      exhaustRatePerSec: options?.exhaustRatePerSec,
+      feedSpeciesIndex: options?.feedSpeciesIndex,
+      feedConcentrationMolM3: options?.feedConcentrationMolM3,
+      ambientTempK: options?.ambientTempK,
+      ambientPressureAtm: options?.ambientPressureAtm,
+    });
+
+    const n = grid.cellsPerAxis;
+    const minShellR = this.baseRadius * 0.62;
+    const maxShellR = this.baseRadius * 1.22;
+    for (let iz = 0; iz < n; iz++) {
+      for (let iy = 0; iy < n; iy++) {
+        for (let ix = 0; ix < n; ix++) {
+          const [wx, wy, wz] = grid.cellCenterWorld(ix, iy, iz);
+          const idx = grid.cellIndex(ix, iy, iz);
+          const r = Math.hypot(wx, wy, wz);
+          if (r < minShellR || r > maxShellR) {
+            grid.activeMask[idx] = 0;
+            grid.porosity[idx] = 0;
+            continue;
+          }
+          const d = this.sampleDensity(wx, wy, wz, true);
+          const mat = this.sampleNearestMaterial(wx, wy, wz);
+          const nearSurface = Math.abs(d) < grid.voxelSize * 2.2;
+          grid.activeMask[idx] = 1;
+          grid.porosity[idx] =
+            d <= 0
+              ? 1.0
+              : nearSurface
+                ? 0.65
+                : mat === MaterialId.Crystal || mat === MaterialId.Sandstone
+                  ? 0.45
+                  : 0.22;
+        }
+      }
+    }
+    grid.rebuildActiveCellList();
+    grid.syncInternalEnergyFromTemp();
+    this.fvmGrid = grid;
+    return grid;
+  }
+
+  public getVoxControlVolume(ix: number, iy: number, iz: number): VoxControlVolume | null {
+    if (!this.fvmGrid) return null;
+    const fn = this.fvmGrid.cellsPerAxis;
+    const fx =
+      this.cellsPerAxis === fn
+        ? clamp(ix, 0, fn - 1)
+        : clamp(Math.floor((ix / Math.max(1, this.cellsPerAxis)) * fn), 0, fn - 1);
+    const fy =
+      this.cellsPerAxis === fn
+        ? clamp(iy, 0, fn - 1)
+        : clamp(Math.floor((iy / Math.max(1, this.cellsPerAxis)) * fn), 0, fn - 1);
+    const fz =
+      this.cellsPerAxis === fn
+        ? clamp(iz, 0, fn - 1)
+        : clamp(Math.floor((iz / Math.max(1, this.cellsPerAxis)) * fn), 0, fn - 1);
+    return this.fvmGrid.getVoxControlVolume(fx, fy, fz);
   }
 
   public findSurfaceRadiusAlongRay(dx: number, dy: number, dz: number): number {

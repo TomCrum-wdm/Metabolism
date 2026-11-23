@@ -17,6 +17,7 @@ import {
   RenderQualityPreset,
   ShadowQualityLevel,
 } from '../engine/renderQuality';
+import { MATTER_PHASE_LABELS } from '../engine/metabolism';
 
 interface DebugMenuProps {
   telemetry: SandboxTelemetry;
@@ -594,6 +595,31 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
                       ))}
                     </div>
                   </div>
+
+                  {probe.fvmControlVolume && (
+                    <div className="pt-1.5 border-t border-slate-800 space-y-1 text-[10px]">
+                      <div className="text-emerald-300 font-semibold">
+                        欧拉 FVM 控制单元 · C[{probe.fvmControlVolume.cx},{probe.fvmControlVolume.cy},{probe.fvmControlVolume.cz}] / V[{probe.fvmControlVolume.ix},{probe.fvmControlVolume.iy},{probe.fvmControlVolume.iz}]
+                      </div>
+                      <div className="grid grid-cols-2 gap-1 text-slate-300">
+                        <div>
+                          相态: <span className="text-cyan-300">{MATTER_PHASE_LABELS[probe.fvmControlVolume.phase]}</span>
+                        </div>
+                        <div>
+                          内能: <span className="text-amber-300">{probe.fvmControlVolume.internalEnergy.toFixed(1)} J/m³</span>
+                        </div>
+                        <div>
+                          温度/孔隙度: {probe.fvmControlVolume.temperatureK.toFixed(1)}K / {probe.fvmControlVolume.porosity.toFixed(2)}
+                        </div>
+                        <div>
+                          通量 J: [{probe.fvmControlVolume.flux.map((v) => v.toFixed(3)).join(', ')}]
+                        </div>
+                      </div>
+                      <div className="text-slate-300">
+                        组分浓度 (mol/m³): [{Array.from(probe.fvmControlVolume.speciesConc).map((v) => v.toFixed(3)).join(', ')}]
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="text-[11px] text-slate-400 py-1.5">

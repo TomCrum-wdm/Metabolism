@@ -78,6 +78,7 @@ import {
   SurveyBenchmark,
 } from './engine/geologySurvey';
 import { SurveyPanel, SurveyPanelTab } from './components/SurveyPanel';
+import { MetabolismPanel } from './components/MetabolismPanel';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'firstPerson',
@@ -254,6 +255,7 @@ export default function App() {
   const [debugOpen, setDebugOpen] = useState(false);
   const [mapsOpen, setMapsOpen] = useState(false);
   const [atmosPanelOpen, setAtmosPanelOpen] = useState(false);
+  const [metabolismOpen, setMetabolismOpen] = useState(false);
   const [seedModalOpen, setSeedModalOpen] = useState(false);
   const [dockOpen, setDockOpen] = useState(true);
   const [touchEnabled, setTouchEnabled] = useState<boolean>(
@@ -901,6 +903,9 @@ export default function App() {
       } else if (e.code === 'KeyC') {
         e.preventDefault();
         setAtmosPanelOpen((prev) => !prev);
+      } else if (e.code === 'KeyJ') {
+        e.preventDefault();
+        setMetabolismOpen((prev) => !prev);
       } else if (e.code === 'KeyV') {
         e.preventDefault();
         handleUpdateConfig({
@@ -918,7 +923,9 @@ export default function App() {
               ? 'temperature'
               : cur === 'temperature'
                 ? 'density'
-                : 'material',
+                : cur === 'density'
+                  ? 'metabolism'
+                  : 'material',
         });
       } else if (e.code === 'KeyK') {
         e.preventDefault();
@@ -1126,6 +1133,7 @@ export default function App() {
           surveyOpen={surveyOpen}
           surveyBenchmarkCount={benchmarks.length}
           atmosPanelOpen={atmosPanelOpen}
+          metabolismOpen={metabolismOpen}
           dockOpen={dockOpen}
           touchEnabled={touchEnabled}
           newTabUrl={newTabUrl}
@@ -1148,6 +1156,7 @@ export default function App() {
           onToggleMaps={() => setMapsOpen((v) => !v)}
           onToggleSurvey={() => setSurveyOpen((v) => !v)}
           onToggleAtmosPanel={() => setAtmosPanelOpen((v) => !v)}
+          onToggleMetabolism={() => setMetabolismOpen((v) => !v)}
           onToggleDebug={handleToggleDebug}
           onReselectLanding={() => engineRef.current?.reselectLandingSite()}
           onFocusCamera={() => engineRef.current?.focusCameraAtPointer()}
@@ -1305,6 +1314,35 @@ export default function App() {
           config={config}
           onUpdateConfig={handleUpdateConfig}
           onClose={() => setAtmosPanelOpen(false)}
+        />
+      )}
+
+      {phase === 'playing' && metabolismOpen && engineRef.current && (
+        <MetabolismPanel
+          snapshot={
+            telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
+          }
+          config={config}
+          onUpdateConfig={handleUpdateConfig}
+          onSetMode={(mode) => engineRef.current?.setMetabolismMode(mode)}
+          onSetBackend={(cells, backend) => engineRef.current?.setMetabolismBackend(cells, backend)}
+          onSetRunning={(running) => engineRef.current?.setMetabolismRunning(running)}
+          onStepOnce={() => engineRef.current?.stepMetabolismOnce()}
+          onSetParams={(params) => engineRef.current?.setMetabolismParams(params)}
+          onInjectPerturbation={() => engineRef.current?.injectMetabolismPerturbation(1, 1.8)}
+          onRunBifurcationSweep={() => {
+            engineRef.current?.runMetabolismBifurcationSweep();
+          }}
+          onRunMicroCalibration={(zoneId) => {
+            engineRef.current?.runMetabolismMicroCalibration(zoneId);
+          }}
+          onSetAutoCalibrate={(enabled) => {
+            engineRef.current?.setMetabolismAutoCalibrate(enabled);
+          }}
+          onSetFeedbackConfig={(partial) => {
+            engineRef.current?.setMetabolismFeedbackConfig(partial);
+          }}
+          onClose={() => setMetabolismOpen(false)}
         />
       )}
 

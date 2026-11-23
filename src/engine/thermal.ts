@@ -27,6 +27,7 @@ export interface ThermalHotspot {
   radius: number;
   deltaC: number;
   decayPerSec: number;
+  source?: 'event' | 'metabolism';
 }
 
 export function computeHotspotDeltaC(

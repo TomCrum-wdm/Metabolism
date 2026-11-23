@@ -142,12 +142,13 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
             />
           </label>
 
-          <div className="grid grid-cols-3 gap-1 pt-1 border-t border-slate-800/80">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 pt-1 border-t border-slate-800/80">
             {(
               [
                 { id: 'material', label: '岩性材质' },
                 { id: 'temperature', label: '三维温度场' },
                 { id: 'density', label: '深度层析' },
+                { id: 'metabolism', label: '耗散代谢场' },
               ] as ReadonlyArray<{ id: TerrainOverlayMode; label: string }>
             ).map((ov) => (
               <button

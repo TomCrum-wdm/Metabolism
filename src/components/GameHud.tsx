@@ -11,6 +11,7 @@ import {
   Compass,
   Crosshair,
   ExternalLink,
+  FlaskConical,
   Globe2,
   Hand,
   Magnet,
@@ -60,6 +61,7 @@ interface GameHudProps {
   surveyOpen: boolean;
   surveyBenchmarkCount: number;
   atmosPanelOpen: boolean;
+  metabolismOpen: boolean;
   dockOpen: boolean;
   touchEnabled: boolean;
   newTabUrl: string;
@@ -82,6 +84,7 @@ interface GameHudProps {
   onToggleMaps: () => void;
   onToggleSurvey: () => void;
   onToggleAtmosPanel: () => void;
+  onToggleMetabolism: () => void;
   onToggleDebug: () => void;
   onReselectLanding: () => void;
   onFocusCamera: () => void;
@@ -127,12 +130,14 @@ const OVERLAY_LABEL: Record<TerrainOverlayMode, string> = {
   temperature: '温度',
   density: '层析',
   lod: 'LOD',
+  metabolism: '代谢场',
 };
 
 const NEXT_OVERLAY: Record<TerrainOverlayMode, TerrainOverlayMode> = {
   material: 'temperature',
   temperature: 'density',
-  density: 'material',
+  density: 'metabolism',
+  metabolism: 'material',
   lod: 'material',
 };
 
@@ -156,6 +161,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   surveyOpen,
   surveyBenchmarkCount,
   atmosPanelOpen,
+  metabolismOpen,
   dockOpen,
   touchEnabled,
   newTabUrl,
@@ -178,6 +184,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   onToggleMaps,
   onToggleSurvey,
   onToggleAtmosPanel,
+  onToggleMetabolism,
   onToggleDebug,
   onReselectLanding,
   onFocusCamera,
@@ -561,6 +568,26 @@ export const GameHud: React.FC<GameHudProps> = ({
           >
             <Cloud className="w-3.5 h-3.5 shrink-0" />
             <span>大气/云温 [C]</span>
+          </button>
+
+          <button
+            type="button"
+            tabIndex={-1}
+            data-testid="metabolism-panel-btn"
+            aria-pressed={metabolismOpen}
+            title="打开《Metabolism》欧拉耗散通量场、反应超图与 PIC 耦合控制台 (J)"
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onToggleMetabolism();
+            }}
+            className={`h-7 px-2 rounded-xs border text-[11px] font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0 ${
+              metabolismOpen
+                ? 'border-emerald-400 bg-emerald-950/70 text-emerald-200'
+                : 'border-slate-700/80 bg-[#0d1322] text-slate-200 hover:border-emerald-400/70'
+            }`}
+          >
+            <FlaskConical className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+            <span>耗散代谢 [J]</span>
           </button>
 
           <button

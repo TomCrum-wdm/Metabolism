@@ -44,6 +44,7 @@ const PRESET_ACCENTS: Record<string, string> = {
   titan: '#f59e0b',
   asteroid: '#a855f7',
   cryo: '#38bdf8',
+  pangaea_epic: '#fb7185',
 };
 
 export function createStarterTiles(): PlanetTileItem[] {

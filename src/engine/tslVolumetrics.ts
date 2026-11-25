@@ -251,9 +251,10 @@ export function buildTerrainSubVoxelPbrBundle(
     const viewDir = viewVec.div(max(camDist, float(1e-5))).toVar();
     const nDotV = dot(viewDir, baseN).toVar();
 
-    // Distance-adaptive triplanar octave selection
+    // Distance-adaptive triplanar octave selection with Distant Horizons Nyquist fade-out
     const baseSubSize = max(nativeVoxelSizeNode.mul(0.25), float(1e-5)).toVar();
-    const targetCell = max(baseSubSize, camDist.mul(0.022));
+    const maxHorizonCell = max(baseSubSize.mul(16.0), float(0.055));
+    const targetCell = min(max(baseSubSize, camDist.mul(0.022)), maxHorizonCell);
     const octF = log2(max(targetCell.div(baseSubSize), 1.0));
     const oct0 = floor(octF);
     const octBlend = smoothstep(0.2, 0.8, fract(octF)).toVar();
@@ -270,8 +271,13 @@ export function buildTerrainSubVoxelPbrBundle(
     const cellFootprint = pixelWorld.div(
       max(activeCellSize.mul(max(abs(nDotV), 0.25)), float(1e-5)),
     );
-    const reliefAa = smoothstep(0.75, 0.16, cellFootprint).toVar();
-    const tier2Aa = smoothstep(0.30, 0.08, cellFootprint).toVar();
+    const reliefDistFade = smoothstep(
+      max(nativeVoxelSizeNode.mul(380.0), float(38.0)),
+      max(nativeVoxelSizeNode.mul(90.0), float(8.0)),
+      camDist,
+    );
+    const reliefAa = smoothstep(0.75, 0.16, cellFootprint).mul(reliefDistFade).toVar();
+    const tier2Aa = smoothstep(0.30, 0.08, cellFootprint).mul(reliefDistFade).toVar();
 
     const activeRelief = tslClamp(pbrReliefDepthNode, 0.0, 2.2)
       .mul(tslClamp(pbrEnhancedNode, 0.0, 1.0))
@@ -572,7 +578,7 @@ export function buildWaterWaveNormalNode(params: {
 
     const grad = vec3(dwx, dwy, dwz);
     const tangentGrad = grad.sub(baseN.mul(dot(grad, baseN)));
-    const amp = float(0.14).mul(tslClamp(pbrEnhancedNode, 0.0, 1.0));
+    const amp = float(0.048).mul(tslClamp(pbrEnhancedNode, 0.0, 1.0));
     const waveWorld = normalize(baseN.add(tangentGrad.mul(amp)));
     return normalize(transformNormalToView(waveWorld));
   })();
@@ -787,8 +793,8 @@ export function buildVolumetricAtmoCompositeNode(
             .mul(sunColor)
             .mul(scatterGain);
 
-          // Blend physical aerial perspective over distant terrain, full limb glow on sky
-          const terrainAerialRamp = smoothstep(R0.mul(0.03), R0.mul(0.28), hitDist);
+          // Blend physical aerial perspective over distant terrain/valleys, full limb glow on sky
+          const terrainAerialRamp = smoothstep(R0.mul(0.025), R0.mul(0.34), hitDist);
           const applyFactor = isSky.select(
             tslClamp(atmoScatterEnabledNode.mul(0.95), 0.0, 1.0),
             tslClamp(atmoActive.mul(terrainAerialRamp), 0.0, 1.0),

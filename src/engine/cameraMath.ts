@@ -88,11 +88,17 @@ export function computeSafeClipPlanes(
   const horizonDist =
     Math.sqrt(Math.max(0, focusDist * (2 * planetRadius + focusDist))) +
     planetRadius * 0.4;
+  const rawHorizonFar = Math.max(
+    horizonDist * 4.0,
+    planetRadius * 4.5,
+    focusDist * 18,
+  );
   const maxSafeRatioFar = near * 1.8e5;
+  const maxAllowedFar = Math.min(baseFar, maxSafeRatioFar);
   const far = clamp(
-    Math.min(baseFar, Math.max(horizonDist * 3.5, focusDist * 16), maxSafeRatioFar),
-    Math.max(near * 2e4, focusDist * 4),
-    baseFar,
+    Math.min(maxAllowedFar, rawHorizonFar),
+    Math.min(maxAllowedFar, Math.max(near * 2e4, focusDist * 4)),
+    maxAllowedFar,
   );
   return { near, far };
 }

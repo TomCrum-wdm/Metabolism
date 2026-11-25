@@ -78,7 +78,8 @@ import {
   SurveyBenchmark,
 } from './engine/geologySurvey';
 import { SurveyPanel, SurveyPanelTab } from './components/SurveyPanel';
-import { MetabolismPanel } from './components/MetabolismPanel';
+import { MetabolismPanel, MetabolismPanelTab } from './components/MetabolismPanel';
+import { VoxelFieldLegend } from './components/VoxelFieldLegend';
 
 const NEXT_CAMERA: Record<CameraMode, CameraMode> = {
   explorer: 'firstPerson',
@@ -161,6 +162,10 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     visualFilter: 'none',
     filterIntensity: 0.85,
     filterScale: 1.0,
+    showFvmFluxVectors: true,
+    showProtocell3d: true,
+    showHoveredFvmVox: true,
+    showFvmVoxelBlocks: true,
   };
 }
 
@@ -221,6 +226,7 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   hoveredCoord: null,
   hoveredWorldPos: null,
   hoveredAttitude: null,
+  voxLocked: false,
 };
 
 export default function App() {
@@ -256,6 +262,10 @@ export default function App() {
   const [mapsOpen, setMapsOpen] = useState(false);
   const [atmosPanelOpen, setAtmosPanelOpen] = useState(false);
   const [metabolismOpen, setMetabolismOpen] = useState(false);
+  const [metabolismTabOverride, setMetabolismTabOverride] = useState<{
+    tab: MetabolismPanelTab;
+    nonce: number;
+  } | null>(null);
   const [seedModalOpen, setSeedModalOpen] = useState(false);
   const [dockOpen, setDockOpen] = useState(true);
   const [touchEnabled, setTouchEnabled] = useState<boolean>(
@@ -356,6 +366,10 @@ export default function App() {
   useEffect(() => {
     engineRef.current?.setTouchActionMode(touchActionMode);
   }, [touchActionMode]);
+
+  useEffect(() => {
+    engineRef.current?.setMetabolismUiOpen(metabolismOpen);
+  }, [metabolismOpen]);
 
   // Mount WebGPU renderer & planetary engine once
   useEffect(() => {
@@ -906,6 +920,9 @@ export default function App() {
       } else if (e.code === 'KeyJ') {
         e.preventDefault();
         setMetabolismOpen((prev) => !prev);
+      } else if (e.code === 'KeyL') {
+        e.preventDefault();
+        engineRef.current?.toggleMetabolismVoxLock();
       } else if (e.code === 'KeyV') {
         e.preventDefault();
         handleUpdateConfig({
@@ -1317,19 +1334,54 @@ export default function App() {
         />
       )}
 
+      {phase === 'playing' && !directorOpen && engineRef.current && (
+        <VoxelFieldLegend
+          config={config}
+          snapshot={
+            telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
+          }
+          hoveredVoxProfile={telemetry.hoveredVoxProfile}
+          voxLocked={Boolean(telemetry.voxLocked)}
+          metabolismOpen={metabolismOpen}
+          onUpdateConfig={handleUpdateConfig}
+          onToggleVoxLock={() => {
+            engineRef.current?.toggleMetabolismVoxLock();
+          }}
+          onOpenFormulas={() => {
+            setMetabolismOpen(true);
+            setMetabolismTabOverride((prev) => ({
+              tab: 'formulas',
+              nonce: (prev?.nonce ?? 0) + 1,
+            }));
+          }}
+        />
+      )}
+
       {phase === 'playing' && metabolismOpen && engineRef.current && (
         <MetabolismPanel
           snapshot={
             telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
           }
           config={config}
+          hoveredVoxProfile={telemetry.hoveredVoxProfile}
+          voxLocked={Boolean(telemetry.voxLocked)}
+          activeTabOverride={metabolismTabOverride}
           onUpdateConfig={handleUpdateConfig}
+          onToggleVoxLock={() => {
+            engineRef.current?.toggleMetabolismVoxLock();
+          }}
           onSetMode={(mode) => engineRef.current?.setMetabolismMode(mode)}
           onSetBackend={(cells, backend) => engineRef.current?.setMetabolismBackend(cells, backend)}
           onSetRunning={(running) => engineRef.current?.setMetabolismRunning(running)}
           onStepOnce={() => engineRef.current?.stepMetabolismOnce()}
           onSetParams={(params) => engineRef.current?.setMetabolismParams(params)}
           onInjectPerturbation={() => engineRef.current?.injectMetabolismPerturbation(1, 1.8)}
+          onInjectNutrientBurst={() => {
+            engineRef.current?.injectMetabolismNutrientBurst();
+          }}
+          onFocusProtocell={() => {
+            engineRef.current?.focusCameraOnProtocellZone();
+          }}
           onRunBifurcationSweep={() => {
             engineRef.current?.runMetabolismBifurcationSweep();
           }}
@@ -1341,6 +1393,19 @@ export default function App() {
           }}
           onSetFeedbackConfig={(partial) => {
             engineRef.current?.setMetabolismFeedbackConfig(partial);
+          }}
+          interiorCutawayEnabled={Boolean(telemetry.interiorCutawayEnabled)}
+          onToggleInteriorCutaway={() => {
+            engineRef.current?.togglePlanetInteriorCutaway();
+          }}
+          onSetGeologicalConfig={(partial) => {
+            engineRef.current?.setMetabolismGeologicalConfig(partial);
+          }}
+          onTriggerGeoEvent={(kind) => {
+            engineRef.current?.triggerGeologicalEvent(kind);
+          }}
+          onRunDeepTimeEpoch={(deltaMyr) => {
+            engineRef.current?.runDeepTimeGeologicalEpoch(deltaMyr);
           }}
           onClose={() => setMetabolismOpen(false)}
         />

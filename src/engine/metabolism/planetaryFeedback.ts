@@ -28,7 +28,16 @@ export const DEFAULT_PLANETARY_FEEDBACK_CONFIG: PlanetaryFeedbackConfig = {
 
 export interface PlanetaryFeedbackEventLog {
   readonly stepIndex: number;
-  readonly kind: 'thermal' | 'mineral_crystal' | 'mineral_basalt' | 'acid_etch' | 'porosity_sync';
+  readonly kind:
+    | 'thermal'
+    | 'mineral_crystal'
+    | 'mineral_basalt'
+    | 'acid_etch'
+    | 'porosity_sync'
+    | 'volcano_eruption'
+    | 'tectonic_quake'
+    | 'plateau_uplift'
+    | 'fluvial_erosion';
   readonly summary: string;
 }
 
@@ -113,8 +122,21 @@ export function evaluateFeedbackCandidatesFromCpuGrid(
         if (r < r0 * 0.78 || r > r0 * 1.14) continue;
 
         const base = idx * S;
-        const cX = grid.speciesConc[base + 1] ?? 0;
-        const cW = grid.speciesConc[base + 2] ?? 0;
+        const hId = grid.hypergraph.id;
+        const cX =
+          hId === 'planetary_carbon_water'
+            ? (grid.speciesConc[base + 3] ?? 0)
+            : hId === 'cellular_metabolism'
+              ? (grid.speciesConc[base + 5] ?? 0)
+              : hId === 'planetary_hydrology'
+                ? (grid.speciesConc[base + 2] ?? 0)
+                : (grid.speciesConc[base + 1] ?? 0);
+        const cW =
+          hId === 'cellular_metabolism'
+            ? (grid.speciesConc[base + 4] ?? 0)
+            : hId === 'planetary_carbon_water'
+              ? (grid.speciesConc[base + 5] ?? 0)
+              : (grid.speciesConc[base + 2] ?? 0);
         const tempDiffK = grid.temperatureK[idx] - grid.ambientTempK;
         const sigma = grid.entropyProdRate[idx];
 

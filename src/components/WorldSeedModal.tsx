@@ -117,7 +117,7 @@ export const WorldSeedModal: React.FC<WorldSeedModalProps> = ({
         <div className="overflow-y-auto p-4 grid grid-cols-1 lg:grid-cols-12 gap-4">
           {/* Left: Unrestricted Seed Parameters */}
           <div className="lg:col-span-7 space-y-3">
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-1.5">
               {PLANET_PRESETS.map((p) => (
                 <button
                   key={p.id}

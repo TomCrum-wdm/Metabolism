@@ -83,6 +83,7 @@ export interface FvmStepTelemetry {
   readonly totalEntropyProdRate: number;
   readonly phaseCounts: Record<MatterPhase, number>;
   readonly meanFluxMagnitude: number;
+  readonly meanReactionRates: Float64Array;
   readonly conservation: MassConservationAudit;
 }
 
@@ -100,6 +101,8 @@ export interface FvmRenderFieldView {
   readonly fluxX: Float32Array;
   readonly fluxY: Float32Array;
   readonly fluxZ: Float32Array;
+  readonly porosity: Float32Array;
+  readonly entropyProdRate: Float32Array;
   readonly phase: Uint8Array;
   readonly activeMask: Uint8Array;
 }
@@ -192,6 +195,8 @@ export class EulerianFvmGrid {
     activeReactionCount: 0,
     totalTurnoverRate: 0,
   };
+  private readonly _cellRxnRates: Float64Array;
+  private readonly _meanRxnRatesAccum: Float64Array;
 
   public stepIndex = 0;
   public simTimeSec = 0;
@@ -205,6 +210,8 @@ export class EulerianFvmGrid {
   private readonly renderFluxXCopy: Float32Array;
   private readonly renderFluxYCopy: Float32Array;
   private readonly renderFluxZCopy: Float32Array;
+  private readonly renderPorosityCopy: Float32Array;
+  private readonly renderEntropyCopy: Float32Array;
   private readonly renderPhaseCopy: Uint8Array;
   private readonly renderActiveCopy: Uint8Array;
   private renderRevision = 0;
@@ -258,8 +265,14 @@ export class EulerianFvmGrid {
     this.renderFluxXCopy = new Float32Array(this.totalCells);
     this.renderFluxYCopy = new Float32Array(this.totalCells);
     this.renderFluxZCopy = new Float32Array(this.totalCells);
+    this.renderPorosityCopy = new Float32Array(this.totalCells);
+    this.renderEntropyCopy = new Float32Array(this.totalCells);
     this.renderPhaseCopy = new Uint8Array(this.totalCells);
     this.renderActiveCopy = new Uint8Array(this.totalCells);
+
+    const R = Math.max(1, this.hypergraph.numReactions);
+    this._cellRxnRates = new Float64Array(R);
+    this._meanRxnRatesAccum = new Float64Array(R);
 
     this.lastTelemetry = this.buildTelemetry({
       stepIndex: 0,
@@ -721,6 +734,9 @@ export class EulerianFvmGrid {
    */
   private applyReactionOperator(dt: number): void {
     const S = this.hypergraph.numSpecies;
+    const R = this.hypergraph.numReactions;
+    this._meanRxnRatesAccum.fill(0);
+
     for (let a = 0; a < this.activeCellCount; a++) {
       const idx = this.activeCellList[a];
       const base = idx * S;
@@ -736,7 +752,12 @@ export class EulerianFvmGrid {
         dt,
         this.rxnStepOut,
         1.0,
+        this._cellRxnRates,
       );
+
+      for (let r = 0; r < R; r++) {
+        this._meanRxnRatesAccum[r] += this._cellRxnRates[r];
+      }
 
       this.internalEnergy[idx] = Math.max(
         5000,
@@ -744,6 +765,11 @@ export class EulerianFvmGrid {
       );
       this.entropyProdRate[idx] = this.rxnStepOut.entropyProductionRate;
       this.updateTempAndPhaseFromEnergy(idx);
+    }
+
+    const denom = Math.max(1, this.activeCellCount);
+    for (let r = 0; r < R; r++) {
+      this._meanRxnRatesAccum[r] /= denom;
     }
   }
 
@@ -813,6 +839,7 @@ export class EulerianFvmGrid {
       totalEntropyProdRate: totalEntropy,
       phaseCounts,
       meanFluxMagnitude: fluxMagSum / count,
+      meanReactionRates: new Float64Array(this._meanRxnRatesAccum ?? []),
       conservation,
     };
   }
@@ -824,6 +851,8 @@ export class EulerianFvmGrid {
     this.renderFluxXCopy.set(this.fluxX);
     this.renderFluxYCopy.set(this.fluxY);
     this.renderFluxZCopy.set(this.fluxZ);
+    this.renderPorosityCopy.set(this.porosity);
+    this.renderEntropyCopy.set(this.entropyProdRate);
     this.renderPhaseCopy.set(this.phase);
     this.renderActiveCopy.set(this.activeMask);
     this.renderRevision = this.revision;
@@ -848,8 +877,122 @@ export class EulerianFvmGrid {
       fluxX: this.renderFluxXCopy,
       fluxY: this.renderFluxYCopy,
       fluxZ: this.renderFluxZCopy,
+      porosity: this.renderPorosityCopy,
+      entropyProdRate: this.renderEntropyCopy,
       phase: this.renderPhaseCopy,
       activeMask: this.renderActiveCopy,
     };
   }
 }
+
+export interface CellularBioTelemetry {
+  readonly atpSynthesisRateMmolLs: number;
+  readonly respiratoryQuotient: number;
+  readonly aerobicSharePct: number;
+  readonly anaerobicSharePct: number;
+  readonly membranePotentialMv: number;
+  readonly protocellBiomassMolM3: number;
+  readonly carbonFixationRate: number;
+  readonly netEvaporationRate: number;
+}
+
+/**
+ * Derives intuitive biological & planetary metabolic indicators from live FVM reaction rates & concentrations.
+ */
+export function computeCellularBioTelemetry(
+  hypergraph: CompiledReactionHypergraph,
+  telemetry: FvmStepTelemetry,
+): CellularBioTelemetry {
+  const rates = telemetry.meanReactionRates;
+  const conc = telemetry.meanConcentrations;
+
+  if (hypergraph.id === 'cellular_metabolism') {
+    const rPhoto = Math.max(0, rates[0] ?? 0);
+    const rTca = Math.max(0, rates[1] ?? 0);
+    const rGly = Math.max(0, rates[2] ?? 0);
+    const rCori = Math.max(0, rates[3] ?? 0);
+
+    // 30 ATP per glucose oxidized via TCA, 14 ATP per lactate oxidized, 2 ATP per glycolysis
+    const aerobicAtp = rTca * 30.0 + rCori * 14.0;
+    const anaerobicAtp = rGly * 2.0;
+    const atpTotal = aerobicAtp + anaerobicAtp;
+    const totalPath = rTca + rCori + rGly;
+    const aerobicSharePct = totalPath > 1e-6 ? ((rTca + rCori) / totalPath) * 100 : 50;
+    const anaerobicSharePct = 100 - aerobicSharePct;
+
+    const co2Prod = rTca * 6.0 + rCori * 3.0;
+    const o2Cons = rTca * 6.0 + rCori * 3.0;
+    const respiratoryQuotient =
+      o2Cons > 1e-6 ? clamp(co2Prod / o2Cons + (rGly * 0.25) / Math.max(0.05, o2Cons), 0.65, 1.45) : 1.0;
+
+    const biomass = conc[5] ?? 0;
+    const membranePotentialMv = -62 - clamp(atpTotal * 2.2 + biomass * 4.5, 0, 32);
+
+    return {
+      atpSynthesisRateMmolLs: atpTotal,
+      respiratoryQuotient,
+      aerobicSharePct,
+      anaerobicSharePct,
+      membranePotentialMv,
+      protocellBiomassMolM3: biomass,
+      carbonFixationRate: rPhoto * 6.0,
+      netEvaporationRate: 0,
+    };
+  }
+
+  if (hypergraph.id === 'planetary_carbon_water') {
+    const rEvap = rates[0] ?? 0;
+    const rPhoto = Math.max(0, rates[1] ?? 0);
+    const rResp = Math.max(0, rates[2] ?? 0);
+    const rMeth = Math.max(0, rates[3] ?? 0);
+    const rCh4Ox = Math.max(0, rates[4] ?? 0);
+
+    const o2 = conc[4] ?? 0;
+    const biomass = conc[3] ?? 0;
+    const aerobicPath = rResp + rCh4Ox;
+    const anaerobicPath = rMeth;
+    const totalPath = aerobicPath + anaerobicPath;
+    const aerobicSharePct = totalPath > 1e-6 ? (aerobicPath / totalPath) * 100 : o2 > 0.2 ? 82 : 25;
+    const atpEquiv = rResp * 18.0 + rPhoto * 6.0 + rMeth * 2.0;
+    const membranePotentialMv = -60 - clamp(atpEquiv * 1.6 + biomass * 4.0, 0, 30);
+
+    return {
+      atpSynthesisRateMmolLs: atpEquiv,
+      respiratoryQuotient: aerobicPath > 1e-6 ? clamp((rResp + rCh4Ox) / Math.max(1e-6, rResp + 2 * rCh4Ox), 0.5, 1.2) : 0.85,
+      aerobicSharePct,
+      anaerobicSharePct: 100 - aerobicSharePct,
+      membranePotentialMv,
+      protocellBiomassMolM3: biomass,
+      carbonFixationRate: rPhoto,
+      netEvaporationRate: rEvap,
+    };
+  }
+
+  if (hypergraph.id === 'planetary_hydrology') {
+    const rEvap = rates[0] ?? 0;
+    return {
+      atpSynthesisRateMmolLs: 0,
+      respiratoryQuotient: 1.0,
+      aerobicSharePct: 100,
+      anaerobicSharePct: 0,
+      membranePotentialMv: -60,
+      protocellBiomassMolM3: 0,
+      carbonFixationRate: 0,
+      netEvaporationRate: rEvap,
+    };
+  }
+
+  const biomass = conc[1] ?? 0;
+  const prod = Math.max(0, rates[0] ?? 0);
+  return {
+    atpSynthesisRateMmolLs: prod * 12.0,
+    respiratoryQuotient: 1.0,
+    aerobicSharePct: 75,
+    anaerobicSharePct: 25,
+    membranePotentialMv: -64 - clamp(prod * 6.0 + biomass * 6.0, 0, 26),
+    protocellBiomassMolM3: biomass,
+    carbonFixationRate: prod,
+    netEvaporationRate: 0,
+  };
+}
+

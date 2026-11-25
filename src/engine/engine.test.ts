@@ -13,6 +13,7 @@ import {
   DEFAULT_SEED_CONFIG,
   encodeSeedCode,
   MaterialId,
+  PLANET_PRESETS,
   VoxelPlanet,
 } from './voxelPlanet';
 import { FluidSim, MAX_FLUID_PARTICLES } from './fluidSim';
@@ -115,23 +116,36 @@ import {
 } from './geologySurvey';
 import {
   buildFvmGridDescriptor,
+  COMPOUND_CATALOG,
   compileReactionHypergraph,
+  computeCellularBioTelemetry,
+  computeCompoundMolarMassKgPerMol,
+  computeMaterialElementalBreakdown,
+  createCellularMetabolismHypergraph,
   createClosedEquilibriumHypergraph,
   createOpenAutocatalyticHypergraph,
+  createPlanetaryCarbonWaterHypergraph,
+  createPlanetaryHydrologyHypergraph,
+  DEFAULT_GEOLOGICAL_EVOLUTION_CONFIG,
   DEFAULT_PLANETARY_FEEDBACK_CONFIG,
   EulerianFvmGrid,
+  evaluateArrheniusRateConstant,
   evaluateFeedbackCandidatesFromCpuGrid,
   evaluateSymmetricFluxReactionStepCpuReference,
+  evaluateTectonicAndFluvialCandidatesFromCpuGrid,
   evaluateTpWindowGate,
   FVM_RESOLUTION_PRESETS,
   MatterPhase,
   MetabolismSimRunner,
   PACKED_KINETICS_VEC4_COUNT,
   packHypergraphKineticsVec4,
+  PERIODIC_ELEMENTS,
   PicCouplingRegistry,
   runLocalMicroCalibration,
   sampleFvmRenderColor,
   syncLocalBrushToCpuFvmGrid,
+  verifyHypergraphElementBalance,
+  VOXEL_MATERIAL_COMPOSITIONS,
 } from './metabolism';
 
 const GRAVITY_PARAMS = {
@@ -2805,6 +2819,443 @@ test('Metabolism Stage 2 Pillar 3: Bidirectional Planetary Feedback (Exothermic 
   assert.ok(runner.grid.revision > revBeforeSync);
 });
 
+test('Metabolism Stage 3: Full 118 Periodic Elements, Compound Molar Masses, and Voxel Mineralogy Composition', () => {
+  // 1. All 118 IUPAC elements present in strict order 1..118 with valid atomic masses
+  assert.equal(PERIODIC_ELEMENTS.length, 118);
+  for (let i = 0; i < PERIODIC_ELEMENTS.length; i++) {
+    const el = PERIODIC_ELEMENTS[i];
+    assert.equal(el.atomicNumber, i + 1);
+    assert.ok(el.atomicMassGPerMol > 0);
+    assert.ok(el.symbol.length >= 1 && el.symbol.length <= 3);
+  }
 
+  // 2. Compound molar mass strictly equals sum of constituent element masses (no string parsing in solver)
+  const glucose = COMPOUND_CATALOG.find((c) => c.id === 'C6H12O6');
+  assert.ok(glucose);
+  const expectedGlucoseKgMol = computeCompoundMolarMassKgPerMol({ C: 6, H: 12, O: 6 });
+  assert.ok(Math.abs(glucose.molarMassKgPerMol - expectedGlucoseKgMol) < 1e-6);
+  assert.ok(Math.abs(glucose.molarMassKgPerMol - 0.180156) < 0.001);
 
+  // 3. Every Voxel MaterialId mineral composition weights sum to 1.0 & elemental mass breakdown sums to 100%
+  for (const matId of [
+    MaterialId.Air,
+    MaterialId.Soil,
+    MaterialId.Stone,
+    MaterialId.Basalt,
+    MaterialId.Crystal,
+    MaterialId.Ice,
+    MaterialId.Sandstone,
+  ]) {
+    const comp = VOXEL_MATERIAL_COMPOSITIONS[matId];
+    assert.ok(comp && comp.components.length >= 1);
+    const weightSum = comp.components.reduce((acc, m) => acc + m.weightFraction, 0);
+    assert.ok(Math.abs(weightSum - 1.0) < 1e-5, `Material ${matId} mineral sum ${weightSum} != 1`);
+
+    const breakdown = computeMaterialElementalBreakdown(matId);
+    const pctSum = breakdown.reduce((acc, item) => acc + item.weightPercent, 0);
+    assert.ok(Math.abs(pctSum - 100) < 1e-3, `Material ${matId} elemental pct sum ${pctSum} != 100`);
+  }
+});
+
+test('Metabolism Stage 3: Planetary Carbon-Water, Cellular Metabolism & Hydrology Hypergraphs conserve atoms, mass & drive bioenergetics', () => {
+  // 1. Atomic element conservation + molar mass conservation across all 3 real biogeochemical/cellular hypergraphs
+  for (const hg of [
+    createPlanetaryCarbonWaterHypergraph(),
+    createCellularMetabolismHypergraph(),
+    createPlanetaryHydrologyHypergraph(),
+  ]) {
+    const elemCheck = verifyHypergraphElementBalance(hg);
+    assert.equal(elemCheck.isElementBalanced, true, `Element balance failed for ${hg.uiTitle}`);
+    assert.equal(hg.isStoichMassConserved, true, `Hypergraph mass balance failed for ${hg.uiTitle}`);
+    for (let r = 0; r < hg.numReactions; r++) {
+      assert.ok(
+        Math.abs(hg.stoichMassResiduals[r]) < 1e-6,
+        `Mass residual too large for ${hg.reactions[r].uiName}: ${hg.stoichMassResiduals[r]}`,
+      );
+    }
+  }
+
+  // 2. Planetary Carbon-Water Cycle run: mass conserved, reaction rates populated, Vox chemical probe works
+  const cwRunner = new MetabolismSimRunner('planetary_carbon_water', 2, 10.0, 7.0);
+  for (let i = 0; i < 12; i++) {
+    const tel = cwRunner.stepOnce(0.05);
+    assert.equal(tel.conservation.conserved, true);
+    assert.ok(tel.conservation.relativeError < 1e-5);
+  }
+  const cwSnap = cwRunner.getSummarySnapshot();
+  assert.equal(cwSnap.telemetry.meanReactionRates.length, cwSnap.hypergraph.reactions.length);
+  const voxProf = cwRunner.getVoxChemicalProfile(0, 7.0, 0);
+  assert.equal(voxProf.speciesConcentrations.length, 6);
+  assert.ok(voxProf.elementalBreakdown.length >= 2);
+
+  // 3. Cellular Metabolism run: aerobic dominance when O2 rich; anaerobic fermentation share rises when O2 depleted
+  const cellRunner = new MetabolismSimRunner('cellular_metabolism', 2, 10.0, 7.0);
+  for (let i = 0; i < 8; i++) {
+    cellRunner.stepOnce(0.05);
+  }
+  const aeroBio = computeCellularBioTelemetry(cellRunner.grid.hypergraph, cellRunner.grid.lastTelemetry);
+  assert.ok(aeroBio.atpSynthesisRateMmolLs > 0);
+  assert.ok(aeroBio.aerobicSharePct > 50, `Expected aerobic share > 50% with O2 present, got ${aeroBio.aerobicSharePct}`);
+
+  // Deplete O2 across grid -> anaerobic glycolysis / lactate share increases substantially
+  const S = cellRunner.grid.hypergraph.numSpecies;
+  for (let c = 0; c < cellRunner.grid.totalCells; c++) {
+    cellRunner.grid.speciesConc[c * S + 0] = 2.4; // rich glucose
+    cellRunner.grid.speciesConc[c * S + 1] = 0.0; // anoxic O2
+  }
+  cellRunner.stepOnce(0.05);
+  const anoxBio = computeCellularBioTelemetry(cellRunner.grid.hypergraph, cellRunner.grid.lastTelemetry);
+  assert.ok(
+    anoxBio.anaerobicSharePct > aeroBio.anaerobicSharePct,
+    `Expected anaerobic share under hypoxia (${anoxBio.anaerobicSharePct}%) > normoxia (${aeroBio.anaerobicSharePct}%)`,
+  );
+});
+
+test('Metabolism Stage 3: 6-Species GPU Ping-Pong Stencil Parity (Planetary Carbon-Water Cycle)', () => {
+  const hg = createPlanetaryCarbonWaterHypergraph();
+  const packed = packHypergraphKineticsVec4(hg);
+  assert.equal(packed.length, PACKED_KINETICS_VEC4_COUNT * 4);
+
+  const grid = new EulerianFvmGrid({
+    chunksPerAxis: 1,
+    worldHalf: 10.0,
+    baseRadius: 7.0,
+    hypergraph: hg,
+    boundaryMode: 'closed',
+  });
+  const n = grid.cellsPerAxis;
+  const desc = buildFvmGridDescriptor(grid);
+  const total = desc.totalCells;
+  const s012Ping = new Float32Array(total * 4);
+  const s012Pong = new Float32Array(total * 4);
+  const s345Ping = new Float32Array(total * 4);
+  const s345Pong = new Float32Array(total * 4);
+  const auxPing = new Float32Array(total * 4);
+  const auxPong = new Float32Array(total * 4);
+  const velPor = new Float32Array(total * 4);
+  const meta = new Float32Array(total * 4);
+  const diag = new Float32Array(total * 4);
+
+  for (let iz = 0; iz < n; iz++) {
+    for (let iy = 0; iy < n; iy++) {
+      for (let ix = 0; ix < n; ix++) {
+        const idx = ix + iy * n + iz * n * n;
+        s012Ping[idx * 4 + 0] = 1.2; // CO2
+        s012Ping[idx * 4 + 1] = 0.6; // H2O(g)
+        s012Ping[idx * 4 + 2] = ix < 4 ? 2.0 : 0.8; // H2O(l)
+        s012Ping[idx * 4 + 3] = 296 * 2200; // internal energy
+        s345Ping[idx * 4 + 0] = ix < 4 ? 1.1 : 0.2; // CH2O
+        s345Ping[idx * 4 + 1] = 0.9; // O2
+        s345Ping[idx * 4 + 2] = 0.1; // CH4
+        auxPing[idx * 4 + 3] = 296;
+        velPor[idx * 4 + 3] = 0.7;
+        meta[idx * 4 + 0] = 1.0;
+        meta[idx * 4 + 1] = 1.0;
+        meta[idx * 4 + 2] = 1.0;
+      }
+    }
+  }
+
+  let maxErr = 0;
+  for (let s = 0; s < 10; s++) {
+    const even = s % 2 === 0;
+    const res = evaluateSymmetricFluxReactionStepCpuReference(
+      desc,
+      hg,
+      even ? s012Ping : s012Pong,
+      even ? s012Pong : s012Ping,
+      even ? auxPing : auxPong,
+      even ? auxPong : auxPing,
+      velPor,
+      meta,
+      diag,
+      {
+        dtSec: 0.04,
+        boundaryMode: 'closed',
+        feedRatePerSec: 0,
+        exhaustRatePerSec: 0,
+        feedConcentrationMolM3: 0,
+        ambientTempK: 296,
+      },
+      even ? s345Ping : s345Pong,
+      even ? s345Pong : s345Ping,
+    );
+    if (res.relativeError > maxErr) maxErr = res.relativeError;
+    assert.equal(res.meanConcentrations.length, 6);
+    assert.ok(res.meanConcentrations.every((v) => Number.isFinite(v) && v >= 0));
+  }
+  assert.ok(maxErr < 1e-5, `Expected 6-species GPU stencil mass conservation < 1e-5, got ${maxErr}`);
+});
+
+test('Metabolism Stage 4: Mineral/Rate 6-channel FVM render view & VoxChemicalProfile live formula evaluations', () => {
+  const runner = new MetabolismSimRunner('planetary_carbon_water', 2, 10.0, 7.0);
+  for (let i = 0; i < 6; i++) {
+    runner.stepOnce(0.05);
+  }
+
+  // 1. FvmRenderFieldView exposes porosity and entropyProdRate read-only buffers
+  const view = runner.getReadOnlyRenderView();
+  assert.equal(view.porosity.length, runner.grid.totalCells);
+  assert.equal(view.entropyProdRate.length, runner.grid.totalCells);
+
+  // 2. sampleFvmRenderColor supports 'mineral' (with MaterialId) & 'rate' channels cleanly
+  const rgbMineral: [number, number, number] = [0, 0, 0];
+  const rgbRate: [number, number, number] = [0, 0, 0];
+  const hitMineral = sampleFvmRenderColor(view, 0, 7.0, 0, 'mineral', rgbMineral, MaterialId.Crystal);
+  const hitRate = sampleFvmRenderColor(view, 0, 7.0, 0, 'rate', rgbRate);
+  assert.equal(hitMineral, true);
+  assert.equal(hitRate, true);
+  assert.ok(rgbMineral.every((c) => Number.isFinite(c) && c >= 0 && c <= 1));
+  assert.ok(rgbRate.every((c) => Number.isFinite(c) && c >= 0 && c <= 1));
+
+  // 3. VoxChemicalProfile carries full thermodynamic & kinetic substitution fields matching core math
+  const prof = runner.getVoxChemicalProfile(0, 7.0, 0);
+  assert.ok(prof.cellVolumeM3 > 0);
+  assert.ok(prof.heatCapacityJm3K >= 1800);
+  assert.ok(prof.internalEnergyJm3 > 0);
+  assert.ok(prof.voxelMassKg > 0);
+  assert.equal(prof.reactionEvaluations.length, runner.grid.hypergraph.reactions.length);
+
+  const rxn0 = runner.grid.hypergraph.reactions[0];
+  const eval0 = prof.reactionEvaluations[0];
+  const expectedTpGate = evaluateTpWindowGate(rxn0, prof.temperatureK, prof.pressureAtm);
+  const expectedKf =
+    evaluateArrheniusRateConstant(
+      runner.grid.hypergraph.calibratedForwardA[0],
+      runner.grid.hypergraph.calibratedForwardEaJ[0],
+      rxn0.tempExponentBeta ?? 0,
+      prof.temperatureK,
+    ) * expectedTpGate;
+  assert.ok(Math.abs(eval0.tpGate - expectedTpGate) < 1e-6);
+  assert.ok(Math.abs(eval0.kf - expectedKf) < 1e-6);
+  assert.ok(Number.isFinite(eval0.enthalpyRateWm3));
+});
+
+test('Metabolism Stage 5: Core-Mantle-Crust Stratification, Reversible Cutaway, Epic Landforms & pangaea_epic Preset', () => {
+  const epicPreset = PLANET_PRESETS.find((p) => p.id === 'pangaea_epic');
+  assert.ok(epicPreset, 'Expected pangaea_epic preset in PLANET_PRESETS');
+
+  const planet = new VoxelPlanet({ ...epicPreset.config, voxelRadius: 18 });
+  const R = planet.baseRadius;
+
+  // 1. Stratified Core-Mantle-Crust materials
+  const coreMat = planet.sampleNearestMaterial(0, 0, 0);
+  const outerCoreMat = planet.sampleNearestMaterial(R * 0.23, 0, 0);
+  const mantleSamples = [
+    planet.sampleNearestMaterial(R * 0.72, 0, 0),
+    planet.sampleNearestMaterial(-R * 0.72, 0, 0),
+    planet.sampleNearestMaterial(0, R * 0.72, 0),
+    planet.sampleNearestMaterial(0, 0, R * 0.72),
+  ];
+  assert.equal(coreMat, MaterialId.Crystal, 'Inner Core (r < 0.17 R0) should be crystalline Fe-Ni');
+  assert.ok(
+    outerCoreMat === MaterialId.Basalt || outerCoreMat === MaterialId.Crystal,
+    'Outer Core / Deep Mantle should be molten Basalt or Crystal vein',
+  );
+  assert.ok(
+    mantleSamples.every((m) => m === MaterialId.Stone || m === MaterialId.Crystal),
+    'Upper Mantle / Lower Crust should consist of silicate Stone and rising Crystal plume conduits',
+  );
+  assert.ok(
+    mantleSamples.includes(MaterialId.Stone),
+    'Expected silicate Stone across Upper Mantle shell',
+  );
+
+  // 2. Epic basins & craters seeded cleanly with water
+  assert.ok(
+    planet.lakeBasinCenters.length >= 4,
+    `Expected >= 4 crater+tectonic basin centers, got ${planet.lakeBasinCenters.length}`,
+  );
+  const fluid = new FluidSim();
+  fluid.seedInitialLakes(planet);
+  assert.ok(fluid.activeCount >= 200, `Expected water particles across lakes/basins, got ${fluid.activeCount}`);
+
+  // 3. Reversible 90-deg spherical cutaway exposes core while preserving exact pre-cutaway restore
+  const preDens = planet.sampleDensity(R * 0.45, R * 0.45, R * 0.45);
+  assert.ok(preDens > 0, 'Crust/mantle quadrant should initially be solid');
+
+  const toggledOn = planet.setInteriorCutaway(true);
+  assert.equal(toggledOn, true);
+  assert.equal(planet.isInteriorCutawayEnabled(), true);
+  assert.ok(planet.sampleDensity(0, 0, 0) > 0, 'Inner core sphere must remain solid inside cutaway');
+  assert.ok(
+    planet.sampleDensity(R * 0.45, R * 0.45, R * 0.45) <= 0,
+    'Exposed (+X,+Y,+Z) octant outside core must be carved open',
+  );
+
+  const toggledOff = planet.setInteriorCutaway(false);
+  assert.equal(toggledOff, true);
+  assert.equal(planet.isInteriorCutawayEnabled(), false);
+  const postRestoreDens = planet.sampleDensity(R * 0.45, R * 0.45, R * 0.45);
+  assert.ok(
+    Math.abs(postRestoreDens - preDens) < 1e-5,
+    `Expected exact restoration after disabling cutaway (${preDens} vs ${postRestoreDens})`,
+  );
+});
+
+test('Metabolism Stage 5: FVM-Driven Volcanism, Tectonic Quakes, Plateau Uplift, Fluvial Erosion & Deep-Time Epochs', () => {
+  const R = 13.0;
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, radius: R, voxelRadius: 18 });
+  const runner = new MetabolismSimRunner('planetary_carbon_water', 3, planet.worldHalf, R);
+  runner.bindToPlanet(planet, [0.7, 0.5, 0.5], DEFAULT_ATMOS_CONFIG, DEFAULT_THERMAL_CONFIG);
+
+  // 1. Trigger volcano: builds volcanic basalt cone, degasses heat & CO2 into FVM grid
+  const rev0 = planet.voxelRevision;
+  const gridRev0 = runner.grid.revision;
+  const vRes = runner.triggerGeologicalEvent('volcano', planet, [R, 0, 0]);
+  assert.ok(vRes.terrainOps.some((o) => o.mode === 'volcano'));
+  assert.ok(vRes.hotspots.length >= 1 && vRes.hotspots[0].deltaC >= 400);
+  assert.ok(planet.voxelRevision > rev0);
+  assert.ok(runner.grid.revision > gridRev0);
+
+  // 2. Trigger earthquake: records Mw >= 6.0 and fractures fault porosity
+  const qRes = runner.triggerGeologicalEvent('quake', planet, [0, R, 0]);
+  assert.ok(qRes.quakes.length === 1 && qRes.quakes[0].magnitudeMw >= 6.0);
+  assert.ok(qRes.terrainOps.some((o) => o.mode === 'quake' && o.shape === 'cylinder'));
+
+  // 3. Trigger uplift & fluvial erosion: spawns rain particles & modifies sandstone/stone
+  const eRes = runner.triggerGeologicalEvent('erosion', planet, [0, 0, R]);
+  assert.ok(eRes.fluidOps.some((f) => f.kind === 'spawn_rain'));
+
+  // 4. Autonomous CPU FVM tectonic/fluvial evaluation responds cleanly to thermal & flux anomalies
+  const idx = runner.grid.cellIndex(
+    Math.floor(runner.grid.cellsPerAxis / 2),
+    Math.min(runner.grid.cellsPerAxis - 1, Math.floor(runner.grid.cellsPerAxis * 0.78)),
+    Math.floor(runner.grid.cellsPerAxis / 2),
+  );
+  runner.grid.activeMask[idx] = 1;
+  runner.grid.temperatureK[idx] = runner.grid.ambientTempK + 210;
+  runner.grid.pressureAtm[idx] = 6.5;
+  runner.grid.fluxX[idx] = 0.25;
+  const accum = new Float32Array(runner.grid.totalCells).fill(2.0);
+  const autoGeo = evaluateTectonicAndFluvialCandidatesFromCpuGrid(
+    runner.grid,
+    planet,
+    DEFAULT_PLANETARY_FEEDBACK_CONFIG,
+    { ...DEFAULT_GEOLOGICAL_EVOLUTION_CONFIG, epochAcceleration: 25 },
+    accum,
+    1.0,
+    5,
+  );
+  assert.ok(autoGeo.terrainOps.length >= 1, 'High FVM thermal/flux gradients should trigger autonomous geological ops');
+
+  // 5. Deep-Time Epoch ("沧海桑田"): steps coupled solver and executes multi-process morphogenesis
+  const epochRes = runner.runDeepTimeEpoch(10, planet);
+  assert.ok(epochRes.stepsExecuted >= 3);
+  assert.ok(epochRes.terrainOpsApplied >= 4);
+  const snap = runner.getSummarySnapshot();
+  assert.ok(snap.geologicalStats.geologicalAgeMyr >= 10);
+  assert.ok(snap.geologicalStats.activeVolcanoCount >= 1);
+  assert.ok(snap.geologicalStats.quakeCount >= 2);
+  assert.ok(snap.geologicalStats.recentGeoEvents.length >= 3);
+  assert.equal(snap.telemetry.conservation.conserved, true);
+});
+
+test('Distant Horizons LOD: surface horizon pyramid, strict timeBudgetMs cap, non-overlapping partition, and extended clip far', () => {
+  // 1. Extended horizon clip plane reaches planetary limb while keeping 24-bit depth ratio healthy
+  const dhClips = computeSafeClipPlanes(1.5, 1.6, 26.0, 62);
+  assert.ok(
+    dhClips.far >= 26.0 * 4.4,
+    `Expected horizon far clip >= 4.4*R (114.4m), got ${dhClips.far}`,
+  );
+  assert.ok(
+    dhClips.far / dhClips.near <= 2.5e5,
+    `Expected depth ratio <= 2.5e5, got ${dhClips.far / dhClips.near}`,
+  );
+
+  // 2. Time-budgeted streaming caps work per pass cleanly and converges incrementally
+  const epicPreset = PLANET_PRESETS.find((p) => p.id === 'pangaea_epic');
+  assert.ok(epicPreset, 'Expected pangaea_epic preset');
+  const epicCfg = {
+    ...epicPreset!.config,
+    seed: 661122,
+  };
+  const planet = new VoxelPlanet(epicCfg);
+  assert.equal(planet.isHighResStreaming, true);
+
+  const sy = planet.findSurfaceRadiusAlongRay(0, 1, 0);
+  const camPos: [number, number, number] = [0, sy + 1.4, 0];
+  const camFwd: [number, number, number] = [0, 0, -1];
+  const focusPos: [number, number, number] = [0, sy, -2.5];
+
+  const firstBudgeted = planet.streamHighResAround(
+    focusPos[0],
+    focusPos[1],
+    focusPos[2],
+    'blocky',
+    40,
+    2.8,
+    camPos,
+    camFwd,
+    { lodMode: 'auto', lod0Dist: 38, timeBudgetMs: 0.01, distantHorizon: true },
+  );
+  assert.equal(firstBudgeted.active, true);
+  assert.ok(firstBudgeted.pendingTotal > 0, 'Tiny timeBudgetMs should defer remaining builds to subsequent frames');
+  assert.ok(
+    firstBudgeted.rebuiltMeshes.length <= 12,
+    `Expected timeBudgetMs=0.01 to yield quickly with <=12 built meshes, got ${firstBudgeted.rebuiltMeshes.length}`,
+  );
+
+  // 3. Converge Distant Horizons surface pyramid across horizon
+  let lastBatch = firstBudgeted;
+  for (let pass = 0; pass < 60 && lastBatch.pendingTotal > 0; pass++) {
+    lastBatch = planet.streamHighResAround(
+      focusPos[0],
+      focusPos[1],
+      focusPos[2],
+      'blocky',
+      48,
+      2.8,
+      camPos,
+      camFwd,
+      { lodMode: 'auto', lod0Dist: 38, distantHorizon: true },
+    );
+  }
+  assert.equal(lastBatch.pendingTotal, 0, 'Distant Horizons pyramid should converge completely');
+  assert.equal(lastBatch.hideMacro, true);
+
+  // Verify non-overlapping dyadic partition invariant
+  for (const kStr of lastBatch.desiredKeys) {
+    const [smStr, coords] = kStr.split(':');
+    const sm = Number(smStr);
+    const [cx, cy, cz] = coords.split(',').map(Number);
+    let ax = cx;
+    let ay = cy;
+    let az = cz;
+    for (let asm = sm * 2; asm <= 1024; asm *= 2) {
+      ax = Math.floor(ax / 2);
+      ay = Math.floor(ay / 2);
+      az = Math.floor(az / 2);
+      assert.equal(
+        lastBatch.desiredKeys.has(`${asm}:${ax},${ay},${az}`),
+        false,
+        `Overlapping Distant Horizons leaf ${kStr} and ancestor ${asm}:${ax},${ay},${az}`,
+      );
+    }
+  }
+
+  // Verify multi-tier LOD cascade covers foreground 1:1 blocks and wide horizon shells
+  const scaleCounts = new Map<number, number>();
+  let maxDistInForwardCone = 0;
+  let forwardHighResCount = 0;
+  for (const kStr of lastBatch.desiredKeys) {
+    const ch = planet.sparseChunks.get(kStr);
+    if (!ch || ch.isEmpty) continue;
+    scaleCounts.set(ch.scaleMult, (scaleCounts.get(ch.scaleMult) ?? 0) + 1);
+    const span = 8 * ch.stepSize;
+    const dx = ch.originX + span * 0.5 - camPos[0];
+    const dy = ch.originY + span * 0.5 - camPos[1];
+    const dz = ch.originZ + span * 0.5 - camPos[2];
+    const dist = Math.hypot(dx, dy, dz);
+    const fwdDot = dist > 1e-4 ? (dx * camFwd[0] + dy * camFwd[1] + dz * camFwd[2]) / dist : 1;
+    if (fwdDot > 0.25 && ch.scaleMult <= 4) {
+      forwardHighResCount++;
+      if (dist > maxDistInForwardCone) maxDistInForwardCone = dist;
+    }
+  }
+  assert.ok((scaleCounts.get(1) ?? 0) >= 4, `Expected native 1:1 foreground chunks, got ${scaleCounts.get(1) ?? 0}`);
+  assert.ok(scaleCounts.size >= 3, `Expected >=3 active LOD scales in Distant Horizons pyramid, got ${scaleCounts.size}`);
+  assert.ok(forwardHighResCount >= 30, `Expected broad horizon dome in forward cone, got ${forwardHighResCount}`);
+  assert.ok(maxDistInForwardCone >= 12.0, `Expected sweeping horizon reach >= 12m, got ${maxDistInForwardCone.toFixed(2)}m`);
+});
 

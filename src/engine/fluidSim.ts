@@ -446,7 +446,7 @@ export class FluidSim {
     const basins = planet.lakeBasinCenters;
     if (basins.length === 0) return;
 
-    const targets = [240, 170, 150];
+    const targets = [200, 150, 130, 110, 100];
     let seed = (planet.seedConfig.seed ^ 918273) >>> 0;
     const rand = () => {
       seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
@@ -536,7 +536,7 @@ export class FluidSim {
       return true;
     }
 
-    const targets = [240, 170, 150];
+    const targets = [200, 150, 130, 110, 100];
     let seed = (planet.seedConfig.seed ^ 918273) >>> 0;
     const rand = () => {
       seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;

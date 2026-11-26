@@ -31,6 +31,7 @@ import {
 import {
   AUTOSAVE_SLOT_ID,
   buildNewTabLaunchUrl,
+  clearStoredPrefs,
   deletePlanetSaveFromDb,
   HANDOFF_SLOT_PREFIX,
   listPlanetSavesFromDb,
@@ -43,7 +44,18 @@ import {
 import { DEFAULT_ATMOS_CONFIG } from './engine/atmosphere';
 import { DEFAULT_THERMAL_CONFIG } from './engine/thermal';
 import { TitleOverlay } from './components/TitleOverlay';
-import { GameHud } from './components/GameHud';
+import {
+  BottomParameterBench,
+  TopCommandBar,
+  ViewportContextStrip,
+} from './components/GameHud';
+import { LeftToolPalette } from './components/LeftToolPalette';
+import { ToolStudioDrawer } from './components/ToolStudioDrawer';
+import {
+  RightInspectorDock,
+  RightInspectorTab,
+} from './components/RightInspectorDock';
+import { SystemSettingsPanel } from './components/SystemSettingsPanel';
 import { PauseModal } from './components/PauseModal';
 import { DebugMenu } from './components/DebugMenu';
 import { WorldSeedModal } from './components/WorldSeedModal';
@@ -138,11 +150,11 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     gravityScale: prefs.gravityScale ?? 1.0,
     sunElevationDeg: prefs.sunElevationDeg ?? 28,
     sunAzimuthDeg: prefs.sunAzimuthDeg ?? 28,
-    showGravityVectors: false,
+    showGravityVectors: prefs.showGravityVectors ?? false,
     cameraMode: 'explorer',
     perspectiveFov: prefs.perspectiveFov ?? 55,
     playerScale: clampPlayerScale(prefs.playerScale ?? DEFAULT_PLAYER_SCALE),
-    muted: false,
+    muted: prefs.muted ?? false,
     simPaused: false,
     lodMode: prefs.lodMode ?? 'auto',
     lod0Dist: Number(((prefs.lod0Dist ?? 38.0) * rScale).toPrecision(4)),
@@ -152,9 +164,9 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     debugProbeEnabled: false,
     terrainRenderMode: 'smooth',
     terrainOverlay: 'material',
-    voxelEdges: true,
+    voxelEdges: prefs.voxelEdges ?? true,
     coordSystem: prefs.coordSystem ?? 'geo_dd',
-    showCoordGrid: false,
+    showCoordGrid: prefs.showCoordGrid ?? false,
     enuOrigin: [initialRadius ?? DEFAULT_PLANET_RADIUS, 0, 0],
     atmosphere: { ...DEFAULT_ATMOS_CONFIG },
     thermal: { ...DEFAULT_THERMAL_CONFIG },
@@ -166,6 +178,10 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     showProtocell3d: true,
     showHoveredFvmVox: true,
     showFvmVoxelBlocks: true,
+    mouseSensitivity: prefs.mouseSensitivity ?? 1.0,
+    cameraDamping: prefs.cameraDamping ?? 1.0,
+    fpsSpeedMult: prefs.fpsSpeedMult ?? 1.0,
+    horizonStreamBudget: prefs.horizonStreamBudget ?? 1.0,
   };
 }
 
@@ -227,6 +243,13 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   hoveredWorldPos: null,
   hoveredAttitude: null,
   voxLocked: false,
+  canUndo: false,
+  canRedo: false,
+  undoCount: 0,
+  redoCount: 0,
+  historyCapacity: 64,
+  undoLabel: null,
+  redoLabel: null,
 };
 
 export default function App() {
@@ -258,16 +281,23 @@ export default function App() {
     seed: launchParams.seedConfig?.seed ?? DEFAULT_SEED_CONFIG.seed,
   }));
   const [initError, setInitError] = useState<string | null>(null);
-  const [debugOpen, setDebugOpen] = useState(false);
+  const [rightTab, setRightTab] = useState<RightInspectorTab | null>(null);
   const [mapsOpen, setMapsOpen] = useState(false);
-  const [atmosPanelOpen, setAtmosPanelOpen] = useState(false);
-  const [metabolismOpen, setMetabolismOpen] = useState(false);
   const [metabolismTabOverride, setMetabolismTabOverride] = useState<{
     tab: MetabolismPanelTab;
     nonce: number;
   } | null>(null);
   const [seedModalOpen, setSeedModalOpen] = useState(false);
-  const [dockOpen, setDockOpen] = useState(true);
+  const [leftDockOpen, setLeftDockOpen] = useState<boolean>(
+    () => loadStoredPrefs().leftDockOpen ?? true,
+  );
+  const [paletteExpanded, setPaletteExpanded] = useState(true);
+  const [dockOpen, setDockOpen] = useState<boolean>(
+    () => loadStoredPrefs().bottomDockOpen ?? true,
+  );
+  const [workspaceDensity, setWorkspaceDensity] = useState<'compact' | 'standard'>(
+    () => loadStoredPrefs().workspaceDensity ?? 'standard',
+  );
   const [touchEnabled, setTouchEnabled] = useState<boolean>(
     detectInitialTouchEnabled,
   );
@@ -282,7 +312,6 @@ export default function App() {
   const [toolOverrides, setToolOverrides] = useState<
     Record<string, Partial<ToolAttributes>>
   >(loadToolAttributeOverrides);
-  const [studioOpen, setStudioOpen] = useState(false);
   const [directorOpen, setDirectorOpen] = useState(false);
   const [directorPreviewing, setDirectorPreviewing] = useState(false);
   const [directorProject, setDirectorProject] = useState<DirectorTimelineProject>(
@@ -292,7 +321,6 @@ export default function App() {
   const [shotToast, setShotToast] = useState<string | null>(null);
   const [seedVersion, setSeedVersion] = useState(0);
   const [genProgress, setGenProgress] = useState<GenerationProgress | null>(null);
-  const [surveyOpen, setSurveyOpen] = useState(false);
   const [surveyTab, setSurveyTab] = useState<SurveyPanelTab>('pins');
   const [benchmarks, setBenchmarks] = useState<SurveyBenchmark[]>([]);
   const [pendingTransectA, setPendingTransectA] = useState<[number, number, number] | null>(null);
@@ -300,6 +328,13 @@ export default function App() {
   const [boreholeReport, setBoreholeReport] = useState<BoreholeLogReport | null>(null);
   const [boreholeDepthRatio, setBoreholeDepthRatio] = useState<number>(0.55);
   const [lockedAttitude, setLockedAttitude] = useState<GeologicalAttitude | null>(null);
+
+  const systemOpen = rightTab === 'system';
+  const debugOpen = rightTab === 'debug';
+  const atmosPanelOpen = rightTab === 'atmos';
+  const metabolismOpen = rightTab === 'metabolism';
+  const surveyOpen = rightTab === 'survey';
+  const studioOpen = rightTab === 'studio';
 
   const pendingTransectARef = useRef<[number, number, number] | null>(null);
   pendingTransectARef.current = pendingTransectA;
@@ -396,7 +431,7 @@ export default function App() {
       setConfig((prev) => ({ ...prev, material: picked }));
     });
     engine.setOnSurveyAction((action) => {
-      setSurveyOpen(true);
+      setRightTab('survey');
       if (action.kind === 'surveyPin') {
         setSurveyTab('pins');
         setBenchmarks((prev) => {
@@ -502,7 +537,7 @@ export default function App() {
     };
   }, [launchParams, refreshSavesList, syncScaledConfigForRadius]);
 
-  // Persist user preferences when LOD/gravity/sun/autosave/touch change
+  // Persist user preferences when LOD/gravity/sun/scale/controls/workspace change
   useEffect(() => {
     saveStoredPrefs({
       autoSaveEnabled,
@@ -516,10 +551,24 @@ export default function App() {
       perspectiveFov: config.perspectiveFov,
       playerScale: config.playerScale,
       coordSystem: config.coordSystem,
+      mouseSensitivity: config.mouseSensitivity,
+      cameraDamping: config.cameraDamping,
+      fpsSpeedMult: config.fpsSpeedMult,
+      horizonStreamBudget: config.horizonStreamBudget,
+      voxelEdges: config.voxelEdges,
+      showCoordGrid: config.showCoordGrid,
+      showGravityVectors: config.showGravityVectors,
+      muted: config.muted,
+      leftDockOpen,
+      bottomDockOpen: dockOpen,
+      workspaceDensity,
     });
   }, [
     autoSaveEnabled,
     touchEnabled,
+    leftDockOpen,
+    dockOpen,
+    workspaceDensity,
     config.gravityScale,
     config.sunElevationDeg,
     config.sunAzimuthDeg,
@@ -529,6 +578,14 @@ export default function App() {
     config.perspectiveFov,
     config.playerScale,
     config.coordSystem,
+    config.mouseSensitivity,
+    config.cameraDamping,
+    config.fpsSpeedMult,
+    config.horizonStreamBudget,
+    config.voxelEdges,
+    config.showCoordGrid,
+    config.showGravityVectors,
+    config.muted,
   ]);
 
   // Sync 3D surveying pins/transect/borehole/clinometer overlays to engine
@@ -662,13 +719,36 @@ export default function App() {
     [customTools, handleSelectTool, toolOverrides],
   );
 
+  const selectRightTab = useCallback(
+    (tab: RightInspectorTab) => {
+      setRightTab((prev) => {
+        const next = prev === tab ? null : tab;
+        handleUpdateConfig({ debugProbeEnabled: next === 'debug' });
+        return next;
+      });
+    },
+    [handleUpdateConfig],
+  );
+
   const handleToggleDebug = useCallback(() => {
-    setDebugOpen((prev) => {
-      const next = !prev;
-      handleUpdateConfig({ debugProbeEnabled: next });
-      return next;
-    });
-  }, [handleUpdateConfig]);
+    selectRightTab('debug');
+  }, [selectRightTab]);
+
+  const handleResetAllDefaults = useCallback(() => {
+    clearStoredPrefs();
+    const radius = engineRef.current?.planet.baseRadius ?? DEFAULT_PLANET_RADIUS;
+    const fresh = buildInitialConfig(radius);
+    configRef.current = fresh;
+    setConfig(fresh);
+    engineRef.current?.updateConfig(fresh);
+    setAutoSaveEnabled(true);
+    setTouchEnabled(false);
+    setLeftDockOpen(true);
+    setDockOpen(true);
+    setWorkspaceDensity('standard');
+    setShotToast('已恢复全局默认系统设置');
+    window.setTimeout(() => setShotToast(null), 2200);
+  }, []);
 
   const handleToggleTouch = useCallback(() => {
     setTouchEnabled((prev) => !prev);
@@ -847,6 +927,22 @@ export default function App() {
     setDirectorPreviewing(false);
   }, []);
 
+  const handleUndo = useCallback(() => {
+    const res = engineRef.current?.undo();
+    if (res?.ok) {
+      setShotToast(`已撤销：${res.label ?? '地形修改'}`);
+      window.setTimeout(() => setShotToast(null), 1800);
+    }
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    const res = engineRef.current?.redo();
+    if (res?.ok) {
+      setShotToast(`已重做：${res.label ?? '地形修改'}`);
+      window.setTimeout(() => setShotToast(null), 1800);
+    }
+  }, []);
+
   // Global keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -889,8 +985,8 @@ export default function App() {
           }
           return;
         }
-        if (surveyOpen && e.code === 'Escape') {
-          setSurveyOpen(false);
+        if (rightTab === 'survey' && e.code === 'Escape') {
+          setRightTab(null);
           return;
         }
         setPhase((prev) => (prev === 'playing' ? 'paused' : 'playing'));
@@ -899,9 +995,25 @@ export default function App() {
 
       if (phaseRef.current !== 'playing' || directorOpen) return;
 
+      if (e.ctrlKey || e.metaKey) {
+        if (e.code === 'KeyZ' && !e.shiftKey) {
+          e.preventDefault();
+          handleUndo();
+          return;
+        }
+        if (e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey)) {
+          e.preventDefault();
+          handleRedo();
+          return;
+        }
+      }
+
       if (e.code === 'KeyU') {
         e.preventDefault();
-        setSurveyOpen((prev) => !prev);
+        selectRightTab('survey');
+      } else if (e.code === 'F2') {
+        e.preventDefault();
+        selectRightTab('system');
       } else if (e.code === 'F10') {
         e.preventDefault();
         void handleQuickScreenshot();
@@ -916,10 +1028,10 @@ export default function App() {
         setMapsOpen((prev) => !prev);
       } else if (e.code === 'KeyC') {
         e.preventDefault();
-        setAtmosPanelOpen((prev) => !prev);
+        selectRightTab('atmos');
       } else if (e.code === 'KeyJ') {
         e.preventDefault();
-        setMetabolismOpen((prev) => !prev);
+        selectRightTab('metabolism');
       } else if (e.code === 'KeyL') {
         e.preventDefault();
         engineRef.current?.toggleMetabolismVoxLock();
@@ -1006,13 +1118,16 @@ export default function App() {
     directorOpen,
     directorPreviewing,
     handleQuickScreenshot,
+    handleRedo,
     handleSelectToolById,
     handleStopDirectorPreview,
     handleToggleDebug,
+    handleUndo,
     handleUpdateConfig,
     mapsOpen,
+    rightTab,
     seedModalOpen,
-    surveyOpen,
+    selectRightTab,
   ]);
 
   const surveyDatum: CoordDatum = useMemo(
@@ -1088,100 +1203,69 @@ export default function App() {
     return buildNewTabLaunchUrl(cfg, tabHandoffIdRef.current);
   }, [launchParams.seedConfig, seedVersion]);
 
-  return (
-    <main className="relative w-full h-full overflow-hidden bg-[#050810]">
-      {/* Isolated WebGPU/WebGL Canvas Mount (Docks cleanly inside Program Monitor when Director Studio is active) */}
-      <div
-        ref={mountRef}
-        data-testid="planet-canvas-mount"
-        className={
-          phase === 'playing' && directorOpen && directorProgramRect
-            ? 'fixed z-[32]'
-            : 'absolute inset-0 w-full h-full'
-        }
-        style={
-          phase === 'playing' && directorOpen && directorProgramRect
-            ? {
-                top: `${directorProgramRect.top}px`,
-                left: `${directorProgramRect.left}px`,
-                width: `${directorProgramRect.width}px`,
-                height: `${directorProgramRect.height}px`,
-                touchAction: 'none',
-              }
-            : { touchAction: 'none' }
-        }
-      />
-
-      {initError && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center p-6 bg-[#050810]/95">
-          <div className="max-w-md rounded-sm border border-rose-500/40 bg-slate-900 p-6 text-center">
-            <h2 className="font-display text-lg font-semibold text-white mb-2">
-              3D 渲染环境不可用
-            </h2>
-            <p className="text-sm text-slate-300">{initError}</p>
-          </div>
-        </div>
-      )}
-
-      {phase === 'title' && !genProgress?.active && (
-        <TitleOverlay
-          saves={saves}
-          initialSeedConfig={launchParams.seedConfig}
-          isGenerating={Boolean(genProgress?.active)}
-          backendInfo={telemetry.backendInfo}
-          onGenerateAndEnter={(cfg) => void handleGenerateWithSeed(cfg)}
-          onLoadSaveSlot={(id) => void handleLoadSlot(id)}
-          onDeleteSaveSlot={(id) => void handleDeleteSlot(id)}
+  const renderActiveInspectorContent = (): React.ReactNode => {
+    if (rightTab === 'system') {
+      return (
+        <SystemSettingsPanel
+          config={config}
+          telemetry={telemetry}
+          autoSaveEnabled={autoSaveEnabled}
+          touchEnabled={touchEnabled}
+          leftDockOpen={leftDockOpen}
+          bottomDockOpen={dockOpen}
+          workspaceDensity={workspaceDensity}
+          onUpdateConfig={handleUpdateConfig}
+          onToggleAutoSave={setAutoSaveEnabled}
+          onToggleTouch={handleToggleTouch}
+          onToggleLeftDock={() => setLeftDockOpen((v) => !v)}
+          onToggleBottomDock={() => setDockOpen((v) => !v)}
+          onChangeDensity={setWorkspaceDensity}
+          onResetAllDefaults={handleResetAllDefaults}
+          onClose={() => setRightTab(null)}
         />
-      )}
+      );
+    }
 
-      {phase === 'playing' && !directorOpen && (
-        <GameHud
+    if (rightTab === 'debug') {
+      return (
+        <DebugMenu
           telemetry={telemetry}
           config={config}
-          tools={allTools}
+          voxelStats={voxelStats}
+          onUpdateConfig={handleUpdateConfig}
+          onClose={handleToggleDebug}
+        />
+      );
+    }
+
+    if (rightTab === 'studio') {
+      return (
+        <ToolStudioDrawer
           activeTool={activeTool}
-          hasToolOverride={Boolean(toolOverrides[activeTool.id])}
-          studioOpen={studioOpen}
-          directorOpen={directorOpen}
-          directorPreviewing={directorPreviewing}
-          debugOpen={debugOpen}
-          mapsOpen={mapsOpen}
-          surveyOpen={surveyOpen}
-          surveyBenchmarkCount={benchmarks.length}
-          atmosPanelOpen={atmosPanelOpen}
-          metabolismOpen={metabolismOpen}
-          dockOpen={dockOpen}
-          touchEnabled={touchEnabled}
-          newTabUrl={newTabUrl}
-          onToggleStudio={() => setStudioOpen((v) => !v)}
-          onToggleDirector={() => setDirectorOpen((v) => !v)}
-          onQuickScreenshot={() => void handleQuickScreenshot()}
-          onStopDirectorPreview={handleStopDirectorPreview}
-          onSelectTool={handleSelectTool}
+          paletteExpanded={paletteExpanded}
+          hasOverride={Boolean(toolOverrides[activeTool.id])}
           onUpdateActiveAttributes={handleUpdateActiveAttributes}
           onResetBuiltinOverride={handleResetBuiltinOverride}
           onSaveCustomTool={handleSaveCustomTool}
           onDeleteCustomTool={handleDeleteCustomTool}
-          onToggleDock={() => setDockOpen((v) => !v)}
-          onToggleTouch={handleToggleTouch}
-          onPrepareNewTab={handlePrepareNewTab}
-          onUpdateConfig={handleUpdateConfig}
-          onClearWater={handleClearWater}
-          onResetPlanet={handleResetPlanet}
-          onOpenSeedModal={() => setSeedModalOpen(true)}
-          onToggleMaps={() => setMapsOpen((v) => !v)}
-          onToggleSurvey={() => setSurveyOpen((v) => !v)}
-          onToggleAtmosPanel={() => setAtmosPanelOpen((v) => !v)}
-          onToggleMetabolism={() => setMetabolismOpen((v) => !v)}
-          onToggleDebug={handleToggleDebug}
-          onReselectLanding={() => engineRef.current?.reselectLandingSite()}
-          onFocusCamera={() => engineRef.current?.focusCameraAtPointer()}
-          onPause={() => setPhase('paused')}
+          onClose={() => setRightTab(null)}
         />
-      )}
+      );
+    }
 
-      {phase === 'playing' && surveyOpen && (
+    if (rightTab === 'atmos') {
+      return (
+        <AtmosphereThermalPanel
+          telemetry={telemetry}
+          config={config}
+          onUpdateConfig={handleUpdateConfig}
+          onClose={() => setRightTab(null)}
+        />
+      );
+    }
+
+    if (rightTab === 'survey') {
+      return (
         <SurveyPanel
           activeTab={surveyTab}
           onChangeTab={setSurveyTab}
@@ -1305,59 +1389,13 @@ export default function App() {
           onTeleportToWorld={(worldPos) => {
             engineRef.current?.teleportToWorldPos(worldPos[0], worldPos[1], worldPos[2]);
           }}
-          onClose={() => setSurveyOpen(false)}
+          onClose={() => setRightTab(null)}
         />
-      )}
+      );
+    }
 
-      {phase === 'playing' && touchEnabled && (
-        <TouchControlsOverlay
-          cameraMode={config.cameraMode}
-          touchActionMode={touchActionMode}
-          dockOpen={dockOpen}
-          onChangeTouchActionMode={setTouchActionMode}
-          onJoystickMove={(x, y) =>
-            engineRef.current?.setVirtualJoystick(x, y)
-          }
-          onVerticalChange={(up, down) =>
-            engineRef.current?.setVirtualVertical(up, down)
-          }
-          onJump={() => engineRef.current?.triggerVirtualJump()}
-        />
-      )}
-
-      {phase === 'playing' && atmosPanelOpen && (
-        <AtmosphereThermalPanel
-          telemetry={telemetry}
-          config={config}
-          onUpdateConfig={handleUpdateConfig}
-          onClose={() => setAtmosPanelOpen(false)}
-        />
-      )}
-
-      {phase === 'playing' && !directorOpen && engineRef.current && (
-        <VoxelFieldLegend
-          config={config}
-          snapshot={
-            telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
-          }
-          hoveredVoxProfile={telemetry.hoveredVoxProfile}
-          voxLocked={Boolean(telemetry.voxLocked)}
-          metabolismOpen={metabolismOpen}
-          onUpdateConfig={handleUpdateConfig}
-          onToggleVoxLock={() => {
-            engineRef.current?.toggleMetabolismVoxLock();
-          }}
-          onOpenFormulas={() => {
-            setMetabolismOpen(true);
-            setMetabolismTabOverride((prev) => ({
-              tab: 'formulas',
-              nonce: (prev?.nonce ?? 0) + 1,
-            }));
-          }}
-        />
-      )}
-
-      {phase === 'playing' && metabolismOpen && engineRef.current && (
+    if (rightTab === 'metabolism' && engineRef.current) {
+      return (
         <MetabolismPanel
           snapshot={
             telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
@@ -1407,17 +1445,210 @@ export default function App() {
           onRunDeepTimeEpoch={(deltaMyr) => {
             engineRef.current?.runDeepTimeGeologicalEpoch(deltaMyr);
           }}
-          onClose={() => setMetabolismOpen(false)}
+          onClose={() => setRightTab(null)}
+        />
+      );
+    }
+
+    return null;
+  };
+
+  const legendElement =
+    phase === 'playing' &&
+    !directorOpen &&
+    engineRef.current &&
+    (config.terrainOverlay !== 'material' || metabolismOpen) ? (
+      <VoxelFieldLegend
+        config={config}
+        snapshot={
+          telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
+        }
+        hoveredVoxProfile={telemetry.hoveredVoxProfile}
+        voxLocked={Boolean(telemetry.voxLocked)}
+        metabolismOpen={metabolismOpen}
+        onUpdateConfig={handleUpdateConfig}
+        onToggleVoxLock={() => {
+          engineRef.current?.toggleMetabolismVoxLock();
+        }}
+        onOpenFormulas={() => {
+          setRightTab('metabolism');
+          setMetabolismTabOverride((prev) => ({
+            tab: 'formulas',
+            nonce: (prev?.nonce ?? 0) + 1,
+          }));
+        }}
+      />
+    ) : null;
+
+  const showWorkstationChrome = phase === 'playing' && !directorOpen;
+
+  return (
+    <main className="relative w-full h-full overflow-hidden bg-[#050810] flex flex-col">
+      {showWorkstationChrome && (
+        <TopCommandBar
+          telemetry={telemetry}
+          config={config}
+          systemOpen={systemOpen}
+          directorOpen={directorOpen}
+          debugOpen={debugOpen}
+          mapsOpen={mapsOpen}
+          surveyOpen={surveyOpen}
+          surveyBenchmarkCount={benchmarks.length}
+          atmosPanelOpen={atmosPanelOpen}
+          metabolismOpen={metabolismOpen}
+          touchEnabled={touchEnabled}
+          newTabUrl={newTabUrl}
+          onToggleSystem={() => selectRightTab('system')}
+          onToggleDirector={() => setDirectorOpen((v) => !v)}
+          onQuickScreenshot={() => void handleQuickScreenshot()}
+          onPrepareNewTab={handlePrepareNewTab}
+          onUpdateConfig={handleUpdateConfig}
+          onOpenSeedModal={() => setSeedModalOpen(true)}
+          onToggleMaps={() => setMapsOpen((v) => !v)}
+          onToggleSurvey={() => selectRightTab('survey')}
+          onToggleAtmosPanel={() => selectRightTab('atmos')}
+          onToggleMetabolism={() => selectRightTab('metabolism')}
+          onToggleDebug={handleToggleDebug}
+          onToggleTouch={handleToggleTouch}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          onPause={() => setPhase('paused')}
         />
       )}
 
-      {phase === 'playing' && debugOpen && (
-        <DebugMenu
+      {/* Main Docked Middle Workstation Area (Zero Canvas Overlap) */}
+      <div className="flex-1 min-h-0 flex overflow-hidden relative">
+        {showWorkstationChrome && leftDockOpen && (
+          <LeftToolPalette
+            config={config}
+            telemetry={telemetry}
+            tools={allTools}
+            activeTool={activeTool}
+            expanded={paletteExpanded}
+            studioOpen={studioOpen}
+            onToggleExpanded={() => setPaletteExpanded((v) => !v)}
+            onToggleStudio={() => selectRightTab('studio')}
+            onSelectTool={handleSelectTool}
+            onUpdateConfig={handleUpdateConfig}
+          />
+        )}
+
+        {/* Center Pane: Docked Telemetry Header + Unobstructed 3D Viewport Stage */}
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col relative bg-[#04070e]">
+          {showWorkstationChrome && (
+            <ViewportContextStrip
+              telemetry={telemetry}
+              config={config}
+              activeTool={activeTool}
+              debugOpen={debugOpen}
+              directorPreviewing={directorPreviewing}
+              onUpdateConfig={handleUpdateConfig}
+              onToggleDebug={handleToggleDebug}
+              onReselectLanding={() => engineRef.current?.reselectLandingSite()}
+              onFocusCamera={() => engineRef.current?.focusCameraAtPointer()}
+              onStopDirectorPreview={handleStopDirectorPreview}
+            />
+          )}
+
+          {/* Unobstructed 3D Canvas Stage */}
+          <div className="flex-1 min-h-0 relative overflow-hidden">
+            <div
+              ref={mountRef}
+              data-testid="planet-canvas-mount"
+              className={
+                phase === 'playing' && directorOpen && directorProgramRect
+                  ? 'fixed z-[32]'
+                  : 'absolute inset-0 w-full h-full'
+              }
+              style={
+                phase === 'playing' && directorOpen && directorProgramRect
+                  ? {
+                      top: `${directorProgramRect.top}px`,
+                      left: `${directorProgramRect.left}px`,
+                      width: `${directorProgramRect.width}px`,
+                      height: `${directorProgramRect.height}px`,
+                      touchAction: 'none',
+                    }
+                  : { touchAction: 'none' }
+              }
+            />
+
+            {showWorkstationChrome && (
+              <div
+                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none"
+                aria-hidden="true"
+              >
+                <div className="w-1.5 h-1.5 rounded-full border border-white/70 bg-sky-400/50" />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {showWorkstationChrome && (
+          <RightInspectorDock
+            activeTab={rightTab}
+            onSelectTab={selectRightTab}
+            config={config}
+            surveyBenchmarkCount={benchmarks.length}
+            legendNode={legendElement}
+          >
+            {renderActiveInspectorContent()}
+          </RightInspectorDock>
+        )}
+      </div>
+
+      {showWorkstationChrome && (
+        <BottomParameterBench
           telemetry={telemetry}
           config={config}
-          voxelStats={voxelStats}
+          activeTool={activeTool}
+          studioOpen={studioOpen}
+          dockOpen={dockOpen}
+          onToggleDock={() => setDockOpen((v) => !v)}
+          onToggleStudio={() => selectRightTab('studio')}
+          onToggleSystem={() => selectRightTab('system')}
           onUpdateConfig={handleUpdateConfig}
-          onClose={handleToggleDebug}
+          onClearWater={handleClearWater}
+          onResetPlanet={handleResetPlanet}
+        />
+      )}
+
+      {initError && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-6 bg-[#050810]/95">
+          <div className="max-w-md rounded-sm border border-rose-500/40 bg-slate-900 p-6 text-center">
+            <h2 className="font-display text-lg font-semibold text-white mb-2">
+              3D 渲染环境不可用
+            </h2>
+            <p className="text-sm text-slate-300">{initError}</p>
+          </div>
+        </div>
+      )}
+
+      {phase === 'title' && !genProgress?.active && (
+        <TitleOverlay
+          saves={saves}
+          initialSeedConfig={launchParams.seedConfig}
+          isGenerating={Boolean(genProgress?.active)}
+          backendInfo={telemetry.backendInfo}
+          onGenerateAndEnter={(cfg) => void handleGenerateWithSeed(cfg)}
+          onLoadSaveSlot={(id) => void handleLoadSlot(id)}
+          onDeleteSaveSlot={(id) => void handleDeleteSlot(id)}
+        />
+      )}
+
+      {phase === 'playing' && touchEnabled && (
+        <TouchControlsOverlay
+          cameraMode={config.cameraMode}
+          touchActionMode={touchActionMode}
+          dockOpen={dockOpen}
+          onChangeTouchActionMode={setTouchActionMode}
+          onJoystickMove={(x, y) =>
+            engineRef.current?.setVirtualJoystick(x, y)
+          }
+          onVerticalChange={(up, down) =>
+            engineRef.current?.setVirtualVertical(up, down)
+          }
+          onJump={() => engineRef.current?.triggerVirtualJump()}
         />
       )}
 
@@ -1437,7 +1668,7 @@ export default function App() {
       )}
 
       {shotToast && (
-        <div className="fixed top-12 right-3 z-30 pointer-events-none px-3 py-1.5 rounded-xs border border-emerald-500/60 bg-[#090d18]/95 text-xs text-emerald-200 font-mono-tabular shadow-lg">
+        <div className="fixed top-10 right-14 z-30 pointer-events-none px-3 py-1.5 rounded-xs border border-emerald-500/60 bg-[#080c15] text-xs text-emerald-200 font-mono-tabular">
           {shotToast}
         </div>
       )}

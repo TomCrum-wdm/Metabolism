@@ -4,6 +4,7 @@ interface NumericCadInputProps {
   value: number;
   onChangeValue: (next: number) => void;
   minValid?: number;
+  maxValid?: number;
   integer?: boolean;
   unit?: string;
   ariaLabel?: string;
@@ -20,10 +21,25 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+export function formatCadNumber(v: number): string {
+  if (!Number.isFinite(v)) return '0';
+  if (v === 0) return '0';
+  const abs = Math.abs(v);
+  if (abs < 1e-4 || abs >= 1e7) {
+    return v
+      .toExponential(3)
+      .replace(/(\.\d*?[1-9])0+e/, '$1e')
+      .replace(/\.0+e/, 'e')
+      .replace('e+', 'e');
+  }
+  return String(Number(v.toPrecision(6)));
+}
+
 export const NumericCadInput: React.FC<NumericCadInputProps> = ({
   value,
   onChangeValue,
   minValid,
+  maxValid,
   integer = false,
   unit,
   ariaLabel,
@@ -35,15 +51,12 @@ export const NumericCadInput: React.FC<NumericCadInputProps> = ({
   sliderStep,
   sliderScale = 'linear',
 }) => {
-  const formatVal = (v: number) =>
-    Number.isFinite(v) ? String(Number(v.toFixed(4))) : '0';
-
-  const [text, setText] = useState<string>(() => formatVal(value));
+  const [text, setText] = useState<string>(() => formatCadNumber(value));
   const [focused, setFocused] = useState(false);
 
   useEffect(() => {
     if (!focused) {
-      setText(formatVal(value));
+      setText(formatCadNumber(value));
     }
   }, [value, focused]);
 
@@ -78,15 +91,22 @@ export const NumericCadInput: React.FC<NumericCadInputProps> = ({
     return ((Math.log(safeV) - logMin) / (logMax - logMin || 1)) * 1000;
   }, [effMax, effMin, isLog, value]);
 
-  const commitIfValid = (raw: string) => {
+  const parseAndValidate = (raw: string): number | null => {
     const trimmed = raw.trim();
-    if (trimmed === '' || trimmed === '-' || trimmed === '.' || trimmed === '-.') {
-      return;
+    if (
+      trimmed === '' ||
+      trimmed === '-' ||
+      trimmed === '.' ||
+      trimmed === '-.' ||
+      /[eE][+-]?$/.test(trimmed)
+    ) {
+      return null;
     }
     const parsed = integer ? parseInt(trimmed, 10) : Number(trimmed);
-    if (!Number.isFinite(parsed)) return;
-    if (minValid !== undefined && parsed < minValid) return;
-    onChangeValue(parsed);
+    if (!Number.isFinite(parsed)) return null;
+    if (minValid !== undefined && parsed < minValid) return null;
+    if (maxValid !== undefined && parsed > maxValid) return null;
+    return parsed;
   };
 
   const handleSliderChange = (rawPos: number) => {
@@ -98,12 +118,15 @@ export const NumericCadInput: React.FC<NumericCadInputProps> = ({
       const raw = Math.exp(logMin + t * (logMax - logMin));
       nextVal = integer ? Math.round(raw) : Number(raw.toPrecision(3));
     } else {
-      nextVal = integer ? Math.round(rawPos) : Number(rawPos.toFixed(4));
+      nextVal = integer ? Math.round(rawPos) : Number(rawPos.toPrecision(5));
     }
     if (minValid !== undefined && nextVal < minValid) {
       nextVal = minValid;
     }
-    setText(formatVal(nextVal));
+    if (maxValid !== undefined && nextVal > maxValid) {
+      nextVal = maxValid;
+    }
+    setText(formatCadNumber(nextVal));
     onChangeValue(nextVal);
   };
 
@@ -111,8 +134,8 @@ export const NumericCadInput: React.FC<NumericCadInputProps> = ({
     <div className={`flex flex-col gap-1 ${className}`}>
       <div className="inline-flex items-center border border-slate-700/90 bg-[#050810] rounded-xs focus-within:border-sky-400 transition-colors">
         <input
-          type="number"
-          step="any"
+          type="text"
+          inputMode="decimal"
           aria-label={ariaLabel}
           data-testid={testId}
           value={text}
@@ -123,28 +146,39 @@ export const NumericCadInput: React.FC<NumericCadInputProps> = ({
           onChange={(e) => {
             const next = e.target.value;
             setText(next);
-            commitIfValid(next);
+            const parsed = parseAndValidate(next);
+            if (parsed !== null) {
+              onChangeValue(parsed);
+            }
           }}
           onBlur={() => {
             setFocused(false);
-            const trimmed = text.trim();
-            const parsed = integer ? parseInt(trimmed, 10) : Number(trimmed);
-            if (
-              Number.isFinite(parsed) &&
-              (minValid === undefined || parsed >= minValid)
-            ) {
+            const parsed = parseAndValidate(text);
+            if (parsed !== null) {
               onChangeValue(parsed);
-              setText(formatVal(parsed));
+              setText(formatCadNumber(parsed));
             } else {
-              setText(formatVal(value));
+              setText(formatCadNumber(value));
             }
           }}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
               e.currentTarget.blur();
+            } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+              e.preventDefault();
+              const dir = e.key === 'ArrowUp' ? 1 : -1;
+              const next = isLog
+                ? value * (dir > 0 ? 1.25 : 0.8)
+                : value + effStep * dir;
+              const clampedMin = minValid !== undefined ? Math.max(minValid, next) : next;
+              const finalV = maxValid !== undefined ? Math.min(maxValid, clampedMin) : clampedMin;
+              if (Number.isFinite(finalV)) {
+                setText(formatCadNumber(finalV));
+                onChangeValue(finalV);
+              }
             }
           }}
-          className="cad-num w-full min-w-0 bg-transparent px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none text-right"
+          className="cad-num w-full min-w-0 bg-transparent px-1.5 py-0.5 text-[11px] font-mono-tabular text-slate-100 focus:outline-none text-right"
         />
         {unit && (
           <span className="pr-1.5 text-[10px] font-mono-tabular text-slate-400 select-none shrink-0">

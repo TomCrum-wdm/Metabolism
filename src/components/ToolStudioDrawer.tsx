@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Copy, Plus, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { MaterialId } from '../engine/voxelPlanet';
 import {
@@ -13,7 +13,7 @@ import { TOOL_ICON_OPTIONS, ToolIcon } from './ToolIcon';
 
 interface ToolStudioDrawerProps {
   activeTool: PlanetToolDef;
-  paletteExpanded: boolean;
+  paletteExpanded?: boolean;
   hasOverride: boolean;
   onUpdateActiveAttributes: (partial: Partial<ToolAttributes>) => void;
   onResetBuiltinOverride: (toolId: string) => void;
@@ -108,16 +108,6 @@ export const ToolStudioDrawer: React.FC<ToolStudioDrawerProps> = ({
     setTab('create');
   };
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.code === 'Escape') {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
   const curAttrs = tab === 'inspect' ? activeTool.attributes : draftAttrs;
   const setAttr = (partial: Partial<ToolAttributes>) => {
     if (tab === 'inspect') {
@@ -146,9 +136,7 @@ export const ToolStudioDrawer: React.FC<ToolStudioDrawerProps> = ({
   return (
     <section
       data-testid="tool-studio-drawer"
-      className={`pointer-events-auto fixed top-11 bottom-16 z-[25] w-80 rounded-sm border border-slate-700 bg-[#090d18]/96 shadow-2xl flex flex-col overflow-hidden transition-transform duration-150 ${
-        paletteExpanded ? 'left-[214px]' : 'left-14'
-      }`}
+      className="flex-1 min-h-0 flex flex-col bg-[#080c15] text-slate-200 overflow-hidden"
     >
       {/* Header */}
       <div className="px-3 py-2 border-b border-slate-800 bg-[#0d1322] flex items-center justify-between gap-2 shrink-0">

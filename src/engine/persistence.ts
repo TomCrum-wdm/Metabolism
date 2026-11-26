@@ -44,6 +44,17 @@ export interface StoredUserPrefs {
   perspectiveFov?: number;
   playerScale?: number;
   coordSystem?: CoordSystemId;
+  mouseSensitivity?: number;
+  cameraDamping?: number;
+  fpsSpeedMult?: number;
+  horizonStreamBudget?: number;
+  voxelEdges?: boolean;
+  showCoordGrid?: boolean;
+  showGravityVectors?: boolean;
+  muted?: boolean;
+  leftDockOpen?: boolean;
+  bottomDockOpen?: boolean;
+  workspaceDensity?: 'compact' | 'standard';
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -167,6 +178,17 @@ export function loadStoredPrefs(): StoredUserPrefs {
       perspectiveFov: parsed.perspectiveFov,
       playerScale: parsed.playerScale,
       coordSystem: parsed.coordSystem,
+      mouseSensitivity: parsed.mouseSensitivity,
+      cameraDamping: parsed.cameraDamping,
+      fpsSpeedMult: parsed.fpsSpeedMult,
+      horizonStreamBudget: parsed.horizonStreamBudget,
+      voxelEdges: parsed.voxelEdges,
+      showCoordGrid: parsed.showCoordGrid,
+      showGravityVectors: parsed.showGravityVectors,
+      muted: parsed.muted,
+      leftDockOpen: parsed.leftDockOpen,
+      bottomDockOpen: parsed.bottomDockOpen,
+      workspaceDensity: parsed.workspaceDensity,
     };
   } catch {
     return { autoSaveEnabled: true };
@@ -178,6 +200,14 @@ export function saveStoredPrefs(prefs: StoredUserPrefs): void {
     localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
   } catch {
     // Ignore storage quota errors
+  }
+}
+
+export function clearStoredPrefs(): void {
+  try {
+    localStorage.removeItem(PREFS_KEY);
+  } catch {
+    // Ignore
   }
 }
 

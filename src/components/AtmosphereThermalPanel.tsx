@@ -48,10 +48,10 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
   return (
     <aside
       data-testid="atmos-thermal-panel"
-      className="fixed left-2.5 top-11 z-20 w-[336px] max-w-[calc(100vw-20px)] max-h-[calc(100vh-140px)] flex flex-col rounded-sm border border-slate-700/90 bg-[#090d18]/96 text-slate-100 overflow-hidden"
+      className="flex-1 min-h-0 flex flex-col bg-[#080c15] text-slate-100 overflow-hidden"
     >
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-slate-800 px-3 py-1.5 bg-[#060912]">
+      <div className="flex items-center justify-between border-b border-slate-800 px-3 py-2 bg-[#0b101d] shrink-0">
         <div className="flex items-center gap-1.5">
           <Cloud className="w-3.5 h-3.5 text-sky-400" />
           <span className="font-display text-xs font-semibold text-white">

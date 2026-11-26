@@ -319,6 +319,13 @@ export interface SandboxTelemetry {
   voxLocked?: boolean;
   interiorCutawayEnabled?: boolean;
   metabolismSummary?: MetabolismSummarySnapshot;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoCount: number;
+  redoCount: number;
+  historyCapacity: number;
+  undoLabel: string | null;
+  redoLabel: string | null;
 }
 
 export interface SandboxConfig {
@@ -360,6 +367,10 @@ export interface SandboxConfig {
   showProtocell3d?: boolean;
   showHoveredFvmVox?: boolean;
   showFvmVoxelBlocks?: boolean;
+  mouseSensitivity?: number;
+  cameraDamping?: number;
+  fpsSpeedMult?: number;
+  horizonStreamBudget?: number;
 }
 
 function detectSoftwareRenderer(): boolean {
@@ -904,6 +915,10 @@ export class PlanetarySandboxEngine {
     showProtocell3d: true,
     showHoveredFvmVox: true,
     showFvmVoxelBlocks: true,
+    mouseSensitivity: 1.0,
+    cameraDamping: 1.0,
+    fpsSpeedMult: 1.0,
+    horizonStreamBudget: 1.0,
   };
 
   private lastTime = 0;
@@ -2352,30 +2367,94 @@ export class PlanetarySandboxEngine {
 
   public triggerGeologicalEvent(kind: 'volcano' | 'quake' | 'uplift' | 'erosion'): void {
     if (!this.hasWorld) return;
-    this.metabolism.triggerGeologicalEvent(
-      kind,
-      this.planet,
-      undefined,
-      (op) => this.applyMetabolismMineralOp(op),
-      (fop) => this.applyMetabolismFluidOp(fop),
-      (hs) => this.applyMetabolismThermalHotspots(hs),
-    );
+    const labelMap: Record<typeof kind, string> = {
+      volcano: '构造火山喷发',
+      quake: '构造地震断层',
+      uplift: '构造板块隆升',
+      erosion: '强烈侵蚀事件',
+    };
+    this.planet.recordHistoryAtomic(labelMap[kind], () => {
+      this.metabolism.triggerGeologicalEvent(
+        kind,
+        this.planet,
+        undefined,
+        (op) => this.applyMetabolismMineralOp(op),
+        (fop) => this.applyMetabolismFluidOp(fop),
+        (hs) => this.applyMetabolismThermalHotspots(hs),
+      );
+    });
     this.syncMetabolismReadOnlyVisuals(true);
     this.emitTelemetrySnapshot();
   }
 
   public runDeepTimeGeologicalEpoch(deltaMyr = 10): void {
     if (!this.hasWorld) return;
-    this.metabolism.runDeepTimeEpoch(
-      deltaMyr,
-      this.planet,
-      (op) => this.applyMetabolismMineralOp(op),
-      (fop) => this.applyMetabolismFluidOp(fop),
-      (hs) => this.applyMetabolismThermalHotspots(hs),
-    );
+    this.planet.recordHistoryAtomic(`深时地质演化 +${deltaMyr}Myr`, () => {
+      this.metabolism.runDeepTimeEpoch(
+        deltaMyr,
+        this.planet,
+        (op) => this.applyMetabolismMineralOp(op),
+        (fop) => this.applyMetabolismFluidOp(fop),
+        (hs) => this.applyMetabolismThermalHotspots(hs),
+      );
+    });
     this.updateChunksWithLod(48);
     this.syncMetabolismReadOnlyVisuals(true);
     this.emitTelemetrySnapshot();
+  }
+
+  public undo(): { ok: boolean; label?: string } {
+    if (!this.hasWorld) return { ok: false };
+    this.isSculpting = false;
+    const res = this.planet.undo();
+    if (!res) return { ok: false };
+    this.rebuildTerrainAfterHistoryStep(res);
+    this.sound.playProbe();
+    this.emitTelemetrySnapshot();
+    return { ok: true, label: res.entry.label };
+  }
+
+  public redo(): { ok: boolean; label?: string } {
+    if (!this.hasWorld) return { ok: false };
+    this.isSculpting = false;
+    const res = this.planet.redo();
+    if (!res) return { ok: false };
+    this.rebuildTerrainAfterHistoryStep(res);
+    this.sound.playBuild();
+    this.emitTelemetrySnapshot();
+    return { ok: true, label: res.entry.label };
+  }
+
+  private rebuildTerrainAfterHistoryStep(res: {
+    entry: { center: [number, number, number]; radius: number };
+    modifiedChunks: number[];
+    dirtySparseKeys: string[];
+  }): void {
+    this.updateChunksWithLod(Math.max(128, res.modifiedChunks.length + 16));
+    this.highResStreamDirty = true;
+    if (this.planet.isHighResStreaming) {
+      this.updateHighResStreaming(null, Math.max(128, res.dirtySparseKeys.length + 48));
+      for (const key of res.dirtySparseKeys) {
+        const sc = this.planet.sparseChunks.get(key);
+        const existingMesh = this.highResMeshes.get(key);
+        if (sc && sc.dirty && existingMesh) {
+          this.scene?.remove(existingMesh);
+          existingMesh.geometry.dispose();
+          this.highResMeshes.delete(key);
+        }
+      }
+      this.updateHighResStreaming(null, Math.max(64, res.dirtySparseKeys.length + 16));
+    }
+    const [cx, cy, cz] = res.entry.center;
+    this.metabolism.syncLocalTerrainPorosity(
+      cx,
+      cy,
+      cz,
+      Math.max(res.entry.radius, this.planet.voxelSize * 2),
+      this.planet,
+    );
+    this.waterMeshDirty = true;
+    this.telemetryTimer = 1;
   }
 
   public togglePlanetInteriorCutaway(): boolean {
@@ -4448,7 +4527,9 @@ export class PlanetarySandboxEngine {
           this.magmaVel[i3 + 1] * this.magmaVel[i3 + 1] +
           this.magmaVel[i3 + 2] * this.magmaVel[i3 + 2];
         if (nextLife <= 0.15 && this.magmaRad[i] > 0 && speedSq < 2.2 * scale) {
-          this.planet.applyBrush(px, py, pz, 'build', this.magmaRad[i], 0.9, MaterialId.Basalt);
+          this.planet.runWithoutHistory(() => {
+            this.planet.applyBrush(px, py, pz, 'build', this.magmaRad[i], 0.9, MaterialId.Basalt);
+          });
           this.magmaLife[i] = 0;
           terrainDirty = true;
           continue;
@@ -4539,11 +4620,14 @@ export class PlanetarySandboxEngine {
         const nrmX = m.x / rLen;
         const nrmY = m.y / rLen;
         const nrmZ = m.z / rLen;
-        this.planet.applyBrush(m.x, m.y, m.z, 'crater', m.radius, m.strength, m.material, {
-          rimHeight: m.leaveRim ? 0.85 : 0,
-          rimMaterial: m.rimMaterial,
-          floorMaterial: m.material,
+        this.planet.recordHistoryAtomic('陨石撞击', () => {
+          this.planet.applyBrush(m.x, m.y, m.z, 'crater', m.radius, m.strength, m.material, {
+            rimHeight: m.leaveRim ? 0.85 : 0,
+            rimMaterial: m.rimMaterial,
+            floorMaterial: m.material,
+          });
         });
+        this.telemetryTimer = 1;
         this.fluid.applyRadialImpulse(m.x, m.y, m.z, m.radius * 2.2, 16 * Math.sqrt(scale), 7 * Math.sqrt(scale));
         this.spawnShockwave(m.x, m.y, m.z, nrmX, nrmY, nrmZ, m.radius * 2.6, true, false);
         this.spawnDebrisBurst(m.x, m.y, m.z, nrmX, nrmY, nrmZ, m.debrisCount);
@@ -4684,12 +4768,14 @@ export class PlanetarySandboxEngine {
       w.stepAccum += stepDist;
       if (w.stepAccum >= w.radius * 0.45) {
         w.stepAccum = 0;
-        this.planet.applyBrush(prevHeadX, prevHeadY, prevHeadZ, 'carve', w.radius, w.strength, w.material, {
-          shape: 'cylinder',
-          ex: nx,
-          ey: ny,
-          ez: nz,
-          rimMaterial: w.material,
+        this.planet.runWithoutHistory(() => {
+          this.planet.applyBrush(prevHeadX, prevHeadY, prevHeadZ, 'carve', w.radius, w.strength, w.material, {
+            shape: 'cylinder',
+            ex: nx,
+            ey: ny,
+            ez: nz,
+            rimMaterial: w.material,
+          });
         });
         terrainDirty = true;
       }
@@ -4753,9 +4839,12 @@ export class PlanetarySandboxEngine {
       vx.age += dt;
       if (vx.age >= vx.maxAge) {
         if (vx.kind === 'blackHole') {
-          this.planet.applyBrush(vx.x, vx.y, vx.z, 'crater', vx.radius * 0.9, vx.strength * 1.8, vx.material, {
-            floorMaterial: MaterialId.Crystal,
+          this.planet.recordHistoryAtomic('黑洞坍缩', () => {
+            this.planet.applyBrush(vx.x, vx.y, vx.z, 'crater', vx.radius * 0.9, vx.strength * 1.8, vx.material, {
+              floorMaterial: MaterialId.Crystal,
+            });
           });
+          this.telemetryTimer = 1;
           this.spawnShockwave(vx.x, vx.y, vx.z, vx.nx, vx.ny, vx.nz, vx.radius * 1.8, false, false);
           terrainDirty = true;
         }
@@ -4769,7 +4858,9 @@ export class PlanetarySandboxEngine {
         vx.carveTimer -= dt;
         if (vx.carveTimer <= 0) {
           vx.carveTimer = 0.35;
-          this.planet.applyBrush(vx.x, vx.y, vx.z, 'paint', vx.radius * 1.1, 1.0, MaterialId.Crystal);
+          this.planet.runWithoutHistory(() => {
+            this.planet.applyBrush(vx.x, vx.y, vx.z, 'paint', vx.radius * 1.1, 1.0, MaterialId.Crystal);
+          });
           terrainDirty = true;
         }
         if (vortexInstCount < this.MAX_VORTEX_INSTANCES) {
@@ -4797,7 +4888,9 @@ export class PlanetarySandboxEngine {
         vx.carveTimer -= dt;
         if (vx.carveTimer <= 0) {
           vx.carveTimer = 0.25;
-          this.planet.applyBrush(vx.x, vx.y, vx.z, 'carve', vx.radius * 0.55, vx.strength * 0.55, vx.material);
+          this.planet.runWithoutHistory(() => {
+            this.planet.applyBrush(vx.x, vx.y, vx.z, 'carve', vx.radius * 0.55, vx.strength * 0.55, vx.material);
+          });
           terrainDirty = true;
         }
         const rings = 5;
@@ -4851,6 +4944,10 @@ export class PlanetarySandboxEngine {
     this.playerRight.set(this._rightLike.x, this._rightLike.y, this._rightLike.z);
 
     const metrics = this.getPlayerMetrics();
+    const scale = this.getPlanetScale();
+    if (metrics.footRadius > 0.36 * scale) {
+      this.playerPos.addScaledVector(this.playerUp, metrics.footRadius - 0.36 * scale);
+    }
     this.camPitch = 0.24;
     this.firstPersonPitch = 0.08;
     this.camDistance = metrics.defaultExplorerCamDist;
@@ -5569,6 +5666,7 @@ export class PlanetarySandboxEngine {
     if (phase !== 'playing') {
       this.keys.clear();
       this.isSculpting = false;
+      this.planet.commitHistoryStroke();
       this.isDraggingOrbit = false;
       this.releaseTractorBeam();
       if (this.brushPreview) {
@@ -5922,9 +6020,12 @@ export class PlanetarySandboxEngine {
     };
     this.sound.setMuted(this.config.muted);
 
-    if (partial.playerScale !== undefined && Math.abs(nextPlayerScale - prevPlayerScale) > 1e-4) {
+    if (
+      partial.playerScale !== undefined &&
+      Math.abs(nextPlayerScale - prevPlayerScale) / Math.max(prevPlayerScale, 1e-15) > 1e-4
+    ) {
       const nextMetrics = this.getPlayerMetrics();
-      const ratio = nextPlayerScale / Math.max(prevPlayerScale, 0.01);
+      const ratio = nextPlayerScale / Math.max(prevPlayerScale, 1e-15);
       this.camDistance = clamp(
         this.camDistance * ratio,
         nextMetrics.minExplorerCamDist,
@@ -7867,7 +7968,9 @@ export class PlanetarySandboxEngine {
 
     switch (ev.type) {
       case 'volcano': {
-        this.planet.applyBrush(hx, hy, hz, 'volcano', effRad, effStr * 1.5, ev.materialId || MaterialId.Basalt);
+        this.planet.runWithoutHistory(() => {
+          this.planet.applyBrush(hx, hy, hz, 'volcano', effRad, effStr * 1.5, ev.materialId || MaterialId.Basalt);
+        });
         this.spawnMagmaBurst(
           hx + nx * effRad * 0.45,
           hy + ny * effRad * 0.45,
@@ -7888,10 +7991,12 @@ export class PlanetarySandboxEngine {
         break;
       }
       case 'nuke': {
-        this.planet.applyBrush(hx, hy, hz, 'crater', effRad * 1.35, effStr * 2.4, MaterialId.Basalt, {
-          rimHeight: 1.1,
-          rimMaterial: MaterialId.Basalt,
-          floorMaterial: MaterialId.Crystal,
+        this.planet.runWithoutHistory(() => {
+          this.planet.applyBrush(hx, hy, hz, 'crater', effRad * 1.35, effStr * 2.4, MaterialId.Basalt, {
+            rimHeight: 1.1,
+            rimMaterial: MaterialId.Basalt,
+            floorMaterial: MaterialId.Crystal,
+          });
         });
         this.fluid.applyRadialImpulse(hx, hy, hz, effRad * 2.8, 28 * Math.sqrt(scale), 14 * Math.sqrt(scale));
         this.fluid.drainWithinRadius(hx, hy, hz, effRad * 0.9);
@@ -7905,10 +8010,12 @@ export class PlanetarySandboxEngine {
         break;
       }
       case 'crater': {
-        this.planet.applyBrush(hx, hy, hz, 'crater', effRad * 1.1, effStr * 1.8, MaterialId.Stone, {
-          rimHeight: 0.72,
-          rimMaterial: MaterialId.Sandstone,
-          floorMaterial: ev.materialId || MaterialId.Stone,
+        this.planet.runWithoutHistory(() => {
+          this.planet.applyBrush(hx, hy, hz, 'crater', effRad * 1.1, effStr * 1.8, MaterialId.Stone, {
+            rimHeight: 0.72,
+            rimMaterial: MaterialId.Sandstone,
+            floorMaterial: ev.materialId || MaterialId.Stone,
+          });
         });
         this.spawnShockwave(hx, hy, hz, nx, ny, nz, effRad * 2.1, true, false);
         this.spawnDebrisBurst(hx, hy, hz, nx, ny, nz, 10, 15, effStr);
@@ -7984,7 +8091,9 @@ export class PlanetarySandboxEngine {
         break;
       }
       case 'terraformMaterial': {
-        this.planet.applyBrush(hx, hy, hz, 'build', effRad, effStr * 1.35, ev.materialId || MaterialId.Crystal);
+        this.planet.runWithoutHistory(() => {
+          this.planet.applyBrush(hx, hy, hz, 'build', effRad, effStr * 1.35, ev.materialId || MaterialId.Crystal);
+        });
         this.updateChunksWithLod(48);
         this.updateHighResStreaming({ hit: true, distance: 0, x: hx, y: hy, z: hz, nx, ny, nz }, 48);
         this.waterMeshDirty = true;
@@ -8876,6 +8985,7 @@ export class PlanetarySandboxEngine {
   private handleWindowBlur = (): void => {
     this.keys.clear();
     this.isSculpting = false;
+    this.planet.commitHistoryStroke();
     this.isDraggingOrbit = false;
     this.isPanningCamera = false;
     this.releaseTractorBeam();
@@ -9030,6 +9140,7 @@ export class PlanetarySandboxEngine {
       this.activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this.activeTouches.size >= 2) {
         this.isSculpting = false;
+        this.planet.commitHistoryStroke();
         this.isDraggingOrbit = false;
         this.isPanningCamera = false;
         this.releaseTractorBeam();
@@ -9060,7 +9171,15 @@ export class PlanetarySandboxEngine {
       if (hit.hit) {
         this.isSculpting = !isSingleShotSurveyTool;
         this.brushCooldown = 0;
+        const label = resolveToolDefinition(this.config.tool).name || bhv;
+        if (!isSingleShotSurveyTool) {
+          this.planet.beginHistoryStroke(label);
+        }
         this.performBrushAction(hit);
+        if (isSingleShotSurveyTool || !this.isSculpting) {
+          this.planet.commitHistoryStroke();
+        }
+        this.telemetryTimer = 1;
       } else {
         this.isDraggingOrbit = true;
       }
@@ -9109,7 +9228,15 @@ export class PlanetarySandboxEngine {
       if (hit.hit) {
         this.isSculpting = !isSingleShotSurveyTool;
         this.brushCooldown = 0;
+        const label = resolveToolDefinition(this.config.tool).name || bhv;
+        if (!isSingleShotSurveyTool) {
+          this.planet.beginHistoryStroke(label);
+        }
         this.performBrushAction(hit);
+        if (isSingleShotSurveyTool || !this.isSculpting) {
+          this.planet.commitHistoryStroke();
+        }
+        this.telemetryTimer = 1;
       } else {
         this.isDraggingOrbit = true;
       }
@@ -9150,47 +9277,48 @@ export class PlanetarySandboxEngine {
     }
 
     if (this.isDraggingOrbit) {
+      const sens = clamp(this.config.mouseSensitivity ?? 1.0, 0.15, 4.0);
       if (this.config.cameraMode === 'explorer') {
         const rot = transportCameraForwardOnSphere(
           [this.playerUp.x, this.playerUp.y, this.playerUp.z],
           [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
-          -dx * 0.0055,
+          -dx * 0.0055 * sens,
         );
         this.explorerCamFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
-        this.camPitch = clamp(this.camPitch + dy * 0.005, -0.45, 1.32);
+        this.camPitch = clamp(this.camPitch + dy * 0.005 * sens, -0.45, 1.32);
       } else if (this.config.cameraMode === 'firstPerson') {
         const rot = transportCameraForwardOnSphere(
           [this.playerUp.x, this.playerUp.y, this.playerUp.z],
           [this.explorerCamFwd.x, this.explorerCamFwd.y, this.explorerCamFwd.z],
-          -dx * 0.0046,
+          -dx * 0.0046 * sens,
         );
         this.explorerCamFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
-        this.firstPersonPitch = clamp(this.firstPersonPitch - dy * 0.0046, -1.42, 1.48);
+        this.firstPersonPitch = clamp(this.firstPersonPitch - dy * 0.0046 * sens, -1.42, 1.48);
       } else if (this.config.cameraMode === 'orbit') {
-        this.orbitYaw -= dx * 0.0055;
-        this.orbitPitch = clamp(this.orbitPitch + dy * 0.005, -1.35, 1.35);
+        this.orbitYaw -= dx * 0.0055 * sens;
+        this.orbitPitch = clamp(this.orbitPitch + dy * 0.005 * sens, -1.35, 1.35);
       } else if (this.config.cameraMode === 'detail') {
         const rot = transportCameraForwardOnSphere(
           [this.detailNormal.x, this.detailNormal.y, this.detailNormal.z],
           [this.detailBasisFwd.x, this.detailBasisFwd.y, this.detailBasisFwd.z],
-          -dx * 0.0052,
+          -dx * 0.0052 * sens,
         );
         this.detailBasisFwd.set(rot.forward[0], rot.forward[1], rot.forward[2]);
-        this.detailPitch = clamp(this.detailPitch + dy * 0.0048, 0.1, 1.46);
+        this.detailPitch = clamp(this.detailPitch + dy * 0.0048 * sens, 0.1, 1.46);
       } else if (this.config.cameraMode === 'perspective') {
-        this.perspYaw += dx * 0.0055;
-        this.perspPitch = clamp(this.perspPitch + dy * 0.005, -1.42, 1.42);
+        this.perspYaw += dx * 0.0055 * sens;
+        this.perspPitch = clamp(this.perspPitch + dy * 0.005 * sens, -1.42, 1.42);
       } else if (this.config.cameraMode === 'landing') {
         if (this.landingStage === 'selecting') {
-          this.landingOrbitYaw -= dx * 0.0055;
-          this.landingOrbitPitch = clamp(this.landingOrbitPitch + dy * 0.005, -1.35, 1.35);
+          this.landingOrbitYaw -= dx * 0.0055 * sens;
+          this.landingOrbitPitch = clamp(this.landingOrbitPitch + dy * 0.005 * sens, -1.35, 1.35);
         } else if (this.landingStage === 'landed') {
-          this.landingFwd.applyAxisAngle(this.landingUp, -dx * 0.0042).normalize();
-          this.landingPitch = clamp(this.landingPitch - dy * 0.0042, -1.36, 1.36);
+          this.landingFwd.applyAxisAngle(this.landingUp, -dx * 0.0042 * sens).normalize();
+          this.landingPitch = clamp(this.landingPitch - dy * 0.0042 * sens, -1.36, 1.36);
         }
       } else if (this.config.cameraMode === 'fps') {
-        this.fpsYaw -= dx * 0.0045;
-        this.fpsPitch = clamp(this.fpsPitch - dy * 0.0045, -1.48, 1.48);
+        this.fpsYaw -= dx * 0.0045 * sens;
+        this.fpsPitch = clamp(this.fpsPitch - dy * 0.0045 * sens, -1.48, 1.48);
       }
     }
   };
@@ -9202,7 +9330,15 @@ export class PlanetarySandboxEngine {
         this.prevPinchDist = 0;
       }
     }
+    const wasSculpting = this.isSculpting;
     this.isSculpting = false;
+    if (wasSculpting) {
+      if (this.planet.commitHistoryStroke()) {
+        this.telemetryTimer = 1;
+      }
+    } else {
+      this.planet.commitHistoryStroke();
+    }
     this.isDraggingOrbit = false;
     this.isPanningCamera = false;
     this.releaseTractorBeam();
@@ -9463,15 +9599,18 @@ export class PlanetarySandboxEngine {
     // Dry terrain click-and-drag automatically detaches loose rock boulders into the beam
     if (fluidCount === 0 && entityCount === 0 && terrainHit.hit) {
       const pocketRad = Math.max(effRad * 0.42, this.planet.nativeVoxelSize * 1.4);
-      this.planet.applyBrush(
-        terrainHit.x,
-        terrainHit.y,
-        terrainHit.z,
-        'carve',
-        pocketRad,
-        Math.max(this.config.brushStrength * 0.78, 0.7),
-        MaterialId.Air,
-      );
+      this.planet.recordHistoryAtomic('牵引剥离岩石', () => {
+        this.planet.applyBrush(
+          terrainHit.x,
+          terrainHit.y,
+          terrainHit.z,
+          'carve',
+          pocketRad,
+          Math.max(this.config.brushStrength * 0.78, 0.7),
+          MaterialId.Air,
+        );
+      });
+      this.telemetryTimer = 1;
       const chunkCount = clamp(Math.round(attrs.debrisCount) || 6, 5, 10);
       this.spawnDebrisBurst(
         terrainHit.x + terrainHit.nx * 0.25 * scale,
@@ -10484,27 +10623,28 @@ export class PlanetarySandboxEngine {
       this.playerGrounded = false;
     }
 
+    const speedMult = clamp(this.config.fpsSpeedMult ?? 1.0, 0.05, 10.0);
     const radialSpeed = this.playerVel.dot(this.playerUp);
     this._v4.copy(this.playerVel).addScaledVector(this.playerUp, -radialSpeed);
-    const maxWalkSpeed = metrics.walkSpeed;
+    const maxWalkSpeed = metrics.walkSpeed * speedMult;
     if (hasMove) {
       this._v4.lerp(
         this._v3.multiplyScalar(maxWalkSpeed),
         1 - Math.exp(-(this.playerGrounded ? 14 : 5) * dt),
       );
-      this.walkPhase += (this._v4.length() / Math.max(metrics.charScale, 0.02)) * dt * 2.2;
+      this.walkPhase += (this._v4.length() / Math.max(metrics.charScale, 1e-12)) * dt * 2.2;
     } else if (this.playerGrounded) {
       this._v4.multiplyScalar(Math.exp(-12 * dt));
     }
 
     this.playerVel.copy(this._v4).addScaledVector(this.playerUp, radialSpeed);
-    const maxVel = 24 * scale;
+    const maxVel = Math.max(24 * scale, maxWalkSpeed * 3.5);
     if (this.playerVel.length() > maxVel) {
       this.playerVel.setLength(maxVel);
     }
 
     this.playerPos.addScaledVector(this.playerVel, dt);
-    const maxAtmo = this.planet.baseRadius + 10.0 * scale;
+    const maxAtmo = this.planet.baseRadius + Math.max(10.0 * scale, metrics.charScale * 4.5);
     if (this.playerPos.length() > maxAtmo) {
       this.playerPos.setLength(maxAtmo);
       if (this.playerVel.dot(this.playerUp) > 0) {
@@ -10534,7 +10674,7 @@ export class PlanetarySandboxEngine {
       const vn = this.playerVel.dot(this._v1);
       if (vn < 0) {
         this.playerVel.addScaledVector(this._v1, -vn);
-        if (!wasGrounded && vn < -2.2 * Math.sqrt(Math.max(metrics.charScale, 0.05))) {
+        if (!wasGrounded && vn < -2.2 * Math.sqrt(Math.max(metrics.charScale, 1e-10))) {
           this.squashY = 0.78;
         }
       }
@@ -10594,7 +10734,7 @@ export class PlanetarySandboxEngine {
     if (this.keys.has('KeyC') || this.keys.has('KeyQ') || this.keys.has('ControlLeft')) mu -= 1;
 
     const boost = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 2.2 : 1.0;
-    const spd = this.fpsSpeed * boost;
+    const spd = this.fpsSpeed * boost * clamp(this.config.fpsSpeedMult ?? 1.0, 0.05, 10.0);
 
     this._v3
       .set(0, 0, 0)
@@ -10611,7 +10751,7 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    const damp = 1 - Math.exp(-16 * dt);
+    const damp = 1 - Math.exp(-16 * clamp(this.config.cameraDamping ?? 1.0, 0.25, 3.0) * dt);
     this.camPosSmooth.lerp(this.fpsPos, damp);
     this._v4.copy(this.fpsPos).add(this._v1);
     this.camLookSmooth.lerp(this._v4, damp);
@@ -11077,8 +11217,9 @@ export class PlanetarySandboxEngine {
     const metrics = this.getPlayerMetrics();
     const charScale = metrics.charScale;
     const up = this.playerUp;
-    const radAlpha = 1 - Math.exp(-9.5 * dt);
-    const tanAlpha = 1 - Math.exp(-22 * dt);
+    const dampMult = clamp(this.config.cameraDamping ?? 1.0, 0.25, 3.0);
+    const radAlpha = 1 - Math.exp(-9.5 * dampMult * dt);
+    const tanAlpha = 1 - Math.exp(-22 * dampMult * dt);
     const stabilized = stabilizeRadialAnchor(
       [this.explorerCamAnchor.x, this.explorerCamAnchor.y, this.explorerCamAnchor.z],
       [this.playerPos.x, this.playerPos.y, this.playerPos.z],
@@ -11095,19 +11236,13 @@ export class PlanetarySandboxEngine {
     );
     this.explorerCamFwd.set(expBasis.forward[0], expBasis.forward[1], expBasis.forward[2]);
 
-    const lookLift = Math.max(
-      this.planet.nativeVoxelSize * 1.4,
-      Math.min(metrics.lookLift, this.camDistance * 0.24),
-    );
+    const lookLift = Math.min(metrics.lookLift, this.camDistance * 0.24);
     const desiredLook = this._v1
       .copy(this.explorerCamAnchor)
       .addScaledVector(up, lookLift);
 
     const cosP = Math.cos(this.camPitch);
-    const shoulderLift = Math.max(
-      this.planet.nativeVoxelSize * 1.0,
-      Math.min(metrics.shoulderLift, this.camDistance * 0.16),
-    );
+    const shoulderLift = Math.min(metrics.shoulderLift, this.camDistance * 0.16);
     const camOffsetDir = this._v2
       .copy(this.explorerCamFwd)
       .multiplyScalar(-cosP)
@@ -11136,7 +11271,10 @@ export class PlanetarySandboxEngine {
       .addScaledVector(camOffsetDir, safeCamDist)
       .addScaledVector(up, shoulderLift);
 
-    const minClear = Math.max(this.planet.nativeVoxelSize * 1.8, 0.16 * charScale);
+    const minClear = Math.max(
+      1e-11 * scale,
+      Math.min(this.planet.nativeVoxelSize * 1.8, 0.35 * charScale),
+    );
     const dCam = this.planet.sampleDensityAndNormal(
       desiredPos.x,
       desiredPos.y,
@@ -11150,20 +11288,22 @@ export class PlanetarySandboxEngine {
       desiredPos.z += this._normalArr[2] * push;
     }
 
-    const damp = 1 - Math.exp(-15 * dt);
+    const damp = 1 - Math.exp(-15 * dampMult * dt);
     this.camPosSmooth.lerp(desiredPos, damp);
     this.camLookSmooth.lerp(desiredLook, damp);
 
     this.camera.position.copy(this.camPosSmooth);
-    this.camera.up.lerp(up, 1 - Math.exp(-11 * dt)).normalize();
+    this.camera.up.lerp(up, 1 - Math.exp(-11 * dampMult * dt)).normalize();
     this.camera.lookAt(this.camLookSmooth);
   }
 
   private updateFirstPersonCamera(dt: number): void {
+    const scale = this.getPlanetScale();
     const metrics = this.getPlayerMetrics();
     const up = this.playerUp;
-    const radAlpha = 1 - Math.exp(-14 * dt);
-    const tanAlpha = 1 - Math.exp(-28 * dt);
+    const dampMult = clamp(this.config.cameraDamping ?? 1.0, 0.25, 3.0);
+    const radAlpha = 1 - Math.exp(-14 * dampMult * dt);
+    const tanAlpha = 1 - Math.exp(-28 * dampMult * dt);
     const stabilized = stabilizeRadialAnchor(
       [this.explorerCamAnchor.x, this.explorerCamAnchor.y, this.explorerCamAnchor.z],
       [this.playerPos.x, this.playerPos.y, this.playerPos.z],
@@ -11189,7 +11329,10 @@ export class PlanetarySandboxEngine {
     );
 
     const desiredEye = this._v4.set(eyePose.eyePos[0], eyePose.eyePos[1], eyePose.eyePos[2]);
-    const minClear = Math.max(this.planet.nativeVoxelSize * 0.9, 0.08 * metrics.charScale);
+    const minClear = Math.max(
+      1e-11 * scale,
+      Math.min(this.planet.nativeVoxelSize * 0.9, 0.22 * metrics.charScale),
+    );
     const dCam = this.planet.sampleDensityAndNormal(
       desiredEye.x,
       desiredEye.y,
@@ -11203,8 +11346,8 @@ export class PlanetarySandboxEngine {
       desiredEye.z += this._normalArr[2] * push;
     }
 
-    const posDamp = 1 - Math.exp(-26 * dt);
-    const lookDamp = 1 - Math.exp(-28 * dt);
+    const posDamp = 1 - Math.exp(-26 * dampMult * dt);
+    const lookDamp = 1 - Math.exp(-28 * dampMult * dt);
     this.camPosSmooth.lerp(desiredEye, posDamp);
     this._v1
       .copy(desiredEye)
@@ -11212,7 +11355,7 @@ export class PlanetarySandboxEngine {
     this.camLookSmooth.lerp(this._v1, lookDamp);
 
     this.camera.position.copy(this.camPosSmooth);
-    this.camera.up.lerp(up, 1 - Math.exp(-14 * dt)).normalize();
+    this.camera.up.lerp(up, 1 - Math.exp(-14 * dampMult * dt)).normalize();
     this.camera.lookAt(this.camLookSmooth);
   }
 
@@ -11452,13 +11595,15 @@ export class PlanetarySandboxEngine {
           };
         }
         this.metabolism.advanceAsync(dt, 2);
-        this.metabolism.tickPlanetaryFeedback(
-          dt,
-          this.planet,
-          (hs) => this.applyMetabolismThermalHotspots(hs),
-          (op) => this.applyMetabolismMineralOp(op),
-          (fop) => this.applyMetabolismFluidOp(fop),
-        );
+        this.planet.runWithoutHistory(() => {
+          this.metabolism.tickPlanetaryFeedback(
+            dt,
+            this.planet,
+            (hs) => this.applyMetabolismThermalHotspots(hs),
+            (op) => this.applyMetabolismMineralOp(op),
+            (fop) => this.applyMetabolismFluidOp(fop),
+          );
+        });
         this.syncMetabolismReadOnlyVisuals(false);
 
         if (this.geologicalVisuals) {
@@ -11624,23 +11769,25 @@ export class PlanetarySandboxEngine {
       this.config.cameraMode === 'firstPerson' ||
       this.config.cameraMode === 'explorer'
     ) {
+      const metrics = this.getPlayerMetrics();
+      const microCharMode =
+        this.config.cameraMode === 'explorer' || this.config.cameraMode === 'firstPerson';
+      const minClipRef = microCharMode
+        ? Math.max(1e-11 * scale, Math.min(this.planet.nativeVoxelSize * 0.25, metrics.charScale * 0.25))
+        : this.planet.nativeVoxelSize * 0.25;
       const camR = this.camera.position.length();
       const surfDist = Math.max(
-        this.planet.nativeVoxelSize * 0.25,
-        Math.abs(camR - this.planet.baseRadius),
+        minClipRef,
+        microCharMode ? Math.min(this.camDistance, Math.abs(camR - this.planet.baseRadius)) : Math.abs(camR - this.planet.baseRadius),
       );
       const focusDist =
         this.config.cameraMode === 'firstPerson'
-          ? Math.max(
-              this.planet.nativeVoxelSize * 0.5,
-              this.getPlayerMetrics().eyeHeight * 0.65,
-            )
-          : Math.max(
-              this.planet.nativeVoxelSize * 0.5,
-              this.camera.position.distanceTo(this.lastHighResFocus),
-            );
+          ? Math.max(minClipRef, metrics.eyeHeight * 0.65)
+          : this.config.cameraMode === 'explorer'
+            ? Math.max(minClipRef, Math.max(this.camDistance, this.camera.position.distanceTo(this.lastHighResFocus)))
+            : Math.max(minClipRef, this.camera.position.distanceTo(this.lastHighResFocus));
       const safeClips = computeSafeClipPlanes(
-        surfDist,
+        microCharMode ? Math.min(surfDist, this.camDistance) : surfDist,
         focusDist,
         this.planet.baseRadius,
         this.camera.fov,
@@ -11649,7 +11796,7 @@ export class PlanetarySandboxEngine {
       const targetFar = safeClips.far;
 
       if (
-        Math.abs(this.camera.near - targetNear) / Math.max(this.camera.near, 1e-10) > 0.15 ||
+        Math.abs(this.camera.near - targetNear) / Math.max(this.camera.near, 1e-13) > 0.15 ||
         Math.abs(this.camera.far - targetFar) / Math.max(this.camera.far, 1) > 0.15
       ) {
         this.camera.near = targetNear;
@@ -11668,7 +11815,8 @@ export class PlanetarySandboxEngine {
     const smoothFrameMs = this.frameTimeSmooth;
     const underStress = smoothFrameMs > 24;
     const severeStress = smoothFrameMs > 38;
-    const streamBudget =
+    const streamScale = clamp(this.config.horizonStreamBudget ?? 1.0, 0.25, 3.0);
+    const baseStreamBudget =
       this.config.lodMode === 0
         ? this.isSoftware
           ? 16
@@ -11682,7 +11830,8 @@ export class PlanetarySandboxEngine {
             : underStress
               ? 14
               : 24;
-    const streamTimeBudgetMs =
+    const streamBudget = clamp(Math.round(baseStreamBudget * streamScale), 6, 96);
+    const baseTimeBudgetMs =
       this.config.lodMode === 0
         ? this.isSoftware
           ? 4.0
@@ -11694,6 +11843,7 @@ export class PlanetarySandboxEngine {
             : underStress
               ? 3.8
               : 5.5;
+    const streamTimeBudgetMs = clamp(baseTimeBudgetMs * streamScale, 1.5, 18.0);
     let previewStreamOverride:
       | {
           focus: readonly [number, number, number];
@@ -11891,6 +12041,8 @@ export class PlanetarySandboxEngine {
           )
         : null;
 
+    const histSnap = this.planet.getHistorySnapshot();
+
     this.onTelemetry({
       altitude: r - this.planet.baseRadius,
       localGravity: computeGravityMagnitude(r, params),
@@ -11940,6 +12092,13 @@ export class PlanetarySandboxEngine {
       voxLocked: Boolean(this.lockedVoxWorldPos),
       interiorCutawayEnabled: this.planet.isInteriorCutawayEnabled(),
       metabolismSummary: this.metabolism.getSummarySnapshot(),
+      canUndo: histSnap.canUndo,
+      canRedo: histSnap.canRedo,
+      undoCount: histSnap.undoCount,
+      redoCount: histSnap.redoCount,
+      historyCapacity: histSnap.capacity,
+      undoLabel: histSnap.undoLabel,
+      redoLabel: histSnap.redoLabel,
     });
   }
 

@@ -59,11 +59,10 @@ export const DebugMenu: React.FC<DebugMenuProps> = ({
   return (
     <aside
       data-testid="debug-menu"
-      className="fixed right-2.5 top-11 z-20 w-[372px] max-w-[calc(100vw-1.25rem)] max-h-[calc(100vh-8.5rem)] flex flex-col rounded-sm border border-slate-700/90 text-slate-200 pointer-events-auto overflow-hidden"
-      style={{ backgroundColor: 'rgba(9, 13, 24, 0.96)' }}
+      className="flex-1 min-h-0 flex flex-col bg-[#080c15] text-slate-200 overflow-hidden"
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 bg-[#0b101d] shrink-0">
         <div className="flex items-center gap-2">
           <span className="font-display font-semibold text-xs text-white tracking-wide">
             调试与体素检查器

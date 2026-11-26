@@ -13,6 +13,13 @@ import {
   VoxControlVolume,
 } from './metabolism/eulerianFvm';
 import { createOpenAutocatalyticHypergraph } from './metabolism/reactionHypergraph';
+import {
+  BrushOpCheckpointRecord,
+  CircularHistorySnapshot,
+  CircularVoxelHistoryBuffer,
+  VoxelHistoryEntry,
+  VoxelTransactionRecorder,
+} from './voxelHistory';
 
 export enum MaterialId {
   Air = 0,
@@ -656,6 +663,11 @@ export class VoxelPlanet {
   private interiorCutawayActive = false;
   private preCutawayDensity: Float32Array | null = null;
   private preCutawayMaterial: Uint8Array | null = null;
+
+  public readonly history = new CircularVoxelHistoryBuffer(64);
+  private activeRecorder: VoxelTransactionRecorder | null = null;
+  private historyEntrySeq = 1;
+  private autoRecordBrushOps = true;
 
   constructor(
     seedOrConfig: number | Partial<PlanetSeedConfig> = 202611,
@@ -1563,6 +1575,7 @@ export class VoxelPlanet {
     this.sparseChunks.clear();
     this.brushOps = [];
     this.svRootBuilt = false;
+    this.clearHistory();
     this.interiorCutawayActive = false;
     this.preCutawayDensity = null;
     this.preCutawayMaterial = null;
@@ -1662,6 +1675,7 @@ export class VoxelPlanet {
     this.sparseChunks.clear();
     this.brushOps = [];
     this.svRootBuilt = false;
+    this.clearHistory();
     this.interiorCutawayActive = false;
     this.preCutawayDensity = null;
     this.preCutawayMaterial = null;
@@ -1810,6 +1824,7 @@ export class VoxelPlanet {
     this.sparseChunks.clear();
     this.brushOps = [];
     this.svRootBuilt = false;
+    this.clearHistory();
     if (snapshot.editedChunks) {
       for (const sc of snapshot.editedChunks) {
         const stepSize = this.nativeVoxelSize * sc.scaleMult;
@@ -2527,6 +2542,176 @@ export class VoxelPlanet {
     return { hit: false, x: 0, y: 0, z: 0, nx: 0, ny: 1, nz: 0, distance: maxDist };
   }
 
+  public clearHistory(): void {
+    this.history.clear();
+    this.activeRecorder = null;
+  }
+
+  public canUndo(): boolean {
+    return this.history.canUndo();
+  }
+
+  public canRedo(): boolean {
+    return this.history.canRedo();
+  }
+
+  public getHistorySnapshot(): CircularHistorySnapshot {
+    return this.history.getSnapshot();
+  }
+
+  public beginHistoryStroke(label = '地形雕刻'): void {
+    if (this.activeRecorder) {
+      this.commitHistoryStroke();
+    }
+    this.activeRecorder = new VoxelTransactionRecorder(label);
+  }
+
+  public commitHistoryStroke(): VoxelHistoryEntry | null {
+    if (!this.activeRecorder) return null;
+    const entry = this.activeRecorder.finalize(this.historyEntrySeq);
+    this.activeRecorder = null;
+    if (entry) {
+      this.historyEntrySeq++;
+      this.history.push(entry);
+    }
+    return entry;
+  }
+
+  public cancelHistoryStroke(): void {
+    this.activeRecorder = null;
+  }
+
+  public recordHistoryAtomic(label: string, fn: () => void): VoxelHistoryEntry | null {
+    if (this.activeRecorder) {
+      fn();
+      return null;
+    }
+    this.beginHistoryStroke(label);
+    try {
+      fn();
+    } finally {
+      // Ensure recorder never leaks on exception
+    }
+    return this.commitHistoryStroke();
+  }
+
+  public runWithoutHistory<T>(fn: () => T): T {
+    const prevAuto = this.autoRecordBrushOps;
+    const prevRecorder = this.activeRecorder;
+    this.autoRecordBrushOps = false;
+    this.activeRecorder = null;
+    try {
+      return fn();
+    } finally {
+      this.autoRecordBrushOps = prevAuto;
+      this.activeRecorder = prevRecorder;
+    }
+  }
+
+  public undo(): {
+    entry: VoxelHistoryEntry;
+    modifiedChunks: number[];
+    dirtySparseKeys: string[];
+  } | null {
+    if (this.activeRecorder) {
+      this.commitHistoryStroke();
+    }
+    const entry = this.history.undo();
+    if (!entry) return null;
+    return this.applyHistoryDelta(entry, 'undo');
+  }
+
+  public redo(): {
+    entry: VoxelHistoryEntry;
+    modifiedChunks: number[];
+    dirtySparseKeys: string[];
+  } | null {
+    if (this.activeRecorder) {
+      this.commitHistoryStroke();
+    }
+    const entry = this.history.redo();
+    if (!entry) return null;
+    return this.applyHistoryDelta(entry, 'redo');
+  }
+
+  private applyHistoryDelta(
+    entry: VoxelHistoryEntry,
+    direction: 'undo' | 'redo',
+  ): {
+    entry: VoxelHistoryEntry;
+    modifiedChunks: number[];
+    dirtySparseKeys: string[];
+  } {
+    const { indices, prevDensity, nextDensity, prevMaterial, nextMaterial, dirtyChunkIndices } =
+      entry.macro;
+    const srcDensity = direction === 'undo' ? prevDensity : nextDensity;
+    const srcMaterial = direction === 'undo' ? prevMaterial : nextMaterial;
+    const cutawayActive =
+      this.interiorCutawayActive && this.preCutawayDensity && this.preCutawayMaterial;
+
+    for (let i = 0; i < indices.length; i++) {
+      const idx = indices[i];
+      if (idx < this.density.length) {
+        this.density[idx] = srcDensity[i];
+        this.material[idx] = srcMaterial[i];
+        if (cutawayActive && this.preCutawayDensity && this.preCutawayMaterial) {
+          this.preCutawayDensity[idx] = srcDensity[i];
+          this.preCutawayMaterial[idx] = srcMaterial[i];
+        }
+      }
+    }
+
+    const modifiedChunks: number[] = [];
+    for (let i = 0; i < dirtyChunkIndices.length; i++) {
+      const ci = dirtyChunkIndices[i];
+      if (ci < this.dirtyChunks.length) {
+        this.dirtyChunks[ci] = 1;
+        this.nonUniformChunks[ci] = 1;
+        modifiedChunks.push(ci);
+      }
+    }
+
+    if (direction === 'redo' && entry.brushOpsChanged && entry.prevBrushOps) {
+      this.brushOps = entry.prevBrushOps.map((op) => ({ ...op })) as BrushOpRecord[];
+    }
+
+    const dirtySparseKeys: string[] = [];
+    for (let s = 0; s < entry.sparseChunks.length; s++) {
+      const sc = entry.sparseChunks[s];
+      let chunk = this.sparseChunks.get(sc.key);
+      if (!chunk && direction === 'redo') {
+        chunk = this.getOrCreateSparseChunk(sc.cx, sc.cy, sc.cz, sc.scaleMult);
+      }
+      if (!chunk) continue;
+
+      const sDens = direction === 'undo' ? sc.prevDensity : sc.nextDensity;
+      const sMat = direction === 'undo' ? sc.prevMaterial : sc.nextMaterial;
+      for (let i = 0; i < sc.indices.length; i++) {
+        const cellIdx = sc.indices[i];
+        if (cellIdx < chunk.density.length) {
+          chunk.density[cellIdx] = sDens[i];
+          chunk.material[cellIdx] = sMat[i];
+        }
+      }
+      chunk.edited = direction === 'undo' ? sc.wasEditedBefore : true;
+      chunk.dirty = true;
+      chunk.isEmpty = false;
+      chunk.lastSeamMask = -1;
+      dirtySparseKeys.push(sc.key);
+    }
+
+    if (entry.brushOpsChanged) {
+      if (direction === 'undo' && entry.prevBrushOps) {
+        this.brushOps = entry.prevBrushOps.map((op) => ({ ...op })) as BrushOpRecord[];
+      } else if (direction === 'redo' && entry.nextBrushOps) {
+        this.brushOps = entry.nextBrushOps.map((op) => ({ ...op })) as BrushOpRecord[];
+      }
+    }
+
+    this.voxelRevision++;
+    return { entry, modifiedChunks, dirtySparseKeys };
+  }
+
   /**
    * Sculpt, pierce, extrude, paint, smooth, or flatten the planetary voxel field (and active high-res sparse chunks).
    */
@@ -2550,6 +2735,14 @@ export class VoxelPlanet {
     const ey = isCylinder && options?.ey !== undefined ? options.ey : cy;
     const ez = isCylinder && options?.ez !== undefined ? options.ez : cz;
     const shape: 'sphere' | 'cylinder' = isCylinder ? 'cylinder' : 'sphere';
+
+    let implicitRecorder: VoxelTransactionRecorder | null = null;
+    let recorder = this.activeRecorder;
+    if (!recorder && this.autoRecordBrushOps) {
+      implicitRecorder = new VoxelTransactionRecorder(`brush:${mode}`);
+      recorder = implicitRecorder;
+    }
+    recorder?.noteBrushRegion(cx, cy, cz, safeRad);
 
     const pad = safeRad + this.voxelSize * 1.5;
     const cellsPerAxis = this.cellsPerAxis;
@@ -2593,6 +2786,7 @@ export class VoxelPlanet {
               : rawFalloff) * macroWeight;
           const idx = this.gridIndex(ix, iy, iz);
           const prev = this.density[idx];
+          const prevMat = this.material[idx];
           let next = prev;
 
           if (mode === 'carve' || mode === 'tunnel' || mode === 'laser' || mode === 'bore') {
@@ -2675,6 +2869,7 @@ export class VoxelPlanet {
             if (prev > -0.15 * this.voxelSize && materialId !== MaterialId.Air) {
               if (this.material[idx] !== materialId) {
                 this.material[idx] = materialId;
+                recorder?.recordMacroCell(idx, prev, prevMat, prev, materialId);
                 deltaVolume += 0.0005;
               }
             }
@@ -2711,6 +2906,9 @@ export class VoxelPlanet {
           }
 
           this.density[idx] = next;
+          if (recorder && (next !== prev || this.material[idx] !== prevMat)) {
+            recorder.recordMacroCell(idx, prev, prevMat, next, this.material[idx]);
+          }
           deltaVolume += next - prev;
         }
       }
@@ -2749,8 +2947,19 @@ export class VoxelPlanet {
         jaggedNoise: options?.jaggedNoise,
       };
 
-      const applyBrushToChunk = (chunk: SparseVoxelChunk) => {
-        const didEdit = this.applyBrushOpToSparseChunk(chunk, opRecord, mode === 'smooth');
+      const applyBrushToChunk = (
+        chunk: SparseVoxelChunk,
+        existedBefore: boolean,
+        wasEditedBefore: boolean,
+      ) => {
+        const didEdit = this.applyBrushOpToSparseChunk(
+          chunk,
+          opRecord,
+          mode === 'smooth',
+          recorder ?? undefined,
+          existedBefore,
+          wasEditedBefore,
+        );
         if (didEdit) {
           deltaVolume += 0.001;
           chunk.edited = true;
@@ -2762,7 +2971,7 @@ export class VoxelPlanet {
 
       // Update every already-resident chunk across all octree scales in place
       for (const chunk of this.sparseChunks.values()) {
-        applyBrushToChunk(chunk);
+        applyBrushToChunk(chunk, true, chunk.edited);
       }
 
       if (totalTouched <= 125 && shape === 'sphere') {
@@ -2772,12 +2981,13 @@ export class VoxelPlanet {
               const key = `1:${scx},${scy},${scz}`;
               if (!this.sparseChunks.has(key)) {
                 const chunk = this.getOrCreateSparseChunk(scx, scy, scz, 1);
-                applyBrushToChunk(chunk);
+                applyBrushToChunk(chunk, false, false);
               }
             }
           }
         }
       } else if (mode !== 'smooth') {
+        recorder?.captureBrushOpsBefore(this.brushOps as BrushOpCheckpointRecord[]);
         // Coalesce near-identical consecutive cylinder ops (e.g. holding laser in place)
         const prevOp = this.brushOps[this.brushOps.length - 1];
         const canCoalesce =
@@ -2796,6 +3006,7 @@ export class VoxelPlanet {
           }
           this.brushOps.push(opRecord);
         }
+        recorder?.markBrushOpsAfter(this.brushOps as BrushOpCheckpointRecord[]);
       }
     }
 
@@ -2817,6 +3028,15 @@ export class VoxelPlanet {
           this.nonUniformChunks[ci] = 1;
           modifiedChunks.push(ci);
         }
+      }
+    }
+
+    recorder?.recordDirtyChunks(modifiedChunks);
+    if (implicitRecorder) {
+      const committed = implicitRecorder.finalize(this.historyEntrySeq);
+      if (committed) {
+        this.historyEntrySeq++;
+        this.history.push(committed);
       }
     }
 
@@ -3489,6 +3709,9 @@ export class VoxelPlanet {
     chunk: SparseVoxelChunk,
     op: BrushOpRecord,
     isSmooth = false,
+    recorder?: VoxelTransactionRecorder,
+    existedBefore = true,
+    wasEditedBefore = chunk.edited,
   ): boolean {
     const step = chunk.stepSize;
     const safeRad = Math.max(op.radius, step * 0.75);
@@ -3556,6 +3779,7 @@ export class VoxelPlanet {
               : rawFalloff;
           const idx = lx + ly * SPARSE_NY + lz * SPARSE_NZ;
           const prev = chunk.density[idx];
+          const prevMat = chunk.material[idx];
           let next = prev;
 
           if (isSmooth && localCopy) {
@@ -3674,6 +3898,16 @@ export class VoxelPlanet {
             if (prev > -0.15 * step && op.materialId !== MaterialId.Air) {
               if (chunk.material[idx] !== op.materialId) {
                 chunk.material[idx] = op.materialId;
+                recorder?.recordSparseCell(
+                  chunk,
+                  idx,
+                  prev,
+                  prevMat,
+                  prev,
+                  op.materialId,
+                  existedBefore,
+                  wasEditedBefore,
+                );
                 touched = true;
               }
             }
@@ -3690,8 +3924,19 @@ export class VoxelPlanet {
             }
           }
 
-          if (next !== prev) {
+          const nextMat = chunk.material[idx];
+          if (next !== prev || nextMat !== prevMat) {
             chunk.density[idx] = next;
+            recorder?.recordSparseCell(
+              chunk,
+              idx,
+              prev,
+              prevMat,
+              next,
+              nextMat,
+              existedBefore,
+              wasEditedBefore,
+            );
             touched = true;
           }
         }

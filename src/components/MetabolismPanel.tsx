@@ -271,10 +271,10 @@ export const MetabolismPanel: React.FC<MetabolismPanelProps> = ({
   return (
     <aside
       data-testid="metabolism-panel"
-      className="fixed top-12 right-3 z-20 w-[436px] max-w-[calc(100vw-24px)] max-h-[calc(100vh-110px)] flex flex-col rounded-xs border border-slate-800 bg-[#090d18]/95 text-slate-200 shadow-2xl overflow-hidden pointer-events-auto"
+      className="flex-1 min-h-0 flex flex-col bg-[#080c15] text-slate-200 overflow-hidden"
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 bg-[#0d1322] shrink-0">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 bg-[#0b101d] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <FlaskConical className="w-4 h-4 text-emerald-400 shrink-0" />
           <div className="min-w-0">

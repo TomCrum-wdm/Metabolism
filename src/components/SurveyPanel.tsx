@@ -198,10 +198,10 @@ export const SurveyPanel: React.FC<SurveyPanelProps> = ({
   return (
     <aside
       data-testid="survey-workstation-panel"
-      className="pointer-events-auto fixed right-2.5 top-11 bottom-16 z-20 w-[410px] max-w-[94vw] rounded-sm border border-slate-700/90 bg-[#080c16]/95 shadow-2xl flex flex-col overflow-hidden"
+      className="flex-1 min-h-0 flex flex-col bg-[#080c15] text-slate-200 overflow-hidden"
     >
       {/* Header */}
-      <div className="px-3 py-2 border-b border-slate-800 bg-[#0b1120] flex items-center justify-between gap-2">
+      <div className="px-3 py-2 border-b border-slate-800 bg-[#0b101d] flex items-center justify-between gap-2 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <Compass className="w-4 h-4 text-cyan-400 shrink-0" />
           <div className="min-w-0">

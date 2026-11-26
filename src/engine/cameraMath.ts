@@ -80,11 +80,16 @@ export function computeSafeClipPlanes(
   planetRadius: number,
   opticalFovDeg = 55,
 ): { near: number; far: number } {
-  const refDist = Math.max(1e-7, Math.min(surfaceClearanceDist, focusDist));
+  const refDist = Math.max(1e-12, Math.min(surfaceClearanceDist, focusDist));
   const fovBoost = clamp(55 / Math.max(opticalFovDeg, 3), 1, 18);
-  // Telephoto detail view stands physically farther back so near can remain comfortable
-  const near = clamp(refDist * 0.25 * Math.min(fovBoost, 3.0), 1e-5, 0.35 * (planetRadius / 13));
-  const baseFar = Math.max(300, planetRadius * 28);
+  // Scale near smoothly from 1e-11 up to planet surface clearance so micro (1e-7) and cosmic (1e6+) views never clip
+  const near = clamp(
+    refDist * 0.22 * Math.min(fovBoost, 3.0),
+    1e-11,
+    Math.max(0.35 * (planetRadius / 13), focusDist * 0.12),
+  );
+  const planetFar = Math.max(300, planetRadius * 28);
+  const baseFar = Math.max(planetFar, focusDist * 24 + planetRadius * 4);
   const horizonDist =
     Math.sqrt(Math.max(0, focusDist * (2 * planetRadius + focusDist))) +
     planetRadius * 0.4;
@@ -258,8 +263,8 @@ export function resolveSphericalCoreUp(
   return [pos[0] / r, pos[1] / r, pos[2] / r];
 }
 
-export const MIN_PLAYER_SCALE = 0.05;
-export const MAX_PLAYER_SCALE = 3.0;
+export const MIN_PLAYER_SCALE = 1e-12;
+export const MAX_PLAYER_SCALE = 1e12;
 export const DEFAULT_PLAYER_SCALE = 0.35;
 
 export interface CharacterScaleMetrics {
@@ -284,38 +289,50 @@ export function clampPlayerScale(scale: number | undefined): number {
   return clamp(scale, MIN_PLAYER_SCALE, MAX_PLAYER_SCALE);
 }
 
+export function formatPlayerScaleLabel(scale: number): string {
+  if (!Number.isFinite(scale) || scale <= 0) return '0.35';
+  if (scale >= 1e5 || scale < 1e-3) {
+    return scale.toExponential(scale >= 1e6 || scale <= 1e-6 ? 1 : 2).replace('+', '');
+  }
+  if (scale >= 100) return scale.toFixed(0);
+  if (scale >= 10) return scale.toFixed(1);
+  return Number(scale.toPrecision(3)).toString();
+}
+
 /**
  * Computes grounded astronaut physical dimensions, explorer camera framing, first-person
- * eye height, and locomotion speeds scaled proportionately with `playerScale` so the character
- * remains well below the planetary atmosphere shell and balanced against the globe.
+ * eye height, and locomotion speeds scaled proportionately with `playerScale` across
+ * extreme micro (1e-12) through cosmic (1e12) character scales.
  */
 export function computeCharacterScaleMetrics(
   planetScale: number,
   playerScale: number,
   gravityScale = 1.0,
-  nativeVoxelSize = 0.02,
+  _nativeVoxelSize = 0.02,
 ): CharacterScaleMetrics {
   const safePlanetScale = Math.max(planetScale, 0.002);
   const clampedScale = clampPlayerScale(playerScale);
   const charScale = safePlanetScale * clampedScale;
   const footRadius = 0.36 * charScale;
-  const eyeHeight = Math.max(nativeVoxelSize * 1.4, 1.22 * charScale);
+  const eyeHeight = Math.max(1e-12 * safePlanetScale, 1.22 * charScale);
 
   const defaultExplorerCamDist = clamp(
     6.6 * charScale,
-    Math.max(nativeVoxelSize * 4, 0.12 * safePlanetScale),
-    36.0 * safePlanetScale,
+    1e-11 * safePlanetScale,
+    1e13 * safePlanetScale,
   );
   const minExplorerCamDist = clamp(
-    Math.min(1.6 * charScale, Math.max(1e-7 * safePlanetScale, nativeVoxelSize * 4)),
-    1e-6,
+    1.6 * charScale,
+    1e-12 * safePlanetScale,
     defaultExplorerCamDist,
   );
-  const maxExplorerCamDist = Math.max(24.0 * charScale, 42.0 * safePlanetScale);
+  const maxExplorerCamDist = Math.max(32.0 * charScale, 48.0 * safePlanetScale);
 
-  const motionScale = safePlanetScale * (0.35 + 0.65 * clampedScale);
+  // Smooth strictly monotonic locomotion scaling (matches default ~3.1 m/s at 0.35x and scales down to 1e-12 & up to 1e12)
+  const motionScale =
+    safePlanetScale * Math.pow(clampedScale / DEFAULT_PLAYER_SCALE, 0.9) * 0.58;
   const walkSpeed = 5.4 * motionScale;
-  const jumpSpeed = 5.8 * Math.sqrt(Math.max(0.05, gravityScale * motionScale));
+  const jumpSpeed = 5.8 * Math.sqrt(Math.max(1e-12, gravityScale * motionScale));
   const jetpackThrust = (9.81 * gravityScale + 7.5) * motionScale;
 
   return {

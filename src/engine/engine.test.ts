@@ -16,6 +16,10 @@ import {
   PLANET_PRESETS,
   VoxelPlanet,
 } from './voxelPlanet';
+import {
+  CircularVoxelHistoryBuffer,
+  VoxelHistoryEntry,
+} from './voxelHistory';
 import { FluidSim, MAX_FLUID_PARTICLES } from './fluidSim';
 import {
   clampPlayerScale,
@@ -25,6 +29,7 @@ import {
   computeSafeClipPlanes,
   DEFAULT_PLAYER_SCALE,
   evaluateLandingDescentPose,
+  formatPlayerScaleLabel,
   MAX_PLAYER_SCALE,
   MIN_PLAYER_SCALE,
   resolveSphericalCoreUp,
@@ -1931,10 +1936,14 @@ test('RenderQuality Halton subpixel jittering and RGBA accumulator produce clean
   assert.deepEqual(Array.from(finalRgba), [15, 30, 40, 255, 110, 160, 210, 255]);
 });
 
-test('Character size controller keeps default eye well under atmosphere shell and scales monotonically', () => {
+test('Character size controller keeps default eye well under atmosphere shell and scales monotonically across extreme 1e-12..1e12 range', () => {
   assert.equal(clampPlayerScale(undefined), DEFAULT_PLAYER_SCALE);
-  assert.equal(clampPlayerScale(0.001), MIN_PLAYER_SCALE);
-  assert.equal(clampPlayerScale(99), MAX_PLAYER_SCALE);
+  assert.ok(MIN_PLAYER_SCALE <= 1e-12);
+  assert.ok(MAX_PLAYER_SCALE >= 1e12);
+  assert.equal(clampPlayerScale(1e-7), 1e-7);
+  assert.equal(clampPlayerScale(1e6), 1e6);
+  assert.equal(clampPlayerScale(1e-20), MIN_PLAYER_SCALE);
+  assert.equal(clampPlayerScale(1e20), MAX_PLAYER_SCALE);
 
   const planetR = 13.0;
   const atmoScaleHeight = planetR * DEFAULT_ATMOS_CONFIG.scaleHeightRatio;
@@ -1944,15 +1953,47 @@ test('Character size controller keeps default eye well under atmosphere shell an
     `Expected default player standing eye (${defM.eyeHeight + defM.footRadius}m) well under atmosphere scale height (${atmoScaleHeight}m)`,
   );
 
-  const tinyM = computeCharacterScaleMetrics(1.0, 0.1, 1.0, 0.02);
-  const giantM = computeCharacterScaleMetrics(1.0, 2.0, 1.0, 0.02);
-  assert.ok(tinyM.charScale < defM.charScale && defM.charScale < giantM.charScale);
-  assert.ok(tinyM.footRadius < defM.footRadius && defM.footRadius < giantM.footRadius);
-  assert.ok(
-    tinyM.defaultExplorerCamDist < defM.defaultExplorerCamDist &&
-      defM.defaultExplorerCamDist < giantM.defaultExplorerCamDist,
+  const scales = [1e-12, 1e-7, 1e-4, 0.01, DEFAULT_PLAYER_SCALE, 1.0, 1e3, 1e6, 1e12];
+  const metrics = scales.map((s) => computeCharacterScaleMetrics(1.0, s, 1.0, 0.02));
+  for (let i = 1; i < metrics.length; i++) {
+    const prev = metrics[i - 1];
+    const curr = metrics[i];
+    assert.ok(prev.charScale < curr.charScale, `charScale monotonic at ${scales[i]}`);
+    assert.ok(prev.footRadius < curr.footRadius, `footRadius monotonic at ${scales[i]}`);
+    assert.ok(prev.eyeHeight < curr.eyeHeight, `eyeHeight monotonic at ${scales[i]}`);
+    assert.ok(
+      prev.defaultExplorerCamDist < curr.defaultExplorerCamDist,
+      `camDist monotonic at ${scales[i]}`,
+    );
+    assert.ok(prev.walkSpeed < curr.walkSpeed, `walkSpeed monotonic at ${scales[i]}`);
+  }
+
+  // Verify clip planes remain valid & maintain 24-bit depth ratio <= 2.5e5 at 1e-7 & 1e6 scales
+  const microM = metrics[1]; // 1e-7
+  const microClips = computeSafeClipPlanes(
+    microM.eyeHeight,
+    microM.defaultExplorerCamDist,
+    planetR,
+    55,
   );
-  assert.ok(tinyM.walkSpeed < defM.walkSpeed && defM.walkSpeed < giantM.walkSpeed);
+  assert.ok(microClips.near > 0 && microClips.near < microM.eyeHeight);
+  assert.ok(microClips.far > microClips.near * 1e3);
+  assert.ok(microClips.far / microClips.near <= 2.5e5);
+
+  const cosmicM = metrics[7]; // 1e6
+  const cosmicClips = computeSafeClipPlanes(
+    cosmicM.eyeHeight,
+    cosmicM.defaultExplorerCamDist,
+    planetR,
+    55,
+  );
+  assert.ok(cosmicClips.near > 0 && cosmicClips.near < cosmicM.defaultExplorerCamDist);
+  assert.ok(cosmicClips.far > cosmicM.defaultExplorerCamDist);
+  assert.ok(cosmicClips.far / cosmicClips.near <= 2.5e5);
+
+  assert.equal(formatPlayerScaleLabel(1e-7), '1.0e-7');
+  assert.equal(formatPlayerScaleLabel(1e6), '1.0e6');
+  assert.equal(formatPlayerScaleLabel(0.35), '0.35');
 });
 
 test('First-person eye pose aligns with local gravity normal and supports upward sky pitch', () => {
@@ -3258,4 +3299,205 @@ test('Distant Horizons LOD: surface horizon pyramid, strict timeBudgetMs cap, no
   assert.ok(forwardHighResCount >= 30, `Expected broad horizon dome in forward cone, got ${forwardHighResCount}`);
   assert.ok(maxDistInForwardCone >= 12.0, `Expected sweeping horizon reach >= 12m, got ${maxDistInForwardCone.toFixed(2)}m`);
 });
+
+function makeDummyHistoryEntry(id: number, label: string): VoxelHistoryEntry {
+  return {
+    id,
+    label,
+    timestamp: 1000 + id,
+    center: [0, 13, 0],
+    radius: 1.5,
+    macro: {
+      indices: new Uint32Array([id]),
+      prevDensity: new Float32Array([0]),
+      nextDensity: new Float32Array([id]),
+      prevMaterial: new Uint8Array([MaterialId.Stone]),
+      nextMaterial: new Uint8Array([MaterialId.Soil]),
+      dirtyChunkIndices: new Uint32Array([0]),
+    },
+    sparseChunks: [],
+    brushOpsChanged: false,
+  };
+}
+
+test('CircularVoxelHistoryBuffer enforces fixed capacity wrap-around, redo branch truncation, and clear', () => {
+  const ring = new CircularVoxelHistoryBuffer(3);
+  assert.equal(ring.capacity, 3);
+  assert.equal(ring.canUndo(), false);
+  assert.equal(ring.canRedo(), false);
+  assert.equal(ring.undo(), null);
+  assert.equal(ring.redo(), null);
+
+  // Push 4 entries into capacity-3 circular buffer: entry 1 should be overwritten
+  ring.push(makeDummyHistoryEntry(1, 'op-1'));
+  ring.push(makeDummyHistoryEntry(2, 'op-2'));
+  ring.push(makeDummyHistoryEntry(3, 'op-3'));
+  assert.equal(ring.getSize(), 3);
+  assert.equal(ring.getHeadIndex(), 0);
+  assert.equal(ring.getUndoCount(), 3);
+  assert.equal(ring.getRedoCount(), 0);
+
+  ring.push(makeDummyHistoryEntry(4, 'op-4'));
+  assert.equal(ring.getSize(), 3);
+  assert.equal(ring.getHeadIndex(), 1, 'Head should wrap modulo capacity=3 after oldest overwrite');
+  assert.equal(ring.getUndoCount(), 3);
+  assert.equal(ring.peekUndoLabel(), 'op-4');
+  assert.deepEqual(
+    ring.getUndoEntriesOrdered().map((e) => e.id),
+    [2, 3, 4],
+  );
+
+  // Undo twice (op-4, op-3) and redo once (op-3)
+  assert.equal(ring.undo()?.id, 4);
+  assert.equal(ring.undo()?.id, 3);
+  assert.equal(ring.getUndoCount(), 1);
+  assert.equal(ring.getRedoCount(), 2);
+  assert.equal(ring.peekUndoLabel(), 'op-2');
+  assert.equal(ring.peekRedoLabel(), 'op-3');
+
+  assert.equal(ring.redo()?.id, 3);
+  assert.equal(ring.getUndoCount(), 2);
+  assert.equal(ring.getRedoCount(), 1);
+  assert.equal(ring.peekRedoLabel(), 'op-4');
+
+  // New push truncates invalidated redo tail (op-4)
+  ring.push(makeDummyHistoryEntry(5, 'op-5'));
+  assert.equal(ring.canRedo(), false);
+  assert.equal(ring.getRedoCount(), 0);
+  assert.equal(ring.getUndoCount(), 3);
+  assert.deepEqual(
+    ring.getUndoEntriesOrdered().map((e) => e.id),
+    [2, 3, 5],
+  );
+
+  // Undo past empty stops at op-2 and never leaks overwritten op-1
+  assert.equal(ring.undo()?.id, 5);
+  assert.equal(ring.undo()?.id, 3);
+  assert.equal(ring.undo()?.id, 2);
+  assert.equal(ring.canUndo(), false);
+  assert.equal(ring.undo(), null);
+  assert.equal(ring.getRedoCount(), 3);
+
+  // Push after undoing everything resets stack to single entry
+  ring.push(makeDummyHistoryEntry(6, 'op-6'));
+  assert.equal(ring.getSize(), 1);
+  assert.equal(ring.getUndoCount(), 1);
+  assert.equal(ring.canRedo(), false);
+  assert.equal(ring.peekUndoLabel(), 'op-6');
+
+  ring.clear();
+  assert.equal(ring.getSize(), 0);
+  assert.equal(ring.canUndo(), false);
+  assert.equal(ring.canRedo(), false);
+});
+
+test('VoxelPlanet sculpting undo/redo reverts and re-applies macro edits, continuous strokes, paint, and SVO sparse chunks', () => {
+  // 1. Macro sculpting round-trip + stroke coalescing + redo truncation
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 18, radius: 13 });
+  const hit = planet.raycastTerrain(0, 26, 0, 0, -1, 0, 30);
+  assert.equal(hit.hit, true);
+
+  const baselineDensity = new Float32Array(planet.density);
+  const baselineMaterial = new Uint8Array(planet.material);
+
+  // Step 1: Single carve edit
+  planet.applyBrush(hit.x, hit.y, hit.z, 'carve', 2.4, 2.0, MaterialId.Air);
+  assert.equal(planet.canUndo(), true);
+  assert.equal(planet.getHistorySnapshot().undoCount, 1);
+  assert.ok(
+    planet.sampleDensity(hit.x - hit.nx * 0.4, hit.y - hit.ny * 0.4, hit.z - hit.nz * 0.4) <
+      0.5,
+  );
+  const afterCarveDensity = new Float32Array(planet.density);
+  const afterCarveMaterial = new Uint8Array(planet.material);
+
+  // Step 2: Continuous multi-step drag grouped into ONE stroke entry
+  planet.beginHistoryStroke('连续拖拽塑形');
+  planet.applyBrush(hit.x + 1.2, hit.y, hit.z, 'build', 1.8, 1.8, MaterialId.Crystal);
+  planet.applyBrush(hit.x + 2.4, hit.y, hit.z, 'build', 1.8, 1.8, MaterialId.Crystal);
+  planet.applyBrush(hit.x + 2.4, hit.y, hit.z, 'paint', 2.0, 1.0, MaterialId.Ice);
+  const committedStroke = planet.commitHistoryStroke();
+  assert.ok(committedStroke !== null);
+  assert.equal(committedStroke?.label, '连续拖拽塑形');
+  assert.equal(planet.getHistorySnapshot().undoCount, 2);
+
+  const afterStrokeDensity = new Float32Array(planet.density);
+  const afterStrokeMaterial = new Uint8Array(planet.material);
+
+  // runWithoutHistory ignores background mutations without pushing history
+  planet.runWithoutHistory(() => {
+    assert.equal(planet.getHistorySnapshot().undoCount, 2);
+  });
+
+  // Undo continuous stroke -> exact match with post-carve state
+  const undoStroke = planet.undo();
+  assert.ok(undoStroke !== null);
+  assert.equal(planet.getHistorySnapshot().undoCount, 1);
+  assert.equal(planet.getHistorySnapshot().redoCount, 1);
+  assert.deepEqual(planet.density, afterCarveDensity);
+  assert.deepEqual(planet.material, afterCarveMaterial);
+
+  // Redo continuous stroke -> exact match with post-stroke state
+  const redoStroke = planet.redo();
+  assert.ok(redoStroke !== null);
+  assert.equal(planet.getHistorySnapshot().undoCount, 2);
+  assert.equal(planet.getHistorySnapshot().redoCount, 0);
+  assert.deepEqual(planet.density, afterStrokeDensity);
+  assert.deepEqual(planet.material, afterStrokeMaterial);
+
+  // Undo both operations back to baseline seed terrain
+  assert.ok(planet.undo() !== null);
+  assert.ok(planet.undo() !== null);
+  assert.equal(planet.canUndo(), false);
+  assert.equal(planet.getHistorySnapshot().redoCount, 2);
+  assert.deepEqual(planet.density, baselineDensity);
+  assert.deepEqual(planet.material, baselineMaterial);
+
+  // Perform a new edit after undoing everything: old redo branch must be discarded
+  planet.applyBrush(hit.x, hit.y, hit.z, 'crater', 2.6, 2.2, MaterialId.Basalt, {
+    rimHeight: 0.75,
+    rimMaterial: MaterialId.Sandstone,
+  });
+  assert.equal(planet.canRedo(), false);
+  assert.equal(planet.getHistorySnapshot().undoCount, 1);
+  assert.ok(planet.undo() !== null);
+  assert.deepEqual(planet.density, baselineDensity);
+  assert.deepEqual(planet.material, baselineMaterial);
+
+  // Regenerate clears history
+  planet.applyBrush(hit.x, hit.y, hit.z, 'build', 1.5, 1.5, MaterialId.Stone);
+  assert.equal(planet.canUndo(), true);
+  planet.generatePlanet(planet.seedConfig);
+  assert.equal(planet.canUndo(), false);
+  assert.equal(planet.canRedo(), false);
+
+  // 2. High-res (>1B^3 SVO) sparse chunk + brushOps undo/redo
+  const svo = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 512, radius: 13 });
+  const svoHit = svo.raycastTerrain(0, 26, 0, 0, -1, 0, 30);
+  assert.equal(svoHit.hit, true);
+  const probeY = svoHit.y - svoHit.ny * 0.15;
+  const origDens = svo.sampleDensity(svoHit.x, probeY, svoHit.z);
+  assert.ok(origDens > 0);
+
+  svo.applyBrush(svoHit.x, svoHit.y, svoHit.z, 'carve', 0.85, 2.4, MaterialId.Air);
+  const carvedDens = svo.sampleDensity(svoHit.x, probeY, svoHit.z);
+  assert.ok(carvedDens < origDens, 'SVO carve should lower density at probe point');
+
+  const svoUndo = svo.undo();
+  assert.ok(svoUndo !== null);
+  const undoneDens = svo.sampleDensity(svoHit.x, probeY, svoHit.z);
+  assert.ok(
+    Math.abs(undoneDens - origDens) < 1e-5,
+    `SVO undo should restore exact pre-carve density (${origDens}), got ${undoneDens}`,
+  );
+
+  const svoRedo = svo.redo();
+  assert.ok(svoRedo !== null);
+  const redoneDens = svo.sampleDensity(svoHit.x, probeY, svoHit.z);
+  assert.ok(
+    Math.abs(redoneDens - carvedDens) < 1e-5,
+    `SVO redo should restore exact carved density (${carvedDens}), got ${redoneDens}`,
+  );
+});
+
 

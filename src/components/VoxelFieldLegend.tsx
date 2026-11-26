@@ -87,10 +87,10 @@ export const VoxelFieldLegend: React.FC<VoxelFieldLegendProps> = ({
   return (
     <aside
       data-testid="voxel-field-legend"
-      className="fixed bottom-16 left-3 z-20 w-[280px] max-w-[calc(100vw-24px)] rounded-xs border border-slate-800 bg-[#090d18]/92 text-slate-200 shadow-2xl pointer-events-auto"
+      className="w-full shrink-0 border-t border-slate-800 bg-[#080c15] text-slate-200 overflow-hidden"
     >
       {/* Header Strip */}
-      <div className="flex items-center justify-between gap-1 px-2.5 py-1.5 border-b border-slate-800 bg-[#0d1322]">
+      <div className="flex items-center justify-between gap-1 px-2.5 py-1.5 border-b border-slate-800 bg-[#0b101d]">
         <div className="flex items-center gap-1.5 min-w-0">
           <span className="text-[11px] font-semibold text-white whitespace-nowrap truncate">
             体素图例 · {overlayLabel}

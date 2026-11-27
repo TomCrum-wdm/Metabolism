@@ -33,6 +33,7 @@ const MATERIAL_CHOICES: ReadonlyArray<{
   { value: MaterialId.Sandstone, label: '砂岩 Sandstone' },
   { value: MaterialId.Crystal, label: '晶矿 Crystal' },
   { value: MaterialId.Ice, label: '极冰 Ice' },
+  { value: MaterialId.Magma, label: '熔岩 Magma' },
 ];
 
 const RIM_MATERIAL_CHOICES: ReadonlyArray<{
@@ -42,6 +43,7 @@ const RIM_MATERIAL_CHOICES: ReadonlyArray<{
   { value: 'none', label: '无焦化/沉积边缘' },
   { value: 'active', label: '跟随当前材质' },
   { value: MaterialId.Basalt, label: '玄武岩焦壳' },
+  { value: MaterialId.Magma, label: '熔融岩浆缘' },
   { value: MaterialId.Crystal, label: '晶化玻璃' },
   { value: MaterialId.Sandstone, label: '焦化砂岩' },
   { value: MaterialId.Ice, label: '寒冰覆盖' },

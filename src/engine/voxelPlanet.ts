@@ -29,6 +29,7 @@ export enum MaterialId {
   Crystal = 4,
   Ice = 5,
   Sandstone = 6,
+  Magma = 7,
 }
 
 export type BrushMode =
@@ -61,7 +62,7 @@ export interface BrushApplyOptions {
 
 export type ChunkLodLevel = 0 | 1 | 2;
 export type TerrainRenderMode = 'smooth' | 'blocky';
-export type TerrainOverlayMode = 'material' | 'temperature' | 'density' | 'lod' | 'metabolism';
+export type TerrainOverlayMode = 'material' | 'temperature' | 'density' | 'lod' | 'metabolism' | 'pressure';
 
 export interface PlanetSeedConfig {
   seed: number;
@@ -391,6 +392,7 @@ export const MATERIAL_PALETTE: Record<
   [MaterialId.Crystal]: { rgb: [0.16, 0.82, 0.88], rough: 0.18, metal: 0.25, glow: 0.65 },
   [MaterialId.Ice]: { rgb: [0.91, 0.95, 0.99], rough: 0.24, metal: 0.03, glow: 0.04 },
   [MaterialId.Sandstone]: { rgb: [0.75, 0.56, 0.39], rough: 0.86, metal: 0.02, glow: 0 },
+  [MaterialId.Magma]: { rgb: [1.0, 0.34, 0.06], rough: 0.28, metal: 0.08, glow: 1.35 },
 };
 
 export const MATERIAL_NAMES: Record<MaterialId, string> = {
@@ -401,6 +403,7 @@ export const MATERIAL_NAMES: Record<MaterialId, string> = {
   [MaterialId.Crystal]: 'Crystal (晶矿)',
   [MaterialId.Ice]: 'Ice (极冰)',
   [MaterialId.Sandstone]: 'Sandstone (砂岩)',
+  [MaterialId.Magma]: 'Magma (熔岩浆)',
 };
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -1901,6 +1904,7 @@ export class VoxelPlanet {
       [MaterialId.Crystal]: 0,
       [MaterialId.Ice]: 0,
       [MaterialId.Sandstone]: 0,
+      [MaterialId.Magma]: 0,
     };
     const n = this.material.length;
     let solid = 0;
@@ -3292,7 +3296,7 @@ export class VoxelPlanet {
                     cg = 0.67;
                     cb = 0.52;
                   }
-                  const cliffBlend = (1 - smoothstep(0.58, 0.86, slopeDot)) * (1 - glow);
+                  const cliffBlend = (1 - smoothstep(0.58, 0.86, slopeDot)) * Math.max(0, 1 - glow);
                   const stoneCol = MATERIAL_PALETTE[MaterialId.Stone].rgb;
                   cr = cr * (1 - cliffBlend * 0.72) + stoneCol[0] * cliffBlend * 0.72;
                   cg = cg * (1 - cliffBlend * 0.72) + stoneCol[1] * cliffBlend * 0.72;
@@ -4567,7 +4571,7 @@ export class VoxelPlanet {
                       cg = 0.67;
                       cb = 0.52;
                     }
-                    const cliffBlend = (1 - smoothstep(0.58, 0.86, slopeDot)) * (1 - glow);
+                    const cliffBlend = (1 - smoothstep(0.58, 0.86, slopeDot)) * Math.max(0, 1 - glow);
                     const stoneCol = MATERIAL_PALETTE[MaterialId.Stone].rgb;
                     cr = cr * (1 - cliffBlend * 0.72) + stoneCol[0] * cliffBlend * 0.72;
                     cg = cg * (1 - cliffBlend * 0.72) + stoneCol[1] * cliffBlend * 0.72;

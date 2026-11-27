@@ -27,6 +27,7 @@ const CHART_MAT_ORDER: MaterialId[] = [
   MaterialId.Sandstone,
   MaterialId.Crystal,
   MaterialId.Ice,
+  MaterialId.Magma,
   MaterialId.Air,
 ];
 
@@ -63,6 +64,11 @@ const MATERIAL_CHART_STYLE: Record<
     shortName: '极冰 Ice',
     fill: '#dbeafe',
     stroke: '#ffffff',
+  },
+  [MaterialId.Magma]: {
+    shortName: '熔岩 Magma',
+    fill: '#ff571a',
+    stroke: '#fdba74',
   },
   [MaterialId.Air]: {
     shortName: '空气 Air',

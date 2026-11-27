@@ -152,6 +152,19 @@ import {
   verifyHypergraphElementBalance,
   VOXEL_MATERIAL_COMPOSITIONS,
 } from './metabolism';
+import {
+  computeVoxelLithostaticPressureAtm,
+  evaluateBlackbodyMagmaRgb,
+  GpuVoxelPipeline,
+  pressureAtmToRgb,
+} from './gpuVoxelPipeline';
+import {
+  computeBoilingPointK,
+  computeMultiphaseCellPressureAtm,
+  evaluateArrheniusMagmaViscosity,
+  evaluateMagmaBlackbodyColor,
+  FluidPhase,
+} from './gpuMultiphaseFluid';
 
 const GRAVITY_PARAMS = {
   referenceRadius: DEFAULT_PLANET_RADIUS,
@@ -3499,5 +3512,143 @@ test('VoxelPlanet sculpting undo/redo reverts and re-applies macro edits, contin
     `SVO redo should restore exact carved density (${carvedDens}), got ${redoneDens}`,
   );
 });
+
+test('GPU Voxel Pipeline physics: lithostatic overburden, magma blackbody emission, pressure stress ramp & MaterialId.Magma geochemistry', () => {
+  // 1. Lithostatic overburden increases monotonically from surface to core & responds to gravity/density/heat
+  const surfP = computeVoxelLithostaticPressureAtm(13.0, 13.0, 1.0, 1.0, MaterialId.Basalt, 290, 0);
+  const midP = computeVoxelLithostaticPressureAtm(7.0, 13.0, 1.0, 1.0, MaterialId.Basalt, 900, 0);
+  const coreP = computeVoxelLithostaticPressureAtm(0.5, 13.0, 1.0, 1.0, MaterialId.Basalt, 3200, 150);
+  assert.ok(Math.abs(surfP - 1.0) < 1e-4, `Expected surface overburden ~1 atm, got ${surfP}`);
+  assert.ok(midP > surfP * 100, `Expected mid-mantle overburden >> surface, got ${midP}`);
+  assert.ok(coreP > midP, `Expected deep core overburden > mid-mantle (${coreP} > ${midP})`);
+
+  // Higher gravity scales lithostatic overburden proportionally
+  const highGP = computeVoxelLithostaticPressureAtm(7.0, 13.0, 1.0, 2.5, MaterialId.Basalt, 290, 0);
+  const lowGP = computeVoxelLithostaticPressureAtm(7.0, 13.0, 1.0, 1.0, MaterialId.Basalt, 290, 0);
+  assert.ok(highGP > lowGP * 2.0);
+
+  // 2. Pressure colormap spans cool deep blue (low P) -> amber/rose-crimson (high P)
+  const lowColor = pressureAtmToRgb(0.5);
+  const highColor = pressureAtmToRgb(12000);
+  assert.ok(lowColor[2] > lowColor[0], 'Low pressure color should be cool blue-cyan');
+  assert.ok(highColor[0] > highColor[2], 'Extreme overburden pressure color should be warm crimson');
+
+  // 3. Magma blackbody curve cools from bright white-yellow (1900K) to deep ember red (920K)
+  const hotBb = evaluateBlackbodyMagmaRgb(1900);
+  const coolBb = evaluateBlackbodyMagmaRgb(920);
+  assert.ok(hotBb[0] + hotBb[1] + hotBb[2] > coolBb[0] + coolBb[1] + coolBb[2]);
+  assert.ok(coolBb[0] > coolBb[2], 'Cooling basaltic lava glows red-orange rather than blue');
+
+  // 4. MaterialId.Magma geochemical profile & VoxelPlanet stats/sculpting integration
+  const magmaComp = VOXEL_MATERIAL_COMPOSITIONS[MaterialId.Magma];
+  assert.ok(magmaComp, 'Expected MaterialId.Magma geochemical composition entry');
+  assert.ok(magmaComp.effectivePorosity > 0.2);
+  assert.ok(magmaComp.components.length >= 3);
+
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 18, radius: 13 });
+  const hit = planet.raycastTerrain(0, 26, 0, 0, -1, 0, 30);
+  assert.equal(hit.hit, true);
+  planet.applyBrush(hit.x, hit.y, hit.z, 'paint', 2.6, 2.0, MaterialId.Magma);
+  assert.equal(planet.sampleNearestMaterial(hit.x, hit.y, hit.z), MaterialId.Magma);
+  const stats = planet.getVoxelStats();
+  assert.ok(stats.materialCounts[MaterialId.Magma] > 0, 'Painted magma voxels must appear in getVoxelStats()');
+});
+
+test('Multiphase geological fluid physics: Arrhenius magma viscosity, Clausius-Clapeyron boiling, magma-water flash & basalt solidification', () => {
+  // 1. Arrhenius viscosity rises exponentially as silicate melt cools toward solidus
+  const hotVisc = evaluateArrheniusMagmaViscosity(1550);
+  const warmVisc = evaluateArrheniusMagmaViscosity(1250);
+  const solidusVisc = evaluateArrheniusMagmaViscosity(910);
+  assert.ok(warmVisc > hotVisc, `Expected cooling magma viscosity to increase (${warmVisc} > ${hotVisc})`);
+  assert.ok(solidusVisc > warmVisc * 2.0, `Expected sharp near-solidus viscosity spike (${solidusVisc} >> ${warmVisc})`);
+
+  // 2. Clausius-Clapeyron boiling point increases with confining pressure
+  const boilVac = computeBoilingPointK(0.2);
+  const boil1Atm = computeBoilingPointK(1.0);
+  const boilDeep = computeBoilingPointK(40.0);
+  assert.ok(boilVac < 350 && boil1Atm > 370 && boil1Atm < 376, `1 atm boiling point expected ~373K, got ${boil1Atm}`);
+  assert.ok(boilDeep > 500, `High confining pressure boiling point must exceed 500K, got ${boilDeep}`);
+
+  // 3. EOS cell pressure rises with mass density and high temperature
+  const pCold = computeMultiphaseCellPressureAtm(1.2, 0.2, 0.0, 0.0, 290, 1.0);
+  const pHotMagma = computeMultiphaseCellPressureAtm(2.5, 0.8, 0.4, 0.1, 1480, 1.0);
+  assert.ok(pHotMagma > pCold);
+
+  const magmaCol = evaluateMagmaBlackbodyColor(1480);
+  assert.ok(magmaCol[0] > 0.7 && magmaCol[0] > magmaCol[2]);
+
+  // 4. CPU FluidSim multiphase simulation: magma + water thermal contact flashes Water -> Steam
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, voxelRadius: 18, radius: 13 });
+  const sim = new FluidSim();
+  const rSurf = planet.findSurfaceRadiusAlongRay(0, 1, 0);
+  const y0 = rSurf + 0.55;
+
+  for (let i = 0; i < 8; i++) {
+    const jitter = (i - 3.5) * 0.08;
+    sim.spawnMultiphaseParticle(jitter, y0, 0, 0, 0, 0, FluidPhase.Water, 355);
+    sim.spawnMultiphaseParticle(jitter, y0 + 0.06, 0.05, 0, 0, 0, FluidPhase.Magma, 1750);
+  }
+  for (let step = 0; step < 30; step++) {
+    sim.step(0.016, planet, GRAVITY_PARAMS, 2);
+  }
+  assert.ok(sim.steamCount > 0, `Expected hot magma-water contact to flash Steam particles, got ${sim.steamCount}`);
+  assert.ok(sim.peakTempK > 900);
+
+  // Snapshot round-trip preserves phases & temperatures
+  const snap = sim.exportState();
+  const restored = new FluidSim();
+  restored.importState(snap);
+  assert.equal(restored.activeCount, sim.activeCount);
+  assert.ok(snap.phases && snap.phases.length === sim.activeCount);
+  assert.ok(snap.temperaturesK && snap.temperaturesK.length === sim.activeCount);
+  assert.deepEqual(restored.phase.slice(0, sim.activeCount), sim.phase.slice(0, sim.activeCount));
+
+  // Cooling magma below solidus after ageSec > 1.2 solidifies into basalt accretion records
+  const coolSim = new FluidSim();
+  coolSim.spawnMultiphaseParticle(0, rSurf + 0.35, 0, 0, 0, 0, FluidPhase.Magma, 880);
+  coolSim.ageSec[0] = 1.5;
+  coolSim.step(0.016, planet, GRAVITY_PARAMS, 1);
+  assert.ok(
+    coolSim.solidifiedSites.length >= 1,
+    'Sub-solidus aged magma particle should emit solidifiedSites basalt event',
+  );
+  assert.equal(coolSim.magmaCount, 0);
+});
+
+test('GpuVoxelPipeline uploadFromPlanet synchronously populates blocky surface instances and respects interior cutaway', () => {
+  const planet = new VoxelPlanet({ ...DEFAULT_SEED_CONFIG, seed: 202611, voxelRadius: 18, radius: 13 });
+  const pipeline = new GpuVoxelPipeline(planet);
+  pipeline.uploadFromPlanet(planet);
+
+  assert.ok(
+    pipeline.liveVisibleInstances > 1000,
+    `Expected > 1000 initial visible surface cubes, got ${pipeline.liveVisibleInstances}`,
+  );
+  assert.equal(pipeline.instancedMesh.count, pipeline.liveVisibleInstances);
+  assert.equal(pipeline.gpuHealthy, true);
+
+  const posScale = pipeline.instPosScaleAttr.array as Float32Array;
+  const meta = pipeline.instMetaAttr.array as Float32Array;
+  assert.ok(posScale[3] > 0, 'First surface voxel must have positive cube scale');
+  assert.ok(meta[1] >= 200 && meta[2] >= 0.02, 'Surface voxel meta must carry valid temperature and pressure');
+
+  // Interior cutaway removes (+x, +y, +z) octant and exposes inner cross-section faces
+  const cutCount = pipeline.rebuildSurfaceCpu(true);
+  assert.ok(cutCount > 1000, `Expected non-empty cutaway surface cubes, got ${cutCount}`);
+  assert.equal(pipeline.instancedMesh.count, cutCount);
+  let foundInCutOctant = false;
+  for (let i = 0; i < cutCount; i++) {
+    const x = posScale[i * 4 + 0];
+    const y = posScale[i * 4 + 1];
+    const z = posScale[i * 4 + 2];
+    if (x > 0 && y > 0 && z > 0) {
+      foundInCutOctant = true;
+      break;
+    }
+  }
+  assert.equal(foundInCutOctant, false, 'Cutaway (+x,+y,+z) octant must have no emitted cubes');
+  pipeline.dispose();
+});
+
 
 

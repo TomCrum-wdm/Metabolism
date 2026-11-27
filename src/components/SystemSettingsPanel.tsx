@@ -62,6 +62,7 @@ const SCALE_PRESETS: ReadonlyArray<{ label: string; value: number; title: string
 const OVERLAY_OPTIONS: ReadonlyArray<{ id: TerrainOverlayMode; label: string }> = [
   { id: 'material', label: '岩性材质' },
   { id: 'temperature', label: '温度场' },
+  { id: 'pressure', label: '压力应力场' },
   { id: 'density', label: '圈层密度' },
   { id: 'lod', label: 'LOD网格' },
   { id: 'metabolism', label: '代谢场' },
@@ -559,6 +560,113 @@ export const SystemSettingsPanel: React.FC<SystemSettingsPanelProps> = ({
                 onChangeValue={(v) => onUpdateConfig({ horizonStreamBudget: v })}
               />
             </label>
+          </div>
+        </div>
+
+        {/* Section 3B: Full GPU Voxel Pipeline & Multiphase Thermodynamic Fluid Engine */}
+        <div className="rounded-xs border border-slate-800 bg-[#0c111d] p-2.5 space-y-2">
+          <div className="flex items-center justify-between border-b border-slate-800/80 pb-1.5">
+            <span className="flex items-center gap-1.5 font-semibold text-white">
+              <Cpu className="w-3.5 h-3.5 text-orange-400 shrink-0" />
+              <span>全 GPU 体素管线与多相地质流体</span>
+            </span>
+            <span className="font-mono-tabular text-[10px] text-orange-300">
+              {telemetry.gpuVoxel?.active || telemetry.gpuFluidActive ? `${telemetry.backend} Compute` : `${telemetry.backend} 兼容回退`}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-1.5 text-[10.5px]">
+            <label className="flex items-center justify-between cursor-pointer">
+              <span className="text-slate-300">启用全 GPU 体素剔除/压力/温度管线</span>
+              <input
+                type="checkbox"
+                data-testid="sys-gpu-voxel-toggle"
+                checked={config.gpuVoxelPipelineEnabled ?? true}
+                onChange={(e) => onUpdateConfig({ gpuVoxelPipelineEnabled: e.target.checked })}
+                className="accent-orange-400 cursor-pointer"
+              />
+            </label>
+
+            <label className="flex items-center justify-between cursor-pointer">
+              <span className="text-slate-300">启用 GPU 多相 PIC 流体 (水 / 熔岩 / 蒸汽)</span>
+              <input
+                type="checkbox"
+                data-testid="sys-gpu-fluid-toggle"
+                checked={config.gpuMultiphaseFluidEnabled ?? true}
+                onChange={(e) => onUpdateConfig({ gpuMultiphaseFluidEnabled: e.target.checked })}
+                className="accent-cyan-400 cursor-pointer"
+              />
+            </label>
+
+            <label className="flex items-center justify-between cursor-pointer">
+              <span className="text-slate-300">流体-岩石耦合 (高压侵蚀 / 岩浆冷却固结玄武岩)</span>
+              <input
+                type="checkbox"
+                data-testid="sys-fluid-coupling-toggle"
+                checked={config.fluidGeoCouplingEnabled ?? true}
+                onChange={(e) => onUpdateConfig({ fluidGeoCouplingEnabled: e.target.checked })}
+                className="accent-amber-400 cursor-pointer"
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-800/80">
+            <label className="space-y-1">
+              <span className="text-[10px] text-slate-400 block">岩浆注入温度</span>
+              <NumericCadInput
+                value={config.magmaInjectionTempK ?? 1480}
+                minValid={950}
+                maxValid={2400}
+                unit="K"
+                ariaLabel="岩浆注入温度"
+                testId="sys-magma-temp-input"
+                sliderMin={950}
+                sliderMax={2200}
+                sliderStep={10}
+                onChangeValue={(v) => onUpdateConfig({ magmaInjectionTempK: v })}
+              />
+            </label>
+
+            <label className="space-y-1">
+              <span className="text-[10px] text-slate-400 block">流体静压耦合倍率</span>
+              <NumericCadInput
+                value={config.fluidPressureScale ?? 1.0}
+                minValid={0.1}
+                maxValid={5.0}
+                unit="×"
+                ariaLabel="流体静压耦合倍率"
+                testId="sys-pressure-scale-input"
+                sliderMin={0.25}
+                sliderMax={4.0}
+                sliderStep={0.05}
+                onChangeValue={(v) => onUpdateConfig({ fluidPressureScale: v })}
+              />
+            </label>
+          </div>
+
+          <div className="rounded-xs border border-slate-800/90 bg-[#060911] px-2 py-1.5 grid grid-cols-2 gap-x-2 gap-y-1 font-mono-tabular text-[10px]">
+            <span className="text-slate-400">可见 GPU 体素实例</span>
+            <span className="text-right text-slate-200">
+              {(telemetry.gpuVoxel?.visibleSurfaceInstances ?? 0).toLocaleString()}
+            </span>
+
+            <span className="text-slate-400">流体多相 (水/熔/汽)</span>
+            <span className="text-right text-cyan-300">
+              {Math.round(telemetry.waterParticles)} /{' '}
+              <span className="text-orange-400">{Math.round(telemetry.magmaParticles)}</span> /{' '}
+              <span className="text-slate-200">{Math.round(telemetry.steamParticles)}</span>
+            </span>
+
+            <span className="text-slate-400">峰值压力 / 峰值温度</span>
+            <span className="text-right text-amber-300">
+              {telemetry.peakFluidPressureAtm.toFixed(1)} atm · {telemetry.peakFluidTempK.toFixed(0)}K
+            </span>
+
+            <span className="text-slate-400">Compute 耗时 / 显存</span>
+            <span className="text-right text-emerald-300">
+              {((telemetry.gpuVoxel?.lastDispatchMs ?? 0) + (telemetry.gpuFluid?.lastDispatchMs ?? 0)).toFixed(2)}ms ·{' '}
+              {(((telemetry.gpuVoxel?.vramBytes ?? 0) + (telemetry.gpuFluid?.vramBytes ?? 0)) / (1024 * 1024)).toFixed(1)}MB
+            </span>
           </div>
         </div>
 

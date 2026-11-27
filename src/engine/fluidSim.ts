@@ -18,8 +18,15 @@ import {
   TractorForceResult,
   TractorRayPickResult,
 } from './tractorBeam';
+import {
+  computeBoilingPointK,
+  evaluateArrheniusMagmaViscosity,
+  evaluateMagmaBlackbodyColor,
+  FluidPhase,
+} from './gpuMultiphaseFluid';
 
 export const MAX_FLUID_PARTICLES = 2200;
+export { FluidPhase };
 
 const WATER_CELLS = 48;
 const WATER_N = WATER_CELLS + 1; // 49
@@ -38,6 +45,8 @@ export interface FluidSnapshot {
   activeCount: number;
   positions: Float32Array;
   velocities: Float32Array;
+  phases?: Uint8Array;
+  temperaturesK?: Float32Array;
 }
 
 export interface ActiveFluidTractorField {
@@ -79,6 +88,21 @@ export class FluidSim {
   public readonly rho = new Float32Array(MAX_FLUID_PARTICLES);
   public readonly press = new Float32Array(MAX_FLUID_PARTICLES);
 
+  // Multiphase Thermodynamic State (0=Water, 1=Magma, 2=Steam)
+  public readonly phase = new Uint8Array(MAX_FLUID_PARTICLES);
+  public readonly temperatureK = new Float32Array(MAX_FLUID_PARTICLES);
+  public readonly pressureAtm = new Float32Array(MAX_FLUID_PARTICLES);
+  public readonly particleVisc = new Float32Array(MAX_FLUID_PARTICLES);
+  public readonly ageSec = new Float32Array(MAX_FLUID_PARTICLES);
+
+  public waterCount = 0;
+  public magmaCount = 0;
+  public steamCount = 0;
+  public peakPressureAtm = 1.0;
+  public peakTempK = 289.0;
+  public readonly solidifiedSites: Array<{ x: number; y: number; z: number; tempK: number }> = [];
+  public readonly erosionSites: Array<{ x: number; y: number; z: number; pressureAtm: number }> = [];
+
   // Spatial hash linked list arrays (zero allocation per step)
   private readonly head = new Int32Array(HASH_TABLE_SIZE);
   private readonly next = new Int32Array(MAX_FLUID_PARTICLES);
@@ -102,9 +126,11 @@ export class FluidSim {
   private readonly scratchPos = new Float32Array(220000 * 3);
   private readonly scratchNorm = new Float32Array(220000 * 3);
 
-  // Splash droplet buffer (subset of fast/free particles)
+  // Splash & multiphase droplet buffer (fast Water + all active Magma/Steam particles)
   public readonly splashPositions = new Float32Array(MAX_FLUID_PARTICLES * 3);
   public readonly splashVelocities = new Float32Array(MAX_FLUID_PARTICLES * 3);
+  public readonly splashColors = new Float32Array(MAX_FLUID_PARTICLES * 3);
+  public readonly splashPhases = new Uint8Array(MAX_FLUID_PARTICLES);
   public splashCount = 0;
 
   // Dynamic water Marching Cubes bounds scaled to planet radius
@@ -152,6 +178,13 @@ export class FluidSim {
   public clear(): void {
     this.activeCount = 0;
     this.splashCount = 0;
+    this.waterCount = 0;
+    this.magmaCount = 0;
+    this.steamCount = 0;
+    this.peakPressureAtm = 1.0;
+    this.peakTempK = 289.0;
+    this.solidifiedSites.length = 0;
+    this.erosionSites.length = 0;
     this.releaseTractorCapture();
   }
 
@@ -176,6 +209,11 @@ export class FluidSim {
         this.vz[write] = this.vz[i];
         this.rho[write] = this.rho[i];
         this.press[write] = this.press[i];
+        this.phase[write] = this.phase[i];
+        this.temperatureK[write] = this.temperatureK[i];
+        this.pressureAtm[write] = this.pressureAtm[i];
+        this.particleVisc[write] = this.particleVisc[i];
+        this.ageSec[write] = this.ageSec[i];
         this.tractorFactor[write] = this.tractorFactor[i];
         this.tractorStretchU[write] = this.tractorStretchU[i];
       }
@@ -412,6 +450,44 @@ export class FluidSim {
     return affected;
   }
 
+  public spawnMultiphaseParticle(
+    x: number,
+    y: number,
+    z: number,
+    vx = 0,
+    vy = 0,
+    vz = 0,
+    phase: FluidPhase = FluidPhase.Water,
+    tempK?: number,
+  ): boolean {
+    if (this.activeCount >= MAX_FLUID_PARTICLES) return false;
+    const i = this.activeCount++;
+    const resolvedT =
+      tempK ??
+      (phase === FluidPhase.Magma ? 1450 : phase === FluidPhase.Steam ? 425 : 289);
+    this.px[i] = x;
+    this.py[i] = y;
+    this.pz[i] = z;
+    this.vx[i] = vx;
+    this.vy[i] = vy;
+    this.vz[i] = vz;
+    this.rho[i] = phase === FluidPhase.Magma ? this.restDensity * 1.9 : phase === FluidPhase.Steam ? this.restDensity * 0.35 : this.restDensity;
+    this.press[i] = 0;
+    this.phase[i] = phase;
+    this.temperatureK[i] = resolvedT;
+    this.pressureAtm[i] = 1.0;
+    this.particleVisc[i] =
+      phase === FluidPhase.Magma
+        ? evaluateArrheniusMagmaViscosity(resolvedT)
+        : phase === FluidPhase.Steam
+          ? 0.04
+          : this.viscosity;
+    this.ageSec[i] = 0;
+    this.tractorFactor[i] = 0;
+    this.tractorStretchU[i] = 0;
+    return true;
+  }
+
   public spawnParticle(
     x: number,
     y: number,
@@ -420,19 +496,7 @@ export class FluidSim {
     vy = 0,
     vz = 0,
   ): boolean {
-    if (this.activeCount >= MAX_FLUID_PARTICLES) return false;
-    const i = this.activeCount++;
-    this.px[i] = x;
-    this.py[i] = y;
-    this.pz[i] = z;
-    this.vx[i] = vx;
-    this.vy[i] = vy;
-    this.vz[i] = vz;
-    this.rho[i] = this.restDensity;
-    this.press[i] = 0;
-    this.tractorFactor[i] = 0;
-    this.tractorStretchU[i] = 0;
-    return true;
+    return this.spawnMultiphaseParticle(x, y, z, vx, vy, vz, FluidPhase.Water, 289);
   }
 
   /**
@@ -619,10 +683,13 @@ export class FluidSim {
   }
 
   public exportState(): FluidSnapshot {
-    const n3 = this.activeCount * 3;
+    const n = this.activeCount;
+    const n3 = n * 3;
     const positions = new Float32Array(n3);
     const velocities = new Float32Array(n3);
-    for (let i = 0; i < this.activeCount; i++) {
+    const phases = new Uint8Array(n);
+    const temperaturesK = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
       const i3 = i * 3;
       positions[i3] = this.px[i];
       positions[i3 + 1] = this.py[i];
@@ -630,11 +697,15 @@ export class FluidSim {
       velocities[i3] = this.vx[i];
       velocities[i3 + 1] = this.vy[i];
       velocities[i3 + 2] = this.vz[i];
+      phases[i] = this.phase[i];
+      temperaturesK[i] = this.temperatureK[i];
     }
     return {
-      activeCount: this.activeCount,
+      activeCount: n,
       positions,
       velocities,
+      phases,
+      temperaturesK,
     };
   }
 
@@ -643,13 +714,17 @@ export class FluidSim {
     const n = Math.min(snap.activeCount, MAX_FLUID_PARTICLES);
     for (let i = 0; i < n; i++) {
       const i3 = i * 3;
-      this.spawnParticle(
+      const ph = snap.phases ? (snap.phases[i] as FluidPhase) : FluidPhase.Water;
+      const tK = snap.temperaturesK ? snap.temperaturesK[i] : undefined;
+      this.spawnMultiphaseParticle(
         snap.positions[i3] ?? 0,
         snap.positions[i3 + 1] ?? 0,
         snap.positions[i3 + 2] ?? 0,
         snap.velocities[i3] ?? 0,
         snap.velocities[i3 + 1] ?? 0,
         snap.velocities[i3 + 2] ?? 0,
+        ph,
+        tK,
       );
     }
   }
@@ -744,6 +819,57 @@ export class FluidSim {
     return true;
   }
 
+  public emitMultiphaseStream(
+    wx: number,
+    wy: number,
+    wz: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    phase: FluidPhase,
+    count: number,
+    spreadRadius: number,
+    scale = 1.0,
+    speed = 1.5,
+    tempK?: number,
+  ): number {
+    const safeScale = Math.max(scale, 0.01);
+    const velJitter = 1.0 * Math.sqrt(safeScale) * Math.max(0.25, speed);
+    const normalOffset = (phase === FluidPhase.Magma ? 0.55 : 0.8) * safeScale;
+    const resolvedT =
+      tempK ?? (phase === FluidPhase.Magma ? 1450 : phase === FluidPhase.Steam ? 425 : 289);
+    let spawned = 0;
+    for (let k = 0; k < count; k++) {
+      const jx = (Math.random() - 0.5) * spreadRadius * 0.85;
+      const jy = (Math.random() - 0.5) * spreadRadius * 0.85;
+      const jz = (Math.random() - 0.5) * spreadRadius * 0.85;
+      const px = wx + nx * normalOffset + jx;
+      const py = wy + ny * normalOffset + jy;
+      const pz = wz + nz * normalOffset + jz;
+      const vx = nx * velJitter * 0.7 + (Math.random() - 0.5) * velJitter;
+      const vy = ny * velJitter * 0.7 + (Math.random() - 0.5) * velJitter;
+      const vz = nz * velJitter * 0.7 + (Math.random() - 0.5) * velJitter;
+      if (this.activeCount >= MAX_FLUID_PARTICLES) {
+        const idx = Math.floor(Math.random() * Math.min(240, MAX_FLUID_PARTICLES));
+        this.px[idx] = px;
+        this.py[idx] = py;
+        this.pz[idx] = pz;
+        this.vx[idx] = vx;
+        this.vy[idx] = vy;
+        this.vz[idx] = vz;
+        this.phase[idx] = phase;
+        this.temperatureK[idx] = resolvedT;
+        this.ageSec[idx] = 0;
+        spawned++;
+        continue;
+      }
+      if (this.spawnMultiphaseParticle(px, py, pz, vx, vy, vz, phase, resolvedT)) {
+        spawned++;
+      }
+    }
+    return spawned;
+  }
+
   /**
    * Emits a stream of water particles from a brush location (with slight radial jitter).
    */
@@ -758,43 +884,20 @@ export class FluidSim {
     spreadRadius: number,
     scale = 1.0,
   ): number {
-    const safeScale = Math.max(scale, 0.01);
-    const velJitter = 1.0 * Math.sqrt(safeScale);
-    const normalOffset = 0.8 * safeScale;
-    let spawned = 0;
-    for (let k = 0; k < count; k++) {
-      if (this.activeCount >= MAX_FLUID_PARTICLES) {
-        // Recycle oldest particle in ring-buffer style if cap is reached
-        const idx = Math.floor(Math.random() * Math.min(200, MAX_FLUID_PARTICLES));
-        const jx = (Math.random() - 0.5) * spreadRadius * 0.85;
-        const jy = (Math.random() - 0.5) * spreadRadius * 0.85;
-        const jz = (Math.random() - 0.5) * spreadRadius * 0.85;
-        this.px[idx] = wx + nx * normalOffset + jx;
-        this.py[idx] = wy + ny * normalOffset + jy;
-        this.pz[idx] = wz + nz * normalOffset + jz;
-        this.vx[idx] = (Math.random() - 0.5) * 1.2 * velJitter;
-        this.vy[idx] = (Math.random() - 0.5) * 1.2 * velJitter;
-        this.vz[idx] = (Math.random() - 0.5) * 1.2 * velJitter;
-        spawned++;
-        continue;
-      }
-      const jx = (Math.random() - 0.5) * spreadRadius * 0.85;
-      const jy = (Math.random() - 0.5) * spreadRadius * 0.85;
-      const jz = (Math.random() - 0.5) * spreadRadius * 0.85;
-      if (
-        this.spawnParticle(
-          wx + nx * normalOffset + jx,
-          wy + ny * normalOffset + jy,
-          wz + nz * normalOffset + jz,
-          (Math.random() - 0.5) * velJitter,
-          (Math.random() - 0.5) * velJitter,
-          (Math.random() - 0.5) * velJitter,
-        )
-      ) {
-        spawned++;
-      }
-    }
-    return spawned;
+    return this.emitMultiphaseStream(
+      wx,
+      wy,
+      wz,
+      nx,
+      ny,
+      nz,
+      FluidPhase.Water,
+      count,
+      spreadRadius,
+      scale,
+      1.0,
+      289,
+    );
   }
 
   private hashCell(cx: number, cy: number, cz: number): number {
@@ -897,10 +1000,35 @@ export class FluidSim {
         }
 
         this.rho[i] = density;
-        this.press[i] = Math.max(0, this.stiffness * (density - this.restDensity));
+        const ph = this.phase[i];
+        const tK = this.temperatureK[i] || 289;
+        const phaseRest =
+          ph === FluidPhase.Magma
+            ? this.restDensity * 1.75
+            : ph === FluidPhase.Steam
+              ? this.restDensity * 0.25
+              : this.restDensity;
+        const phaseStiff =
+          ph === FluidPhase.Magma
+            ? this.stiffness * 2.1
+            : ph === FluidPhase.Steam
+              ? this.stiffness * 1.45
+              : this.stiffness;
+        const steamThermBoost =
+          ph === FluidPhase.Steam ? Math.max(0, (tK - 365) * 0.08) : 0;
+        const pSph = Math.max(0, phaseStiff * (density - phaseRest) + steamThermBoost);
+        this.press[i] = pSph;
+        this.pressureAtm[i] =
+          1.0 + pSph * 0.42 + (ph === FluidPhase.Magma ? Math.max(0, tK - 950) * 0.03 : 0);
+        this.particleVisc[i] =
+          ph === FluidPhase.Magma
+            ? evaluateArrheniusMagmaViscosity(tK)
+            : ph === FluidPhase.Steam
+              ? 0.03
+              : this.viscosity;
       }
 
-      // 3. Compute pressure gradient, viscosity, cohesion & Newtonian radial gravity
+      // 3. Compute pressure gradient, viscosity, thermal conduction & Newtonian radial gravity
       for (let i = 0; i < n; i++) {
         const xi = this.px[i];
         const yi = this.py[i];
@@ -910,6 +1038,8 @@ export class FluidSim {
         const vzi = this.vz[i];
         const rhoi = Math.max(this.rho[i], 0.25);
         const pi = this.press[i];
+        const visci = this.particleVisc[i] || this.viscosity;
+        const ti = this.temperatureK[i] || 289;
 
         const cx = Math.floor(xi * invHash);
         const cy = Math.floor(yi * invHash);
@@ -918,6 +1048,8 @@ export class FluidSim {
         let fpx = 0;
         let fpy = 0;
         let fpz = 0;
+        let dTempSum = 0;
+        let neighCount = 0;
 
         for (let dz = -1; dz <= 1; dz++) {
           for (let dy = -1; dy <= 1; dy++) {
@@ -935,7 +1067,6 @@ export class FluidSim {
                     const hr = h - r;
                     const rhoj = Math.max(this.rho[j], 0.25);
 
-                    // Spiky pressure gradient (symmetric)
                     const pScalar =
                       (-this.mass *
                         ((pi + this.press[j]) / (2.0 * rhoj)) *
@@ -947,13 +1078,15 @@ export class FluidSim {
                     fpy += ry * pScalar;
                     fpz += rz * pScalar;
 
-                    // Viscosity Laplacian
+                    const viscEff = Math.min(2.6, 0.5 * (visci + (this.particleVisc[j] || this.viscosity)));
                     const vScalar =
-                      (this.viscosity * this.mass * this.viscLapCoeff * hr) /
-                      rhoj;
+                      (viscEff * this.mass * this.viscLapCoeff * hr) / rhoj;
                     fpx += (this.vx[j] - vxi) * invScale * vScalar;
                     fpy += (this.vy[j] - vyi) * invScale * vScalar;
                     fpz += (this.vz[j] - vzi) * invScale * vScalar;
+
+                    dTempSum += (this.temperatureK[j] || 289) - ti;
+                    neighCount++;
                   }
                 }
                 j = this.next[j];
@@ -962,11 +1095,20 @@ export class FluidSim {
           }
         }
 
-        // Radial Newtonian gravity at particle position
+        // Radial Newtonian gravity at particle position + Steam buoyancy
         computeGravityVector(xi, yi, zi, gravityParams, this.tempGrav);
-        let accX = (fpx / rhoi) * scale + this.tempGrav.x;
-        let accY = (fpy / rhoi) * scale + this.tempGrav.y;
-        let accZ = (fpz / rhoi) * scale + this.tempGrav.z;
+        const ph = this.phase[i];
+        const buoyMul =
+          ph === FluidPhase.Steam
+            ? -0.68 - clamp((ti - 365) / 420, 0, 1.1)
+            : 1.0;
+        let accX = (fpx / rhoi) * scale + this.tempGrav.x * buoyMul;
+        let accY = (fpy / rhoi) * scale + this.tempGrav.y * buoyMul;
+        let accZ = (fpz / rhoi) * scale + this.tempGrav.z * buoyMul;
+
+        if (sub === substeps - 1 && neighCount > 0) {
+          this.temperatureK[i] = clamp(ti + (dTempSum / neighCount) * clamp(clampedDt * 2.2, 0.02, 0.45), 180, 2600);
+        }
 
         if (hasTractor && tractorField && this.tractorFactor[i] > 0) {
           evaluateStretchedAnchorPoint(
@@ -1020,11 +1162,18 @@ export class FluidSim {
       const boundaryR = (hasTractor ? 24.0 : 18.2) * scale;
       const particleMargin = 0.24 * scale;
       for (let i = 0; i < n; i++) {
+        const ph = this.phase[i];
         let nvx = this.vx[i] + this.fx[i] * hStep;
         let nvy = this.vy[i] + this.fy[i] * hStep;
         let nvz = this.vz[i] + this.fz[i] * hStep;
 
-        // Clamp extreme velocity spikes
+        if (ph === FluidPhase.Magma) {
+          const damp = Math.exp(-Math.min(8.0, (this.particleVisc[i] || 0.35) * 0.45) * hStep);
+          nvx *= damp;
+          nvy *= damp;
+          nvz *= damp;
+        }
+
         const spd = Math.hypot(nvx, nvy, nvz);
         if (spd > maxSpeed) {
           const s = maxSpeed / spd;
@@ -1037,7 +1186,6 @@ export class FluidSim {
         let npy = this.py[i] + nvy * hStep;
         let npz = this.pz[i] + nvz * hStep;
 
-        // Keep particles inside planetary atmosphere boundary
         const r = Math.hypot(npx, npy, npz);
         if (r > boundaryR) {
           const s = boundaryR / r;
@@ -1047,9 +1195,12 @@ export class FluidSim {
           nvx *= 0.6;
           nvy *= 0.6;
           nvz *= 0.6;
+          if (ph === FluidPhase.Steam) {
+            this.phase[i] = FluidPhase.Water;
+            this.temperatureK[i] = 285;
+          }
         }
 
-        // Exact voxel SDF terrain collision
         const d = planet.sampleDensityAndNormal(npx, npy, npz, this.tempNormal, true);
         if (d > -particleMargin) {
           const penetration = d + particleMargin;
@@ -1057,22 +1208,34 @@ export class FluidSim {
           const ny = this.tempNormal[1];
           const nz = this.tempNormal[2];
 
-          // Push out along outward terrain normal (toward air)
           npx += nx * penetration;
           npy += ny * penetration;
           npz += nz * penetration;
 
-          // Reflect normal velocity component + apply boundary drag
           const vn = nvx * nx + nvy * ny + nvz * nz;
           if (vn < 0) {
-            const restitution = 0.12;
+            const restitution = ph === FluidPhase.Magma ? 0.04 : 0.12;
             nvx -= (1 + restitution) * vn * nx;
             nvy -= (1 + restitution) * vn * ny;
             nvz -= (1 + restitution) * vn * nz;
-            // Slight wet friction on rock surface
-            nvx *= 0.965;
-            nvy *= 0.965;
-            nvz *= 0.965;
+            const slip = ph === FluidPhase.Magma ? 0.86 : 0.965;
+            nvx *= slip;
+            nvy *= slip;
+            nvz *= slip;
+          }
+
+          if (
+            sub === substeps - 1 &&
+            ph === FluidPhase.Water &&
+            (this.pressureAtm[i] > 18.0 || spd > 3.6 * sqrtScale) &&
+            this.erosionSites.length < 16
+          ) {
+            this.erosionSites.push({
+              x: npx,
+              y: npy,
+              z: npz,
+              pressureAtm: this.pressureAtm[i],
+            });
           }
         }
 
@@ -1085,7 +1248,92 @@ export class FluidSim {
       }
     }
 
-    // Reset/accumulate tractor telemetry on final substep
+    // Thermodynamics relaxation, Clausius-Clapeyron boiling/condensation & magma solidification
+    let writeIdx = 0;
+    let wCnt = 0;
+    let mCnt = 0;
+    let stCnt = 0;
+    let maxP = 1.0;
+    let maxT = 289.0;
+
+    for (let i = 0; i < n; i++) {
+      this.ageSec[i] += clampedDt;
+      let ph = this.phase[i] as FluidPhase;
+      let tK = this.temperatureK[i] || 289;
+      const pAtm = Math.max(0.2, this.pressureAtm[i] || 1.0);
+      const tBoil = computeBoilingPointK(pAtm);
+
+      // Ambient thermal relaxation
+      const coolKPerSec = ph === FluidPhase.Magma ? 65.0 : ph === FluidPhase.Steam ? 14.0 : 4.5;
+      tK = clamp(tK + (290 - tK) * clamp((coolKPerSec * clampedDt) / 900, 0, 0.25), 180, 2600);
+
+      if (ph === FluidPhase.Water && tK >= tBoil) {
+        ph = FluidPhase.Steam;
+        const pr = Math.hypot(this.px[i], this.py[i], this.pz[i]) || 1;
+        this.vx[i] += (this.px[i] / pr) * 2.8 * sqrtScale;
+        this.vy[i] += (this.py[i] / pr) * 2.8 * sqrtScale;
+        this.vz[i] += (this.pz[i] / pr) * 2.8 * sqrtScale;
+      } else if (ph === FluidPhase.Steam && (tK < tBoil - 10 || this.ageSec[i] > 10.5)) {
+        ph = FluidPhase.Water;
+        this.ageSec[i] = 0;
+      }
+
+      if (
+        ph === FluidPhase.Magma &&
+        tK < 910 &&
+        this.ageSec[i] > 1.2 &&
+        this.solidifiedSites.length < 24
+      ) {
+        this.solidifiedSites.push({
+          x: this.px[i],
+          y: this.py[i],
+          z: this.pz[i],
+          tempK: tK,
+        });
+        continue; // solidified into basalt crust
+      }
+
+      this.phase[i] = ph;
+      this.temperatureK[i] = tK;
+      if (ph === FluidPhase.Water) wCnt++;
+      else if (ph === FluidPhase.Magma) mCnt++;
+      else stCnt++;
+      if (pAtm > maxP) maxP = pAtm;
+      if (tK > maxT) maxT = tK;
+
+      if (writeIdx !== i) {
+        this.px[writeIdx] = this.px[i];
+        this.py[writeIdx] = this.py[i];
+        this.pz[writeIdx] = this.pz[i];
+        this.vx[writeIdx] = this.vx[i];
+        this.vy[writeIdx] = this.vy[i];
+        this.vz[writeIdx] = this.vz[i];
+        this.rho[writeIdx] = this.rho[i];
+        this.press[writeIdx] = this.press[i];
+        this.phase[writeIdx] = this.phase[i];
+        this.temperatureK[writeIdx] = this.temperatureK[i];
+        this.pressureAtm[writeIdx] = this.pressureAtm[i];
+        this.particleVisc[writeIdx] = this.particleVisc[i];
+        this.ageSec[writeIdx] = this.ageSec[i];
+        this.tractorFactor[writeIdx] = this.tractorFactor[i];
+        this.tractorStretchU[writeIdx] = this.tractorStretchU[i];
+      }
+      writeIdx++;
+    }
+    this.activeCount = writeIdx;
+    if (this.tractorCapturedCount > 0 && writeIdx < n) {
+      let cap = 0;
+      for (let i = 0; i < writeIdx; i++) {
+        if (this.tractorFactor[i] > 0) cap++;
+      }
+      this.tractorCapturedCount = cap;
+    }
+    this.waterCount = wCnt;
+    this.magmaCount = mCnt;
+    this.steamCount = stCnt;
+    this.peakPressureAtm = maxP;
+    this.peakTempK = maxT;
+
     if (hasTractor && capturedTelemetrySamples > 0) {
       this.tractorTotalBeamForceN = sumForceN;
       this.tractorTotalGravityWeightN = sumWeightN;
@@ -1096,16 +1344,17 @@ export class FluidSim {
       this.tractorAvgLoadRatio = 0;
     }
 
-    // Update splash droplet list (fast-moving or airborne spray particles)
+    // Update splash & multiphase particle list
     const splashThreshold = 1.35 * sqrtScale;
     let sc = 0;
     let peakSpd = 0;
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < this.activeCount; i++) {
+      const ph = this.phase[i] as FluidPhase;
       const spd = Math.hypot(this.vx[i], this.vy[i], this.vz[i]);
       if (this.tractorFactor[i] > 0 && spd > peakSpd) {
         peakSpd = spd;
       }
-      if (spd > splashThreshold || this.rho[i] < this.restDensity * 1.15) {
+      if (ph !== FluidPhase.Water || spd > splashThreshold || this.rho[i] < this.restDensity * 1.15) {
         const s3 = sc * 3;
         this.splashPositions[s3] = this.px[i];
         this.splashPositions[s3 + 1] = this.py[i];
@@ -1113,6 +1362,21 @@ export class FluidSim {
         this.splashVelocities[s3] = this.vx[i];
         this.splashVelocities[s3 + 1] = this.vy[i];
         this.splashVelocities[s3 + 2] = this.vz[i];
+        this.splashPhases[sc] = ph;
+        if (ph === FluidPhase.Magma) {
+          const [r, g, b] = evaluateMagmaBlackbodyColor(this.temperatureK[i]);
+          this.splashColors[s3] = r;
+          this.splashColors[s3 + 1] = g;
+          this.splashColors[s3 + 2] = b;
+        } else if (ph === FluidPhase.Steam) {
+          this.splashColors[s3] = 0.85;
+          this.splashColors[s3 + 1] = 0.91;
+          this.splashColors[s3 + 2] = 0.98;
+        } else {
+          this.splashColors[s3] = 0.49;
+          this.splashColors[s3 + 1] = 0.83;
+          this.splashColors[s3 + 2] = 0.99;
+        }
         sc++;
       }
     }
@@ -1199,6 +1463,7 @@ export class FluidSim {
     const sZ = WATER_N * WATER_N;
 
     for (let i = 0; i < n; i++) {
+      if (this.phase[i] !== FluidPhase.Water) continue;
       const wx = this.px[i];
       const wy = this.py[i];
       const wz = this.pz[i];

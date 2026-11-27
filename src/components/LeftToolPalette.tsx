@@ -27,6 +27,7 @@ export const EDITOR_MATERIALS: ReadonlyArray<{
   { id: MaterialId.Sandstone, label: '砂岩', swatch: '#c27d57' },
   { id: MaterialId.Crystal, label: '晶矿', swatch: '#29d1e0' },
   { id: MaterialId.Ice, label: '极冰', swatch: '#d6edfc' },
+  { id: MaterialId.Magma, label: '熔岩', swatch: '#ff571a' },
 ];
 
 type CategoryFilter = 'all' | ToolGroup;

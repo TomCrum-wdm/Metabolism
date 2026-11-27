@@ -178,6 +178,11 @@ function buildInitialConfig(initialRadius?: number): SandboxConfig {
     showProtocell3d: true,
     showHoveredFvmVox: true,
     showFvmVoxelBlocks: true,
+    gpuVoxelPipelineEnabled: true,
+    gpuMultiphaseFluidEnabled: true,
+    fluidGeoCouplingEnabled: true,
+    magmaInjectionTempK: 1480,
+    fluidPressureScale: 1.0,
     mouseSensitivity: prefs.mouseSensitivity ?? 1.0,
     cameraDamping: prefs.cameraDamping ?? 1.0,
     fpsSpeedMult: prefs.fpsSpeedMult ?? 1.0,
@@ -243,6 +248,11 @@ const INITIAL_TELEMETRY: SandboxTelemetry = {
   hoveredWorldPos: null,
   hoveredAttitude: null,
   voxLocked: false,
+  magmaParticles: 0,
+  steamParticles: 0,
+  peakFluidPressureAtm: 1.0,
+  peakFluidTempK: 289,
+  gpuFluidActive: false,
   canUndo: false,
   canRedo: false,
   undoCount: 0,
@@ -1051,10 +1061,12 @@ export default function App() {
             cur === 'material'
               ? 'temperature'
               : cur === 'temperature'
-                ? 'density'
-                : cur === 'density'
-                  ? 'metabolism'
-                  : 'material',
+                ? 'pressure'
+                : cur === 'pressure'
+                  ? 'density'
+                  : cur === 'density'
+                    ? 'metabolism'
+                    : 'material',
         });
       } else if (e.code === 'KeyK') {
         e.preventDefault();
@@ -1175,6 +1187,7 @@ export default function App() {
             [MaterialId.Crystal]: 0,
             [MaterialId.Ice]: 0,
             [MaterialId.Sandstone]: 0,
+            [MaterialId.Magma]: 0,
           },
           voxelRadius: DEFAULT_SEED_CONFIG.voxelRadius,
           nativeVoxelSize: DEFAULT_SEED_CONFIG.radius / DEFAULT_SEED_CONFIG.voxelRadius,
@@ -1460,6 +1473,7 @@ export default function App() {
     (config.terrainOverlay !== 'material' || metabolismOpen) ? (
       <VoxelFieldLegend
         config={config}
+        telemetry={telemetry}
         snapshot={
           telemetry.metabolismSummary ?? engineRef.current.getMetabolismSnapshot()
         }

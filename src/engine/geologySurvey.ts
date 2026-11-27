@@ -24,6 +24,7 @@ export const MATERIAL_CN_NAMES: Record<MaterialId, string> = {
   [MaterialId.Crystal]: '高能晶矿脉 (Crystal)',
   [MaterialId.Ice]: '极地冰盖 (Ice)',
   [MaterialId.Sandstone]: '风化砂岩层 (Sandstone)',
+  [MaterialId.Magma]: '熔融硅酸盐岩浆 (Magma)',
 };
 
 export const MATERIAL_SHORT_NAMES: Record<MaterialId, string> = {
@@ -34,6 +35,7 @@ export const MATERIAL_SHORT_NAMES: Record<MaterialId, string> = {
   [MaterialId.Crystal]: '晶矿',
   [MaterialId.Ice]: '极冰',
   [MaterialId.Sandstone]: '砂岩',
+  [MaterialId.Magma]: '熔岩',
 };
 
 export type SurveyToolKind =

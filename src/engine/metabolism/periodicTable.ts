@@ -815,6 +815,21 @@ export const VOXEL_MATERIAL_COMPOSITIONS: Record<MaterialId, VoxelMaterialCompos
       { compoundId: 'H2Ol', weightFraction: 0.06, roleNote: '孔隙承压含水层' },
     ],
   },
+  7: {
+    materialId: 7 as MaterialId,
+    materialNameZh: '熔融硅酸盐岩浆',
+    dominantFormulaTag: 'SiO₂ · Mg₂SiO₄ · Fe₃O₄ · CO₂',
+    bulkDensityKgM3: 2780,
+    effectivePorosity: 0.36,
+    geochemistrySummary: '高温地幔上涌硅酸盐熔体(>1150K)：高黏度流变、黑体辐射散热及喷发脱气CO₂/H₂O源区',
+    components: [
+      { compoundId: 'SiO2', weightFraction: 0.48, roleNote: '聚合硅氧四面体熔体骨架' },
+      { compoundId: 'Mg2SiO4', weightFraction: 0.26, roleNote: '未完全熔融镁橄榄石斑晶' },
+      { compoundId: 'Fe3O4', weightFraction: 0.14, roleNote: '铁镁富集高密度熔融组分' },
+      { compoundId: 'H2Og', weightFraction: 0.07, roleNote: '高压溶解超临界挥发水汽' },
+      { compoundId: 'CO2', weightFraction: 0.05, roleNote: '脱气火山碳排放主要组分' },
+    ],
+  },
 };
 
 export interface ElementMassFractionItem {

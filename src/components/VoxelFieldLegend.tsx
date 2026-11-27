@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Calculator, ChevronDown, ChevronUp, Lock, Unlock } from 'lucide-react';
-import { SandboxConfig } from '../engine/webgpuScene';
+import { SandboxConfig, SandboxTelemetry } from '../engine/webgpuScene';
 import {
   MATTER_PHASE_LABELS,
   MatterPhase,
@@ -13,6 +13,7 @@ import { MaterialId } from '../engine/voxelPlanet';
 
 interface VoxelFieldLegendProps {
   config: SandboxConfig;
+  telemetry?: SandboxTelemetry;
   snapshot: MetabolismSummarySnapshot;
   hoveredVoxProfile?: VoxChemicalProfile | null;
   voxLocked: boolean;
@@ -54,10 +55,12 @@ const MINERAL_SWATCH_IDS: ReadonlyArray<{ id: MaterialId; color: string }> = [
   { id: MaterialId.Crystal, color: '#38bdf8' },
   { id: MaterialId.Ice, color: '#93c5fd' },
   { id: MaterialId.Sandstone, color: '#d4a373' },
+  { id: MaterialId.Magma, color: '#ff571a' },
 ];
 
 export const VoxelFieldLegend: React.FC<VoxelFieldLegendProps> = ({
   config,
+  telemetry: sceneTelemetry,
   snapshot,
   hoveredVoxProfile,
   voxLocked,
@@ -78,9 +81,11 @@ export const VoxelFieldLegend: React.FC<VoxelFieldLegendProps> = ({
       ? 'FVM 场着色'
       : config.terrainOverlay === 'temperature'
         ? '地热温度场'
-        : config.terrainOverlay === 'density'
-          ? '径向深度壳层'
-          : '真实材质 (预览场)';
+        : config.terrainOverlay === 'pressure'
+          ? '压力应力场'
+          : config.terrainOverlay === 'density'
+            ? '径向深度壳层'
+            : '真实材质 (预览场)';
 
   const { hypergraph, telemetry } = snapshot;
 
@@ -347,6 +352,51 @@ export const VoxelFieldLegend: React.FC<VoxelFieldLegendProps> = ({
                 <span>20°C</span>
                 <span>220°C</span>
                 <span>850°C+</span>
+              </div>
+            </div>
+          )}
+
+          {config.terrainOverlay === 'pressure' && (
+            <div className="space-y-1.5" data-testid="pressure-field-legend">
+              <div className="flex justify-between text-[9.5px] text-slate-400">
+                <span>上覆岩石静压 + 孔隙热压 (atm)</span>
+                <span className="font-mono-tabular text-rose-300">
+                  峰值{' '}
+                  {(
+                    sceneTelemetry?.peakFluidPressureAtm ??
+                    sceneTelemetry?.gpuVoxel?.peakPressureAtm ??
+                    1.0
+                  ).toFixed(0)}{' '}
+                  atm
+                </span>
+              </div>
+              <div
+                className="h-2.5 w-full rounded-xs border border-slate-700"
+                style={{
+                  background:
+                    'linear-gradient(90deg, #1d4ed8 0%, #06b6d4 24%, #10b981 48%, #f59e0b 74%, #f43f5e 100%)',
+                }}
+              />
+              <div className="flex justify-between text-[9px] font-mono-tabular text-slate-400">
+                <span>0.2 atm</span>
+                <span>5 atm</span>
+                <span>120 atm</span>
+                <span>2.5k</span>
+                <span>10k+ atm</span>
+              </div>
+              <div className="grid grid-cols-3 gap-1 px-1.5 py-1 rounded-xs border border-slate-800/80 bg-[#060911] font-mono-tabular text-[9px]">
+                <span className="text-cyan-300">
+                  水 {Math.round(sceneTelemetry?.waterParticles ?? 0)}
+                </span>
+                <span className="text-orange-300 text-center">
+                  熔岩 {Math.round(sceneTelemetry?.magmaParticles ?? 0)}
+                </span>
+                <span className="text-slate-300 text-right">
+                  蒸汽 {Math.round(sceneTelemetry?.steamParticles ?? 0)}
+                </span>
+              </div>
+              <div className="text-[9px] text-slate-400 leading-relaxed">
+                P = P₀ + ρgh/P_atm + ΔP_thermal；T_boil(P) 随压力升高，岩浆 η(T) 按阿伦尼乌斯随冷却指数激增并凝固为玄武岩。
               </div>
             </div>
           )}

@@ -14,6 +14,7 @@ import {
   float,
   fract,
   length,
+  log,
   max,
   min,
   mix,
@@ -74,6 +75,16 @@ import {
   FluidSnapshot,
   MAX_FLUID_PARTICLES,
 } from './fluidSim';
+import {
+  GpuVoxelPipeline,
+  GpuVoxelTelemetry,
+  MAX_GPU_VOXEL_AXIS,
+} from './gpuVoxelPipeline';
+import {
+  FluidPhase,
+  GpuMultiphaseFluidSolver,
+  GpuMultiphaseFluidTelemetry,
+} from './gpuMultiphaseFluid';
 import {
   computeRayPointDistanceSq,
   computeTractorSpringForce,
@@ -319,6 +330,13 @@ export interface SandboxTelemetry {
   voxLocked?: boolean;
   interiorCutawayEnabled?: boolean;
   metabolismSummary?: MetabolismSummarySnapshot;
+  gpuVoxel?: GpuVoxelTelemetry;
+  gpuFluid?: GpuMultiphaseFluidTelemetry;
+  magmaParticles: number;
+  steamParticles: number;
+  peakFluidPressureAtm: number;
+  peakFluidTempK: number;
+  gpuFluidActive: boolean;
   canUndo: boolean;
   canRedo: boolean;
   undoCount: number;
@@ -367,6 +385,11 @@ export interface SandboxConfig {
   showProtocell3d?: boolean;
   showHoveredFvmVox?: boolean;
   showFvmVoxelBlocks?: boolean;
+  gpuVoxelPipelineEnabled?: boolean;
+  gpuMultiphaseFluidEnabled?: boolean;
+  fluidGeoCouplingEnabled?: boolean;
+  magmaInjectionTempK?: number;
+  fluidPressureScale?: number;
   mouseSensitivity?: number;
   cameraDamping?: number;
   fpsSpeedMult?: number;
@@ -584,10 +607,16 @@ export class PlanetarySandboxEngine {
   private oceanMaterial: THREE.MeshPhysicalNodeMaterial | null = null;
   private cutawayActiveNode = uniform(0.0);
   private splashMesh!: THREE.InstancedMesh;
+  private readonly _splashColor = new THREE.Color();
   private waterMeshDirty = true;
   private waterRebuildCooldown = 0;
   private lastSeaRadius = -1;
   private lastSeaHidden = false;
+
+  // Full GPU Voxel Pipeline (Direction 3) & GPU Multiphase Fluid Solver (Direction 2)
+  private gpuVoxelPipeline: GpuVoxelPipeline | null = null;
+  private gpuMultiphaseFluid: GpuMultiphaseFluidSolver | null = null;
+  private gpuVoxelExtractCooldown = 0;
 
   // Gravity vector visualizer
   private gravityFieldGroup!: THREE.Group;
@@ -915,6 +944,11 @@ export class PlanetarySandboxEngine {
     showProtocell3d: true,
     showHoveredFvmVox: true,
     showFvmVoxelBlocks: true,
+    gpuVoxelPipelineEnabled: true,
+    gpuMultiphaseFluidEnabled: true,
+    fluidGeoCouplingEnabled: true,
+    magmaInjectionTempK: 1450,
+    fluidPressureScale: 1.0,
     mouseSensitivity: 1.0,
     cameraDamping: 1.0,
     fpsSpeedMult: 1.0,
@@ -1165,6 +1199,10 @@ export class PlanetarySandboxEngine {
       this.renderer,
     );
 
+    if (webGpuOk) {
+      this.initGpuVoxelAndFluidPipelines();
+    }
+
     this.setupMaterials();
     this.highResGroup = new THREE.Group();
     this.scene.add(this.highResGroup);
@@ -1183,6 +1221,7 @@ export class PlanetarySandboxEngine {
       this.resetPlayerToSpawn();
       this.rebuildAllChunks();
       this.rebuildWaterMesh();
+      this.syncGpuPipelinesFullPlanet();
       this.setPlanetRigVisible(true);
     } else {
       this.setPlanetRigVisible(false);
@@ -1723,6 +1762,39 @@ export class PlanetarySandboxEngine {
       this.metabolism.gpuSolver && this.backendDiagnostic.backend === 'WebGPU'
         ? this.metabolism.gpuSolver.buildTerrainColorSampleFn(fvmSampleWorldPos, this.gpuFvmChannelNode)
         : null;
+    const gpuPressureNode =
+      this.gpuVoxelPipeline && this.isHardwareWebGpu()
+        ? this.gpuVoxelPipeline.buildThermoPressureSampleFn(fvmSampleWorldPos)
+        : null;
+
+    const computeAnalyticPressureColor = Fn(() => {
+      const p = positionWorld;
+      const r = length(p);
+      const safeR0 = max(planetRadiusNode, float(0.05));
+      const depthM = max(float(0.0), safeR0.sub(r));
+      const depthRatio = tslClamp(depthM.div(safeR0), 0.0, 1.0);
+      const colScale = float(420.0).div(max(float(1.0), safeR0.div(13.0)));
+      const gEff = float(9.81).mul(float(1.0).sub(depthRatio.mul(0.35)));
+      const lithoAtm = float(2680.0).mul(gEff).mul(depthM.mul(colScale)).div(101325.0);
+
+      const h0D = length(p.sub(this.metabHotspotPos0.xyz));
+      const h0W = float(1.0).sub(smoothstep(0.0, max(this.metabHotspotPos0.w, 0.1), h0D));
+      const h1D = length(p.sub(this.metabHotspotPos1.xyz));
+      const h1W = float(1.0).sub(smoothstep(0.0, max(this.metabHotspotPos1.w, 0.1), h1D));
+      const thermalOverP = max(
+        float(0.0),
+        h0W.mul(this.metabHotspotDeltaC.x).add(h1W.mul(this.metabHotspotDeltaC.y)),
+      ).mul(0.28);
+
+      const pressAtm = max(float(0.1), atmoDensityNode.add(lithoAtm).add(thermalOverP));
+      const logP = tslClamp(log(pressAtm.mul(5.0)).div(log(float(10.0)).mul(5.0)), 0.0, 1.0);
+      let pressCol = mix(color(0x143d9e), color(0x1fcce8), smoothstep(0.0, 0.25, logP));
+      pressCol = mix(pressCol, color(0x22c55e), smoothstep(0.25, 0.5, logP));
+      pressCol = mix(pressCol, color(0xf59e0b), smoothstep(0.5, 0.75, logP));
+      pressCol = mix(pressCol, color(0xe11d48), smoothstep(0.75, 1.0, logP));
+      const isoBar = float(1.0).sub(smoothstep(0.0, 0.08, fract(logP.mul(12.0)))).mul(0.22);
+      return pressCol.add(vec3(isoBar)).saturate();
+    });
 
     mat.colorNode = Fn(() => {
       const p = positionWorld;
@@ -1780,7 +1852,7 @@ export class PlanetarySandboxEngine {
       const materialStyled = mix(smoothCol, blockyCol, isBlockyNode);
       const subVoxelPbrStyled = pbrBundle.applyAlbedoPbr(materialStyled.rgb);
 
-      // Thermal, Strata Density & Read-Only Metabolism Field Overlays (preserving crisp voxel seams in blocky mode)
+      // Thermal, Strata Density, Read-Only Metabolism & GPU Thermo-Pressure Field Overlays
       const thermalCol = computeThermalColor().mul(blockBorderShade);
       const isThermal = smoothstep(0.5, 1.0, overlayModeNode).mul(
         float(1.0).sub(smoothstep(1.5, 2.0, overlayModeNode)),
@@ -1788,11 +1860,17 @@ export class PlanetarySandboxEngine {
       const isDensity = smoothstep(1.5, 2.0, overlayModeNode).mul(
         float(1.0).sub(smoothstep(2.5, 3.0, overlayModeNode)),
       );
-      const isMetabolism = smoothstep(2.5, 3.0, overlayModeNode);
+      const isMetabolism = smoothstep(2.5, 3.0, overlayModeNode).mul(
+        float(1.0).sub(smoothstep(3.5, 4.0, overlayModeNode)),
+      );
+      const isPressure = smoothstep(3.5, 4.0, overlayModeNode);
       const metabDirectCol = (
         gpuSamplerNode
           ? mix(base.rgb, gpuSamplerNode, this.gpuFvmActiveNode)
           : base.rgb
+      ).mul(blockBorderShade);
+      const pressureCol = (
+        gpuPressureNode ? gpuPressureNode.xyz : computeAnalyticPressureColor()
       ).mul(blockBorderShade);
 
       const rRatio = radialDist.div(max(planetRadiusNode, 0.05));
@@ -1811,6 +1889,7 @@ export class PlanetarySandboxEngine {
       let outCol = mix(subVoxelPbrStyled, thermalCol, isThermal);
       outCol = mix(outCol, densityCol, isDensity);
       outCol = mix(outCol, metabDirectCol, isMetabolism);
+      outCol = mix(outCol, pressureCol, isPressure);
       return outCol.saturate();
     })();
 
@@ -1828,12 +1907,19 @@ export class PlanetarySandboxEngine {
       const isThermal = smoothstep(0.5, 1.0, overlayModeNode).mul(
         float(1.0).sub(smoothstep(1.5, 2.0, overlayModeNode)),
       );
-      const isMetabolism = smoothstep(2.5, 3.0, overlayModeNode);
+      const isMetabolism = smoothstep(2.5, 3.0, overlayModeNode).mul(
+        float(1.0).sub(smoothstep(3.5, 4.0, overlayModeNode)),
+      );
+      const isPressure = smoothstep(3.5, 4.0, overlayModeNode);
       const metabEmCol = gpuSamplerNode
         ? mix(vertexColor().rgb, gpuSamplerNode, this.gpuFvmActiveNode)
         : vertexColor().rgb;
+      const pressEmCol = gpuPressureNode
+        ? gpuPressureNode.xyz
+        : computeAnalyticPressureColor();
       let em = mix(crystalGlow, computeThermalColor().mul(0.32), isThermal);
       em = mix(em, metabEmCol.mul(0.3), isMetabolism);
+      em = mix(em, pressEmCol.mul(0.34), isPressure);
       return em;
     })();
 
@@ -2342,16 +2428,23 @@ export class PlanetarySandboxEngine {
     const scale = this.getPlanetScale();
     if (fop.kind === 'spawn_rain') {
       const len = Math.hypot(fop.wx, fop.wy, fop.wz) || 1;
-      this.fluid.emitStream(
+      const count = clamp(Math.round(fop.count), 1, 32);
+      const nx = -fop.wx / len;
+      const ny = -fop.wy / len;
+      const nz = -fop.wz / len;
+      this.fluid.emitStream(fop.wx, fop.wy, fop.wz, nx, ny, nz, count, fop.radius, scale);
+      this.gpuMultiphaseFluid?.emitBurst(
         fop.wx,
         fop.wy,
         fop.wz,
-        -fop.wx / len,
-        -fop.wy / len,
-        -fop.wz / len,
-        clamp(Math.round(fop.count), 1, 32),
+        nx,
+        ny,
+        nz,
+        FluidPhase.Water,
+        count * 4,
         fop.radius,
-        scale,
+        2.2 * Math.sqrt(scale),
+        286,
       );
       this.waterMeshDirty = true;
     } else {
@@ -2453,6 +2546,13 @@ export class PlanetarySandboxEngine {
       Math.max(res.entry.radius, this.planet.voxelSize * 2),
       this.planet,
     );
+    this.gpuVoxelPipeline?.syncLocalRegionFromPlanet(
+      this.planet,
+      cx,
+      cy,
+      cz,
+      Math.max(res.entry.radius, this.planet.voxelSize * 2),
+    );
     this.waterMeshDirty = true;
     this.telemetryTimer = 1;
   }
@@ -2464,6 +2564,7 @@ export class PlanetarySandboxEngine {
     this.cutawayActiveNode.value = next ? 1.0 : 0.0;
     this.syncOceanSeaMeshScale();
     this.updateChunksWithLod(64);
+    this.syncGpuVoxelMeshVisibility();
     this.waterMeshDirty = true;
     this.syncMetabolismReadOnlyVisuals(true);
     this.emitTelemetrySnapshot();
@@ -3423,9 +3524,13 @@ export class PlanetarySandboxEngine {
       }
     }
 
-    const showMacro = !batch.hideMacro;
+    const gpuInstancingOn = this.isGpuVoxelInstancingActive();
+    const showMacro = !gpuInstancingOn && !batch.hideMacro;
     for (const m of this.chunkMeshes) {
       if (m) m.visible = showMacro;
+    }
+    if (this.highResGroup) {
+      this.highResGroup.visible = !gpuInstancingOn && this.hasWorld;
     }
 
     let verts = 0;
@@ -3434,7 +3539,7 @@ export class PlanetarySandboxEngine {
     let svoC1 = 0;
     let svoC2 = 0;
     for (const [key, mesh] of this.highResMeshes.entries()) {
-      const vis = batch.desiredKeys.has(key);
+      const vis = !gpuInstancingOn && batch.desiredKeys.has(key);
       mesh.visible = vis;
       if (vis) {
         verts += mesh.geometry.getAttribute('position').count;
@@ -3458,6 +3563,14 @@ export class PlanetarySandboxEngine {
   }
 
   private setPlanetRigVisible(visible: boolean): void {
+    const gpuInstancingOn = visible && this.isGpuVoxelInstancingActive();
+    const gpuFluidOn = visible && this.isGpuMultiphaseFluidActive();
+    if (this.gpuVoxelPipeline) {
+      this.gpuVoxelPipeline.instancedMesh.visible = gpuInstancingOn;
+    }
+    if (this.gpuMultiphaseFluid) {
+      this.gpuMultiphaseFluid.particleMesh.visible = gpuFluidOn;
+    }
     if (this.atmoMesh) this.atmoMesh.visible = visible;
     if (this.atmoInnerMesh) this.atmoInnerMesh.visible = visible;
     if (this.cloudShellMesh) this.cloudShellMesh.visible = visible;
@@ -3468,13 +3581,18 @@ export class PlanetarySandboxEngine {
       this.oceanSeaMesh.visible = visible && hasSea && !this.lastSeaHidden;
     }
     if (this.splashMesh) this.splashMesh.visible = visible;
-    if (this.highResGroup) this.highResGroup.visible = visible;
+    if (this.highResGroup) this.highResGroup.visible = visible && !gpuInstancingOn;
     if (this.surveyOverlayGroup) this.surveyOverlayGroup.visible = visible;
     if (this.coordGridGroup) this.coordGridGroup.visible = visible && this.config.showCoordGrid;
     if (this.playerGroup) {
       this.playerGroup.visible = visible && this.phase !== 'title';
     }
-    if (!visible) {
+    if (visible) {
+      const showMacro = !gpuInstancingOn && (!this.planet.isHighResStreaming || !this.lastHighResHideMacro);
+      for (const m of this.chunkMeshes) {
+        if (m) m.visible = showMacro;
+      }
+    } else {
       for (const m of this.chunkMeshes) {
         if (m) m.visible = false;
       }
@@ -3578,9 +3696,13 @@ export class PlanetarySandboxEngine {
         geo.setAttribute('uv', new THREE.BufferAttribute(data.uvs, 2));
         geo.computeBoundingSphere();
 
+        const showMacro =
+          !this.isGpuVoxelInstancingActive() &&
+          (!this.planet.isHighResStreaming || !this.lastHighResHideMacro);
         if (existing) {
           existing.geometry.dispose();
           existing.geometry = geo;
+          existing.visible = showMacro;
           existing.userData.baseColors = undefined;
           if (this.config.terrainOverlay === 'metabolism') {
             this.applyFvmColorsToMesh(existing, true, this.config.metabolismChannel ?? 'species');
@@ -3589,6 +3711,7 @@ export class PlanetarySandboxEngine {
           const mesh = new THREE.Mesh(geo, this.terrainMaterial);
           mesh.castShadow = true;
           mesh.receiveShadow = true;
+          mesh.visible = showMacro;
           if (this.config.terrainOverlay === 'metabolism') {
             this.applyFvmColorsToMesh(mesh, true, this.config.metabolismChannel ?? 'species');
           }
@@ -3635,11 +3758,10 @@ export class PlanetarySandboxEngine {
 
     const dropGeo = new THREE.IcosahedronGeometry(0.17, 1);
     const dropMat = new THREE.MeshPhysicalNodeMaterial();
-    dropMat.colorNode = color(0x7dd3fc);
-    dropMat.emissiveNode = color(0x0284c7).mul(0.25);
-    dropMat.roughnessNode = float(0.12);
+    dropMat.color = new THREE.Color(0xffffff);
+    dropMat.roughnessNode = float(0.18);
     dropMat.metalnessNode = float(0.05);
-    dropMat.opacityNode = float(0.82);
+    dropMat.opacityNode = float(0.86);
     dropMat.transparent = true;
 
     const seaGeo = new THREE.IcosahedronGeometry(1, 5);
@@ -3651,6 +3773,7 @@ export class PlanetarySandboxEngine {
     this.syncOceanSeaMeshScale();
 
     this.splashMesh = new THREE.InstancedMesh(dropGeo, dropMat, MAX_FLUID_PARTICLES);
+    this.splashMesh.setColorAt(0, new THREE.Color(0x7dd3fc));
     this.splashMesh.frustumCulled = false;
     this.splashMesh.count = 0;
     this.scene.add(this.splashMesh);
@@ -3708,13 +3831,24 @@ export class PlanetarySandboxEngine {
         this.fluid.splashVelocities[i3 + 1],
         this.fluid.splashVelocities[i3 + 2],
       ) * invSqrtScale;
-      const sc = clamp(0.65 + spd * 0.14, 0.65, 1.35) * scale;
+      const ph = this.fluid.splashPhases[i] ?? 0;
+      const phaseBoost = ph === FluidPhase.Magma ? 1.45 : ph === FluidPhase.Steam ? 1.85 : 1.0;
+      const sc = clamp(0.65 + spd * 0.14, 0.65, 1.35) * scale * phaseBoost;
       this._s1.set(sc, sc, sc);
       this._q1.identity();
       this._m4.compose(this._v1, this._q1, this._s1);
       this.splashMesh.setMatrixAt(i, this._m4);
+      this._splashColor.setRGB(
+        this.fluid.splashColors[i3] ?? 0.49,
+        this.fluid.splashColors[i3 + 1] ?? 0.83,
+        this.fluid.splashColors[i3 + 2] ?? 0.99,
+      );
+      this.splashMesh.setColorAt(i, this._splashColor);
     }
     this.splashMesh.instanceMatrix.needsUpdate = true;
+    if (this.splashMesh.instanceColor) {
+      this.splashMesh.instanceColor.needsUpdate = true;
+    }
   }
 
   private setupPlayer(): void {
@@ -4173,6 +4307,52 @@ export class PlanetarySandboxEngine {
       this.magmaVel[i3 + 2] = (nz * (1.8 + Math.random() * 2.4) + (Math.random() - 0.5) * 3.8) * velScale;
       this.magmaLife[i] = burnOnly ? 0.65 + Math.random() * 0.55 : 2.6 + Math.random() * 1.4;
       this.magmaRad[i] = burnOnly ? -Math.max(rad * 0.25, 0.2 * scale) : Math.max(rad * 0.35, 0.35 * scale);
+    }
+
+    const magmaTempK = clamp(this.config.magmaInjectionTempK ?? 1450, 950, 2400);
+    if (!burnOnly) {
+      const fluidBurst = clamp(Math.round(count * 3), 4, 48);
+      this.fluid.emitMultiphaseStream(
+        cx,
+        cy,
+        cz,
+        nx,
+        ny,
+        nz,
+        FluidPhase.Magma,
+        fluidBurst,
+        Math.max(rad, 0.35 * scale),
+        scale,
+        speedMult * 1.8,
+        magmaTempK,
+      );
+      this.gpuMultiphaseFluid?.emitBurst(
+        cx,
+        cy,
+        cz,
+        nx,
+        ny,
+        nz,
+        FluidPhase.Magma,
+        fluidBurst * 5,
+        Math.max(rad, 0.35 * scale),
+        speedMult * 2.8 * Math.sqrt(scale),
+        magmaTempK,
+      );
+    } else {
+      this.gpuMultiphaseFluid?.emitBurst(
+        cx,
+        cy,
+        cz,
+        nx,
+        ny,
+        nz,
+        FluidPhase.Steam,
+        Math.max(8, count * 2),
+        Math.max(rad, 0.3 * scale),
+        speedMult * 2.2 * Math.sqrt(scale),
+        460,
+      );
     }
   }
 
@@ -5249,7 +5429,9 @@ export class PlanetarySandboxEngine {
         const mesh = new THREE.Mesh(geo, this.terrainMaterial);
         mesh.castShadow = true;
         mesh.receiveShadow = true;
-        mesh.visible = true;
+        mesh.visible =
+          !this.isGpuVoxelInstancingActive() &&
+          (!this.planet.isHighResStreaming || !this.lastHighResHideMacro);
         this.scene.add(mesh);
         this.chunkMeshes[ci] = mesh;
         builtVerts += data.vertexCount;
@@ -5462,6 +5644,7 @@ export class PlanetarySandboxEngine {
 
       this.refreshGravityVisualizer();
       this.bindMetabolismToCurrentPlanet();
+      this.syncGpuPipelinesFullPlanet();
 
       this.hasWorld = true;
       this.setPlanetRigVisible(true);
@@ -5549,6 +5732,7 @@ export class PlanetarySandboxEngine {
       });
       this.refreshGravityVisualizer();
       this.bindMetabolismToCurrentPlanet();
+      this.syncGpuPipelinesFullPlanet();
       this.hasWorld = true;
       this.setPlanetRigVisible(true);
       this.telemetryTimer = 1;
@@ -5580,6 +5764,7 @@ export class PlanetarySandboxEngine {
     this.updateSplashInstances();
     this.refreshGravityVisualizer();
     this.bindMetabolismToCurrentPlanet();
+    this.syncGpuPipelinesFullPlanet();
     this.hasWorld = true;
     this.setPlanetRigVisible(true);
     this.telemetryTimer = 1;
@@ -5595,6 +5780,7 @@ export class PlanetarySandboxEngine {
   public clearWater(): void {
     this.lastSeaHidden = true;
     this.fluid.clear();
+    this.gpuMultiphaseFluid?.clear();
     this.clearDynamicEntities();
     this.updateSplashInstances();
     this.rebuildWaterMesh();
@@ -5652,6 +5838,7 @@ export class PlanetarySandboxEngine {
     });
     this.refreshGravityVisualizer();
     this.bindMetabolismToCurrentPlanet();
+    this.syncGpuPipelinesFullPlanet();
     this.hasWorld = true;
     this.setPlanetRigVisible(true);
     this.telemetryTimer = 1;
@@ -5687,7 +5874,9 @@ export class PlanetarySandboxEngine {
           ? 2.0
           : this.config.terrainOverlay === 'metabolism'
             ? 3.0
-            : 0.0;
+            : this.config.terrainOverlay === 'pressure'
+              ? 4.0
+              : 0.0;
 
     this.atmoEnabledNode.value = atmo.enabled ? 1.0 : 0.0;
     this.atmoDensityNode.value = atmo.surfacePressureAtm;
@@ -6178,10 +6367,12 @@ export class PlanetarySandboxEngine {
     this.syncEnvironmentUniforms();
     this.syncCouplingZoneLines();
     this.syncMetabolismReadOnlyVisuals(false);
+    this.syncGpuVoxelMeshVisibility();
 
     if (this.config.terrainRenderMode !== prevRenderMode && this.scene) {
       this.rebuildAllChunks();
       this.rebuildWaterMesh();
+      this.syncGpuVoxelMeshVisibility();
     } else if (
       (this.config.lodMode !== prevLodMode ||
         this.config.lod0Dist !== prevLod0Dist ||
@@ -6195,6 +6386,7 @@ export class PlanetarySandboxEngine {
           if (!b || b.pendingTotal === 0) break;
         }
       }
+      this.syncGpuVoxelMeshVisibility();
     }
 
     const attrs = this.getActiveToolAttrs();
@@ -10046,16 +10238,59 @@ export class PlanetarySandboxEngine {
     if (bhv === 'water' || bhv === 'geyser') {
       const streamCount = clamp(Math.round(attrs.entityCount), 4, 48);
       if (bhv === 'geyser') {
-        this.fluid.emitStream(
+        this.fluid.emitMultiphaseStream(
           hit.x,
           hit.y,
           hit.z,
           hit.nx,
           hit.ny,
           hit.nz,
+          FluidPhase.Water,
           streamCount,
           effRad * 0.45,
           scale,
+          2.2 * attrs.entitySpeed,
+          368,
+        );
+        this.fluid.emitMultiphaseStream(
+          hit.x,
+          hit.y,
+          hit.z,
+          hit.nx,
+          hit.ny,
+          hit.nz,
+          FluidPhase.Steam,
+          Math.max(4, Math.round(streamCount * 0.5)),
+          effRad * 0.35,
+          scale,
+          3.4 * attrs.entitySpeed,
+          445,
+        );
+        this.gpuMultiphaseFluid?.emitBurst(
+          hit.x,
+          hit.y,
+          hit.z,
+          hit.nx,
+          hit.ny,
+          hit.nz,
+          FluidPhase.Water,
+          streamCount * 5,
+          effRad * 0.45,
+          6.5 * Math.sqrt(scale) * attrs.entitySpeed,
+          368,
+        );
+        this.gpuMultiphaseFluid?.emitBurst(
+          hit.x,
+          hit.y,
+          hit.z,
+          hit.nx,
+          hit.ny,
+          hit.nz,
+          FluidPhase.Steam,
+          streamCount * 4,
+          effRad * 0.35,
+          8.5 * Math.sqrt(scale) * attrs.entitySpeed,
+          450,
         );
         this.fluid.applyRadialImpulse(
           hit.x,
@@ -10077,6 +10312,19 @@ export class PlanetarySandboxEngine {
           streamCount,
           effRad * 0.65,
           scale,
+        );
+        this.gpuMultiphaseFluid?.emitBurst(
+          hit.x,
+          hit.y,
+          hit.z,
+          hit.nx,
+          hit.ny,
+          hit.nz,
+          FluidPhase.Water,
+          streamCount * 5,
+          effRad * 0.65,
+          2.6 * Math.sqrt(scale),
+          289,
         );
       }
       this.waterMeshDirty = true;
@@ -10180,13 +10428,27 @@ export class PlanetarySandboxEngine {
 
     if (bhv === 'burn' || bhv === 'magma') {
       const isMagma = bhv === 'magma';
-      this.planet.applyBrush(hit.x, hit.y, hit.z, 'crater', effRad, effStr * (isMagma ? 0.95 : 0.65), depMat, {
+      const magmaCoreMat = isMagma ? MaterialId.Magma : depMat;
+      this.planet.applyBrush(hit.x, hit.y, hit.z, 'crater', effRad, effStr * (isMagma ? 0.95 : 0.65), magmaCoreMat, {
         rimHeight: attrs.leaveRim ? 0.38 : 0,
         rimMaterial: rimMat ?? MaterialId.Basalt,
-        floorMaterial: depMat,
+        floorMaterial: magmaCoreMat,
       });
       if (isMagma) {
         this.fluid.drainWithinRadius(hit.x, hit.y, hit.z, effRad * 0.8);
+      }
+      if (this.gpuVoxelPipeline && this.isHardwareWebGpu()) {
+        this.gpuVoxelPipeline.dispatchBrush(
+          this.renderer,
+          hit.x,
+          hit.y,
+          hit.z,
+          effRad,
+          effStr,
+          isMagma ? 'magma' : 'carve',
+          magmaCoreMat,
+        );
+        this.gpuVoxelPipeline.syncLocalRegionFromPlanet(this.planet, hit.x, hit.y, hit.z, effRad);
       }
       this.spawnMagmaBurst(
         hit.x,
@@ -10529,6 +10791,21 @@ export class PlanetarySandboxEngine {
       depMat,
       { rimMaterial: rimMat },
     );
+    if (this.gpuVoxelPipeline && this.isHardwareWebGpu()) {
+      if (primitiveMode === 'carve' || primitiveMode === 'build' || primitiveMode === 'paint') {
+        this.gpuVoxelPipeline.dispatchBrush(
+          this.renderer,
+          bx,
+          by,
+          bz,
+          effRad,
+          effStr * 0.72,
+          primitiveMode,
+          depMat,
+        );
+      }
+      this.gpuVoxelPipeline.syncLocalRegionFromPlanet(this.planet, bx, by, bz, effRad);
+    }
     this.metabolism.syncLocalTerrainPorosity(bx, by, bz, effRad, this.planet);
     this.updateChunksWithLod(36);
     this.updateHighResStreaming(hit, 48);
@@ -11525,6 +11802,8 @@ export class PlanetarySandboxEngine {
         }
         this.updateSplashInstances();
 
+        this.dispatchGpuVoxelAndFluidStep(dt);
+
         this.waterRebuildCooldown -= dt;
         if (this.waterRebuildCooldown <= 0 || this.waterMeshDirty) {
           if (this.fluid.activeCount > 0 || this.waterMeshDirty) {
@@ -12042,12 +12321,24 @@ export class PlanetarySandboxEngine {
         : null;
 
     const histSnap = this.planet.getHistorySnapshot();
+    const gpuVoxelTele = this.gpuVoxelPipeline
+      ? this.gpuVoxelPipeline.getTelemetry(
+          this.config.gpuVoxelPipelineEnabled ?? true,
+          this.isGpuVoxelInstancingActive(),
+        )
+      : undefined;
+    const gpuFluidTele = this.gpuMultiphaseFluid
+      ? this.gpuMultiphaseFluid.getTelemetry(this.config.gpuMultiphaseFluidEnabled ?? true)
+      : undefined;
+    const gpuFluidOn = Boolean(gpuFluidTele?.active);
 
     this.onTelemetry({
       altitude: r - this.planet.baseRadius,
       localGravity: computeGravityMagnitude(r, params),
       escapeVelocity: computeEscapeVelocity(r, params),
-      waterParticles: this.fluid.activeCount,
+      waterParticles: gpuFluidOn
+        ? Math.max(this.fluid.waterCount, gpuFluidTele?.waterCount ?? 0)
+        : this.fluid.activeCount,
       terrainVertices: this.totalTerrainVertices + this.highResVertices,
       backend: this.backendDiagnostic.backend,
       grounded:
@@ -12092,6 +12383,17 @@ export class PlanetarySandboxEngine {
       voxLocked: Boolean(this.lockedVoxWorldPos),
       interiorCutawayEnabled: this.planet.isInteriorCutawayEnabled(),
       metabolismSummary: this.metabolism.getSummarySnapshot(),
+      gpuVoxel: gpuVoxelTele,
+      gpuFluid: gpuFluidTele,
+      magmaParticles: gpuFluidOn ? (gpuFluidTele?.magmaCount ?? 0) : this.fluid.magmaCount,
+      steamParticles: gpuFluidOn ? (gpuFluidTele?.steamCount ?? 0) : this.fluid.steamCount,
+      peakFluidPressureAtm: Math.max(
+        this.fluid.peakPressureAtm,
+        gpuFluidTele?.peakPressureAtm ?? 1.0,
+        gpuVoxelTele?.peakPressureAtm ?? 1.0,
+      ),
+      peakFluidTempK: Math.max(this.fluid.peakTempK, gpuFluidTele?.peakTempK ?? 289),
+      gpuFluidActive: gpuFluidOn,
       canUndo: histSnap.canUndo,
       canRedo: histSnap.canRedo,
       undoCount: histSnap.undoCount,
@@ -12100,6 +12402,260 @@ export class PlanetarySandboxEngine {
       undoLabel: histSnap.undoLabel,
       redoLabel: histSnap.redoLabel,
     });
+  }
+
+  private isHardwareWebGpu(): boolean {
+    return (
+      Boolean(this.renderer) &&
+      this.backendDiagnostic.backend === 'WebGPU' &&
+      !this.isSoftware &&
+      !this.backendDiagnostic.isSoftwareRenderer
+    );
+  }
+
+  private isGpuVoxelInstancingActive(): boolean {
+    return (
+      this.hasWorld &&
+      !this.planet.isHighResStreaming &&
+      Boolean(this.gpuVoxelPipeline?.gpuHealthy) &&
+      (this.gpuVoxelPipeline?.liveVisibleInstances ?? 0) > 0 &&
+      this.isHardwareWebGpu() &&
+      (this.config.gpuVoxelPipelineEnabled ?? true) &&
+      this.config.terrainRenderMode === 'blocky'
+    );
+  }
+
+  private isGpuMultiphaseFluidActive(): boolean {
+    return (
+      this.hasWorld &&
+      Boolean(this.gpuMultiphaseFluid) &&
+      this.isHardwareWebGpu() &&
+      (this.config.gpuMultiphaseFluidEnabled ?? true)
+    );
+  }
+
+  private initGpuVoxelAndFluidPipelines(): void {
+    if (!this.scene || !this.isHardwareWebGpu()) return;
+    if (this.gpuVoxelPipeline) {
+      this.scene.remove(this.gpuVoxelPipeline.instancedMesh);
+      this.gpuVoxelPipeline.dispose();
+    }
+    if (this.gpuMultiphaseFluid) {
+      this.scene.remove(this.gpuMultiphaseFluid.particleMesh);
+      this.gpuMultiphaseFluid.dispose();
+    }
+
+    const gpuSolver = this.metabolism.gpuSolver;
+    const fvmSampler = gpuSolver
+      ? (worldPos: Parameters<typeof gpuSolver.buildTerrainColorSampleFn>[0], channel: Parameters<typeof gpuSolver.buildTerrainColorSampleFn>[1]) =>
+          gpuSolver.buildTerrainColorSampleFn(worldPos, channel)
+      : undefined;
+
+    this.gpuVoxelPipeline = new GpuVoxelPipeline(
+      this.planet,
+      undefined,
+      fvmSampler,
+      this.gpuFvmActiveNode,
+      this.gpuFvmChannelNode,
+    );
+    this.scene.add(this.gpuVoxelPipeline.instancedMesh);
+
+    this.gpuMultiphaseFluid = new GpuMultiphaseFluidSolver(
+      this.planet,
+      this.gpuVoxelPipeline,
+    );
+    this.scene.add(this.gpuMultiphaseFluid.particleMesh);
+  }
+
+  private syncGpuVoxelMeshVisibility(): void {
+    if (
+      this.hasWorld &&
+      !this.planet.isHighResStreaming &&
+      this.config.terrainRenderMode === 'blocky' &&
+      this.gpuVoxelPipeline?.gpuHealthy &&
+      this.gpuVoxelPipeline.liveVisibleInstances === 0 &&
+      (this.config.gpuVoxelPipelineEnabled ?? true) &&
+      this.isHardwareWebGpu()
+    ) {
+      this.gpuVoxelPipeline.rebuildSurfaceCpu(this.planet.isInteriorCutawayEnabled());
+    }
+    const gpuInstancingOn = this.isGpuVoxelInstancingActive();
+    const gpuFluidOn = this.isGpuMultiphaseFluidActive();
+    if (this.gpuVoxelPipeline) {
+      this.gpuVoxelPipeline.instancedMesh.visible = gpuInstancingOn;
+      if (gpuInstancingOn) {
+        this.gpuVoxelPipeline.needsSurfaceExtract = true;
+      }
+    }
+    if (this.gpuMultiphaseFluid) {
+      this.gpuMultiphaseFluid.particleMesh.visible = gpuFluidOn;
+    }
+    if (gpuInstancingOn) {
+      for (const m of this.chunkMeshes) {
+        if (m) m.visible = false;
+      }
+      if (this.highResGroup) {
+        this.highResGroup.visible = false;
+      }
+    } else if (this.hasWorld) {
+      const showMacro = !this.planet.isHighResStreaming || !this.lastHighResHideMacro;
+      for (const m of this.chunkMeshes) {
+        if (m) m.visible = showMacro;
+      }
+      if (this.highResGroup) {
+        this.highResGroup.visible = true;
+      }
+    }
+  }
+
+  private syncGpuPipelinesFullPlanet(): void {
+    if (!this.isHardwareWebGpu()) return;
+    const desiredAxis = Math.min(MAX_GPU_VOXEL_AXIS, Math.max(16, this.planet.gridN));
+    if (
+      !this.gpuVoxelPipeline ||
+      Math.abs(this.gpuVoxelPipeline.worldHalf - this.planet.worldHalf) > 1e-4 ||
+      this.gpuVoxelPipeline.axisSize !== desiredAxis ||
+      Math.abs(this.gpuVoxelPipeline.baseRadius - this.planet.baseRadius) > 1e-4
+    ) {
+      this.initGpuVoxelAndFluidPipelines();
+      this.rebuildTerrainMaterialBindings();
+    }
+    if (this.gpuVoxelPipeline) {
+      this.gpuVoxelPipeline.uploadFromPlanet(this.planet);
+    }
+    if (this.gpuMultiphaseFluid) {
+      this.gpuMultiphaseFluid.seedLakesFromPlanet(this.planet);
+    }
+    this.syncGpuVoxelMeshVisibility();
+  }
+
+  private dispatchGpuVoxelAndFluidStep(dt: number): void {
+    const scale = this.getPlanetScale();
+    const sunDirArr: [number, number, number] = [
+      this.sunDirUniform.x,
+      this.sunDirUniform.y,
+      this.sunDirUniform.z,
+    ];
+
+    if (this.isHardwareWebGpu() && this.gpuVoxelPipeline && (this.config.gpuVoxelPipelineEnabled ?? true)) {
+      this.gpuVoxelPipeline.syncUniforms({
+        planetRadius: this.planet.baseRadius,
+        surfaceAtm: this.config.atmosphere.surfacePressureAtm,
+        gravityScale: this.config.gravityScale,
+        coreTempC: this.config.thermal.coreTempC,
+        sunDir: sunDirArr,
+        cutawayActive: this.planet.isInteriorCutawayEnabled(),
+        overlayMode: this.config.terrainOverlay,
+        voxelEdges: this.config.voxelEdges,
+        bloomEnabled: this.config.renderQuality.bloomEnabled,
+      });
+
+      this.gpuVoxelExtractCooldown -= dt;
+      const doExtract =
+        this.isGpuVoxelInstancingActive() &&
+        (this.gpuVoxelPipeline.needsSurfaceExtract || this.gpuVoxelExtractCooldown <= 0);
+      if (doExtract) {
+        this.gpuVoxelExtractCooldown = 0.08;
+      }
+      this.gpuVoxelPipeline.dispatchStep(this.renderer, dt, doExtract);
+    }
+
+    if (this.isHardwareWebGpu() && this.gpuMultiphaseFluid && (this.config.gpuMultiphaseFluidEnabled ?? true)) {
+      this.gpuMultiphaseFluid.syncUniforms({
+        planetRadius: this.planet.baseRadius,
+        surfaceAtm: this.config.atmosphere.surfacePressureAtm,
+        gravityScale: this.config.gravityScale,
+        pressureScale: this.config.fluidPressureScale ?? 1.0,
+        ambientTempK: 288.0 + computeGreenhouseBoostC(this.config.atmosphere),
+        fluidGeoCoupling: this.config.fluidGeoCouplingEnabled ?? true,
+        cutawayActive: this.planet.isInteriorCutawayEnabled(),
+      });
+      this.gpuMultiphaseFluid.dispatchStep(this.renderer, dt);
+    }
+
+    // Drain solidified magma -> Basalt & pressurized hydraulic erosion from both GPU & CPU fluid solvers
+    const solidSites = this.fluid.solidifiedSites.splice(0, 8);
+    const erodeSites = this.fluid.erosionSites.splice(0, 8);
+    const gpuEvents = this.gpuMultiphaseFluid ? this.gpuMultiphaseFluid.drainGeoFeedbackEvents() : [];
+
+    if (solidSites.length > 0 || erodeSites.length > 0 || gpuEvents.length > 0) {
+      let dirtyGeo = false;
+      this.planet.runWithoutHistory(() => {
+        for (const s of solidSites) {
+          this.planet.applyBrush(
+            s.x,
+            s.y,
+            s.z,
+            'build',
+            Math.max(this.planet.voxelSize * 0.72, 0.42 * scale),
+            0.55,
+            MaterialId.Basalt,
+          );
+          this.gpuVoxelPipeline?.syncLocalRegionFromPlanet(
+            this.planet,
+            s.x,
+            s.y,
+            s.z,
+            Math.max(this.planet.voxelSize, 0.5 * scale),
+          );
+          dirtyGeo = true;
+        }
+        for (const e of erodeSites) {
+          this.planet.applyBrush(
+            e.x,
+            e.y,
+            e.z,
+            'carve',
+            Math.max(this.planet.voxelSize * 0.65, 0.36 * scale),
+            clamp(e.pressureAtm * 0.015, 0.05, 0.25),
+            MaterialId.Soil,
+          );
+          this.gpuVoxelPipeline?.syncLocalRegionFromPlanet(
+            this.planet,
+            e.x,
+            e.y,
+            e.z,
+            Math.max(this.planet.voxelSize, 0.45 * scale),
+          );
+          dirtyGeo = true;
+        }
+        for (const ev of gpuEvents.slice(0, 6)) {
+          if (ev.kind === 'solidify_basalt') {
+            this.planet.applyBrush(
+              ev.x,
+              ev.y,
+              ev.z,
+              'build',
+              Math.max(this.planet.voxelSize * 0.9, 0.55 * scale),
+              ev.intensity * 0.45,
+              MaterialId.Basalt,
+            );
+          } else {
+            this.planet.applyBrush(
+              ev.x,
+              ev.y,
+              ev.z,
+              'carve',
+              Math.max(this.planet.voxelSize * 0.85, 0.48 * scale),
+              ev.intensity * 0.25,
+              MaterialId.Soil,
+            );
+          }
+          this.gpuVoxelPipeline?.syncLocalRegionFromPlanet(
+            this.planet,
+            ev.x,
+            ev.y,
+            ev.z,
+            Math.max(this.planet.voxelSize * 1.1, 0.65 * scale),
+          );
+          dirtyGeo = true;
+        }
+      });
+      if (dirtyGeo) {
+        this.updateChunksWithLod(16);
+        this.waterMeshDirty = true;
+      }
+    }
   }
 
   public dispose(): void {
@@ -12131,6 +12687,16 @@ export class PlanetarySandboxEngine {
     this.lockedVoxVisual?.dispose();
     this.fvmVoxelBlocksVisual?.dispose();
     this.geologicalVisuals?.dispose();
+    if (this.gpuVoxelPipeline) {
+      this.scene?.remove(this.gpuVoxelPipeline.instancedMesh);
+      this.gpuVoxelPipeline.dispose();
+      this.gpuVoxelPipeline = null;
+    }
+    if (this.gpuMultiphaseFluid) {
+      this.scene?.remove(this.gpuMultiphaseFluid.particleMesh);
+      this.gpuMultiphaseFluid.dispose();
+      this.gpuMultiphaseFluid = null;
+    }
     if (this.oceanSeaMesh) {
       this.oceanSeaMesh.geometry.dispose();
       this.oceanSeaMesh = null;

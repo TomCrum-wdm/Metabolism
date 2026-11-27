@@ -40,6 +40,7 @@ const SOLID_MATERIALS: ReadonlyArray<MaterialId> = [
   MaterialId.Crystal,
   MaterialId.Ice,
   MaterialId.Sandstone,
+  MaterialId.Magma,
 ];
 
 function getElementGridPosition(el: PeriodicElementDef): { row: number; col: number } {

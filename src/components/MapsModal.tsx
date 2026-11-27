@@ -85,6 +85,7 @@ const MATERIAL_NAMES: Record<MaterialId, string> = {
   [MaterialId.Crystal]: '晶矿脉',
   [MaterialId.Ice]: '极地冰盖',
   [MaterialId.Sandstone]: '砂岩沉积',
+  [MaterialId.Magma]: '熔融岩浆',
 };
 
 const PLANAR_W = 500;
@@ -754,6 +755,7 @@ export const MapsModal: React.FC<MapsModalProps> = ({
                     MaterialId.Sandstone,
                     MaterialId.Crystal,
                     MaterialId.Ice,
+                    MaterialId.Magma,
                   ].map((id) => {
                     const [r, g, b] = MATERIAL_PALETTE[id].rgb;
                     const swatch = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;

@@ -142,11 +142,12 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
             />
           </label>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 pt-1 border-t border-slate-800/80">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 pt-1 border-t border-slate-800/80">
             {(
               [
                 { id: 'material', label: '岩性材质' },
                 { id: 'temperature', label: '三维温度场' },
+                { id: 'pressure', label: '压力应力场' },
                 { id: 'density', label: '深度层析' },
                 { id: 'metabolism', label: '耗散代谢场' },
               ] as ReadonlyArray<{ id: TerrainOverlayMode; label: string }>
@@ -156,7 +157,7 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
                 type="button"
                 data-testid={`panel-overlay-${ov.id}`}
                 onClick={() => onUpdateConfig({ terrainOverlay: ov.id })}
-                className={`h-6 rounded-xs border text-[10px] cursor-pointer ${
+                className={`h-6 rounded-xs border text-[10px] cursor-pointer whitespace-nowrap truncate ${
                   config.terrainOverlay === ov.id
                     ? 'border-amber-400 bg-amber-950/60 text-amber-200'
                     : 'border-slate-800 bg-[#0d1322] text-slate-400 hover:text-white'
@@ -422,6 +423,61 @@ export const AtmosphereThermalPanel: React.FC<AtmosphereThermalPanelProps> = ({
               />
             </label>
           </div>
+        </div>
+
+        {/* GPU Multiphase Fluid & Magma Pressure Controls */}
+        <div className="rounded-xs border border-slate-800 bg-[#060912] p-2 flex flex-col gap-1.5">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-1">
+            <span className="flex items-center gap-1 font-semibold text-orange-300">
+              <Flame className="w-3.5 h-3.5" />
+              <span>岩浆熔融流、蒸汽与静压场</span>
+            </span>
+            <span className="font-mono-tabular text-[10px] text-slate-400">
+              峰值 {telemetry.peakFluidPressureAtm.toFixed(0)} atm
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[10px] text-slate-400">岩浆喷发注入温度</span>
+              <NumericCadInput
+                value={config.magmaInjectionTempK ?? 1480}
+                minValid={950}
+                maxValid={2400}
+                unit="K"
+                testId="atmos-magma-temp-input"
+                sliderMin={950}
+                sliderMax={2200}
+                sliderStep={10}
+                onChangeValue={(v) => onUpdateConfig({ magmaInjectionTempK: v })}
+              />
+            </label>
+
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[10px] text-slate-400">岩石/流体压力缩放</span>
+              <NumericCadInput
+                value={config.fluidPressureScale ?? 1.0}
+                minValid={0.1}
+                maxValid={5.0}
+                unit="×"
+                testId="atmos-pressure-scale-input"
+                sliderMin={0.25}
+                sliderMax={4.0}
+                sliderStep={0.05}
+                onChangeValue={(v) => onUpdateConfig({ fluidPressureScale: v })}
+              />
+            </label>
+          </div>
+
+          <label className="flex items-center justify-between pt-0.5 cursor-pointer text-[10.5px]">
+            <span className="text-slate-300">岩浆冷却凝结与高压水蚀改写地形</span>
+            <input
+              type="checkbox"
+              checked={config.fluidGeoCouplingEnabled ?? true}
+              onChange={(e) => onUpdateConfig({ fluidGeoCouplingEnabled: e.target.checked })}
+              className="accent-orange-400 cursor-pointer"
+            />
+          </label>
         </div>
       </div>
     </aside>

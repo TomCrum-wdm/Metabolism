@@ -88,6 +88,7 @@ const NEXT_CAMERA_MODE: Record<CameraMode, CameraMode> = {
 const OVERLAY_LABEL: Record<TerrainOverlayMode, string> = {
   material: '材质',
   temperature: '温度',
+  pressure: '压力',
   density: '层析',
   lod: 'LOD',
   metabolism: '代谢场',
@@ -95,7 +96,8 @@ const OVERLAY_LABEL: Record<TerrainOverlayMode, string> = {
 
 const NEXT_OVERLAY: Record<TerrainOverlayMode, TerrainOverlayMode> = {
   material: 'temperature',
-  temperature: 'density',
+  temperature: 'pressure',
+  pressure: 'density',
   density: 'metabolism',
   metabolism: 'material',
   lod: 'material',
@@ -284,11 +286,22 @@ export const TopCommandBar: React.FC<TopCommandBarProps> = ({
           <span className="text-cyan-200">{pressStr}</span>
         </div>
 
-        <div className="flex items-center gap-1 whitespace-nowrap">
+        <div className="flex items-center gap-1.5 whitespace-nowrap">
           <span className="text-slate-500">H₂O</span>
           <span className="text-cyan-300">
             {Math.round(telemetry.waterParticles)}
           </span>
+          {(telemetry.magmaParticles > 0 || telemetry.steamParticles > 0) && (
+            <>
+              <span className="text-slate-600">/</span>
+              <span className="text-orange-400" title="熔岩粒子数">
+                熔{Math.round(telemetry.magmaParticles)}
+              </span>
+              <span className="text-slate-300" title="水蒸气粒子数">
+                汽{Math.round(telemetry.steamParticles)}
+              </span>
+            </>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 whitespace-nowrap">
